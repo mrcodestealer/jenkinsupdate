@@ -38,6 +38,14 @@ from typing import Any, Optional
 import requests
 from dotenv import load_dotenv
 
+# Log lines use emoji + arrows; force UTF-8 so a redirected stdout (systemd/journald, pipes,
+# Windows cp1252) never crashes the process with UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Resolve sibling-module imports regardless of process CWD (systemd, gunicorn, etc.)
 _CHBOX_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CHBOX_DIR not in sys.path:
