@@ -1,0 +1,29 @@
+[Unit]
+Description=Update Jenkins Bot (Lark persistent WebSocket + Playwright)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# Absolute path to the repo on the server (git clone target).
+WorkingDirectory=/root/updatejenkinsbot
+EnvironmentFile=/root/updatejenkinsbot/.env
+# Subscription mode: receive events through a persistent connection.
+Environment=LARK_EVENT_MODE=websocket
+Environment=PORT=5000
+# Warm the Jenkins /update pool + VPN browser so the first form fill is instant
+# (these override EnvironmentFile above).
+Environment=JU_WARM_POOL=1
+Environment=JU_WARM_ALLOW_COLD_FALLBACK=0
+Environment=VPN_WARM_BROWSER=1
+Environment=VPN_WARM_PREWARM_ON_STARTUP=1
+Environment=VPN_WARM_ALLOW_COLD_FALLBACK=0
+# Point this at the interpreter of the venv/conda env where you installed
+# requirements.txt AND ran `playwright install chromium`.
+ExecStart=/root/updatejenkinsbot/.venv/bin/python /root/updatejenkinsbot/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

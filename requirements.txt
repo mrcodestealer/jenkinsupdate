@@ -1,0 +1,8 @@
+flask
+requests
+python-dotenv
+apscheduler
+lark-oapi>=1.4.0
+playwright
+# Optional: only needed if you enable Encrypt Key under 事件与回调 in the Lark console.
+# pycryptodome

@@ -1,0 +1,27 @@
+# Secrets / local config
+.env
+.env.local
+
+# Runtime state written by the bot
+jenkinsupdate.json
+*.log
+
+# Playwright persistent profiles / browser data
+.fpms-playwright-profile/
+*-playwright-profile/
+browser_data/
+browser_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+__MACOSX/
+.idea/
+.vscode/
