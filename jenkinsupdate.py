@@ -12616,18 +12616,30 @@ def _fpms_lark_dispatch_igo_prod_script_parameter_flow(
     try:
         data = parse_fpms_prod_script_bot_block(body)
     except Exception as ex:
-        with _fpms_lark_sessions_lock:
-            _fpms_lark_sessions[session_key] = {
-                "state": "fpms_prod_script_need_command",
-                "jenkins_job_url": jenkins_build_url,
+        # Natural-language paste without the ``/jenkinsupdate`` prefix (e.g.
+        # "update igo prod script\nnode ….js"): extract the node command(s) directly —
+        # same as the FPMS prod-script dispatcher — instead of requiring the slash on line 1.
+        cmds = _split_fpms_prod_script_commands(body)
+        if cmds:
+            data = {
+                "_job_kind": "fpms_prod_script",
+                "command": cmds[0]
+                if len(cmds) == 1
+                else _fpms_prod_script_join_command_lines(cmds),
             }
-        send(
-            chat_id,
-            "❌ Could not parse IGO PROD script command.\n```\n%s\n```\n"
-            "Re-send the `node …` command, e.g.\n"
-            "`node wtAliScript/resendPulsar/sendConsumptionPcr.js`" % ex,
-        )
-        return True
+        else:
+            with _fpms_lark_sessions_lock:
+                _fpms_lark_sessions[session_key] = {
+                    "state": "fpms_prod_script_need_command",
+                    "jenkins_job_url": jenkins_build_url,
+                }
+            send(
+                chat_id,
+                "❌ Could not parse IGO PROD script command.\n```\n%s\n```\n"
+                "Re-send the `node …` command, e.g.\n"
+                "`node wtAliScript/resendPulsar/sendConsumptionPcr.js`" % ex,
+            )
+            return True
     data["environment"] = env
     _fpms_lark_begin_jenkins_run(
         chat_id,

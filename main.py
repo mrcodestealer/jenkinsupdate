@@ -1805,11 +1805,13 @@ def _run_lark_ws_forever() -> None:
         .register_p2_im_message_receive_v1(_lark_ws_on_message)
         .register_p2_card_action_trigger(_lark_ws_on_card_action)
     )
-    # The bot's own GotIt/DONE reactions make Lark push reaction events; register no-op
-    # handlers so they ACK cleanly instead of logging "processor not found" + being retried.
+    # The bot's own GotIt/DONE reactions + read receipts make Lark push extra events;
+    # register no-op handlers so they ACK cleanly instead of logging "processor not found"
+    # and being retried.
     for _reg_name in (
         "register_p2_im_message_reaction_created_v1",
         "register_p2_im_message_reaction_deleted_v1",
+        "register_p2_im_message_message_read_v1",
     ):
         _reg = getattr(builder, _reg_name, None)
         if callable(_reg):
