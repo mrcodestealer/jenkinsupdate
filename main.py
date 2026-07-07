@@ -1235,6 +1235,91 @@ def _looks_like_jenkins_nl_update(text: str) -> bool:
         )
 
 
+# ================= Self-deploy: git pull origin main + restart the systemd service =================
+UPDATEJENKINS_SERVICE = (os.getenv("UPDATEJENKINS_SERVICE") or "updatejenkins").strip() or "updatejenkins"
+_DEPLOY_ALLOWED_OPEN_IDS = {
+    x.strip() for x in (os.getenv("DEPLOY_ALLOWED_OPEN_IDS") or "").split(",") if x.strip()
+}
+
+
+def _deploy_allowed(sender_open_id: Optional[str]) -> bool:
+    """Empty allowlist = anyone who can address the bot may deploy; otherwise restrict to it."""
+    if not _DEPLOY_ALLOWED_OPEN_IDS:
+        return True
+    return (sender_open_id or "").strip() in _DEPLOY_ALLOWED_OPEN_IDS
+
+
+def _looks_like_deploy_command(text: str) -> bool:
+    """Match ``git pull origin main and restart service`` / ``/deploy`` / ``/gitpullrestart``."""
+    t = (text or "").strip().casefold()
+    if not t:
+        return False
+    if t in ("/deploy", "/gitpullrestart") or t.startswith("/deploy ") or t.startswith(
+        "/gitpullrestart "
+    ):
+        return True
+    has_pull = bool(re.search(r"\bgit\s+pull\b", t)) or bool(
+        re.search(r"\bpull\s+(?:origin|code|repo|latest)\b", t)
+    )
+    has_restart = bool(re.search(r"\b(?:restart|reboot)\b", t)) or "重启" in t
+    if has_pull and has_restart:
+        return True
+    return bool(re.search(r"拉代码.*重启|部署.*重启", t))
+
+
+def _schedule_service_restart(delay_sec: float = 2.0) -> None:
+    """Restart the systemd unit from a DETACHED process so it survives this process exiting."""
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            ["bash", "-c", f"sleep {delay_sec}; systemctl restart {UPDATEJENKINS_SERVICE}"],
+            start_new_session=True,
+        )
+        print(
+            f"[deploy] scheduled: systemctl restart {UPDATEJENKINS_SERVICE} (in {delay_sec}s)",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[deploy] restart schedule failed: {exc!r}", flush=True)
+
+
+def _run_git_pull_and_restart(chat_id: str) -> None:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            cwd=_CHBOX_DIR,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception as exc:
+        send_message(chat_id, f"❌ `git pull origin main` failed: {exc!r}")
+        return
+    out = "\n".join(x for x in (proc.stdout, proc.stderr) if x).strip()
+    tail = out[-1200:] if len(out) > 1200 else out
+    if proc.returncode != 0:
+        send_message(
+            chat_id,
+            f"❌ `git pull origin main` failed (exit {proc.returncode}).\n```\n{tail or '(no output)'}\n```",
+        )
+        return
+    send_message(
+        chat_id,
+        f"✅ `git pull origin main` OK — restarting `{UPDATEJENKINS_SERVICE}`…\n"
+        f"```\n{tail or 'Already up to date.'}\n```",
+    )
+    _schedule_service_restart()
+
+
+def _handle_deploy_command(chat_id: str) -> None:
+    send_message(chat_id, f"⏳ `git pull origin main` + restart `{UPDATEJENKINS_SERVICE}`…")
+    defer_lark_done_reaction()  # background thread marks DONE when the pull finishes
+    start_lark_background_thread(_run_git_pull_and_restart, chat_id)
+
+
 # ================= APScheduler (midnight run-history reset) =================
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -1359,6 +1444,14 @@ def _handle_jenkins_message(
     # Admin: warm-browser status
     if clean_text.lower() in ("/warmstatus", "/jenkinswarmstatus"):
         _handle_jenkins_warm_status(chat_id)
+        return
+
+    # Admin: self-deploy — "git pull origin main and restart service" / /deploy.
+    if _looks_like_deploy_command(clean_text) or _looks_like_deploy_command(clean_text_multiline):
+        if not _deploy_allowed(sender_id):
+            send_message(chat_id, "❌ You are not allowed to deploy this bot.")
+            return
+        _handle_deploy_command(chat_id)
         return
 
     _full_body = _lark_full_message_body(original_text, clean_text_multiline, message_content_raw)

@@ -66,6 +66,19 @@ On startup you should see:
 - Click **Confirm** to trigger the build (or **Cancel**).
 - `rebuild` / `rebuild again` — re-run the last update.
 - `/warmstatus` — show the warm browser pool status.
+- **Self-update:** `@Jenkins Update Bot git pull origin main and restart service` (or `/deploy`)
+  → the bot runs `git pull origin main` in its repo, replies with the result, then restarts
+  its own systemd unit so the new code takes effect. Also matches `git pull and restart`,
+  `/gitpullrestart`, `拉代码重启`. Restricted to the open_ids in `DEPLOY_ALLOWED_OPEN_IDS`
+  (empty = anyone who can @mention). The unit name comes from `UPDATEJENKINS_SERVICE`
+  (default `updatejenkins`).
+
+  Requirements on the server for this to work unattended:
+  - The service user can run `systemctl restart <unit>` without a password (root does; a
+    non-root user needs a sudoers/polkit rule).
+  - `git pull` has credentials for the repo (cached Git credential helper, a token, or an
+    SSH deploy key) if it is private, and no local edits to **tracked** files (`.env` and
+    `jenkinsupdate.json` are gitignored, so they never conflict).
 
 ## Git
 
