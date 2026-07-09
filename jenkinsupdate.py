@@ -37,8 +37,8 @@ Credentials: ``JENKINS_USERNAME`` / ``JENKINS_PASSWORD`` (recommended), else def
 embedded form screenshot; separate 📸 screenshot messages are not sent.
 uploads in the background. ``JENKINSUPDATE_FORM_SCREENSHOT=0`` disables. ``JENKINSUPDATE_FORM_SCREENSHOT_ROWS=1``
 adds per-parameter row images. By default, when you list services (e.g. ``auth-rollout, player-rollout``), the bot
-also sends a **Services row** PNG plus **one close-up per service** (``JENKINSUPDATE_SERVICES_DETAIL_SCREENSHOT=0``
-to disable). ``JENKINSUPDATE_BOT_SINGLE_VERIFY=0`` restores two on-page re-checks.
+also sends **one close-up per ticked service** (the whole Services row is not captured;
+``JENKINSUPDATE_SERVICES_DETAIL_SCREENSHOT=0`` to disable). ``JENKINSUPDATE_BOT_SINGLE_VERIFY=0`` restores two on-page re-checks.
 
 Usage::
 
@@ -10365,24 +10365,15 @@ def capture_jenkins_services_detail_screenshots(
     prof: str,
 ) -> list[str]:
     """
-    Close-ups for the Services list: full Services row + one PNG per requested service
-    (scrolls each checkbox into view so virtual lists are visible in chat).
+    One close-up PNG per **ticked** service (scrolls each checkbox into view so
+    virtual lists are visible in chat). The whole Services row is intentionally
+    not captured — the per-service close-ups already show exactly what was ticked.
+    Services that are not actually ticked are skipped.
     """
     paths: list[str] = []
     names = [n.strip() for n in (service_names or []) if (n or "").strip()][:8]
     if not names:
         return paths
-    try:
-        row = _form_row(page, "Services")
-        row.wait_for(state="visible", timeout=15_000)
-        row.scroll_into_view_if_needed(timeout=15_000)
-        _safe_page_wait(page, 200)
-        pth = os.path.join(out_dir, f"{prof}_{ts}_Services_row.png")
-        row.screenshot(path=pth, animations="disabled")
-        paths.append(pth)
-        print(f"→ Jenkins Services row screenshot: {pth}", flush=True)
-    except Exception as ex:
-        print(f"→ Services row screenshot skipped: {ex!r}", flush=True)
 
     for n in names:
         safe = re.sub(r"[^\w.-]+", "_", n)[:48]
@@ -10390,6 +10381,24 @@ def capture_jenkins_services_detail_screenshots(
         try:
             _scroll_services_pane_to_reveal_service(page, n)
             _safe_page_wait(page, 150)
+            checked = bool(
+                page.evaluate(
+                    """(v) => {"""
+                    + _SERVICES_UNOCHOICE_JS_FN
+                    + r"""
+                        const root = __fpmsServicesCheckboxRoot();
+                        const el = root && __fpmsFindServiceInput(root, v);
+                        return !!(el && el.checked);
+                    }""",
+                    n,
+                )
+            )
+            if not checked:
+                print(
+                    f"→ Service screenshot skipped ({n!r}): not ticked",
+                    flush=True,
+                )
+                continue
             svc_row = _form_row(page, "Services")
             opt = svc_row.locator(
                 f'div.active-choice div.tr:has(input[type="checkbox"][value="{n}"]), '
@@ -10404,20 +10413,8 @@ def capture_jenkins_services_detail_screenshots(
             _safe_page_wait(page, 120)
             opt.screenshot(path=pth, animations="disabled")
             paths.append(pth)
-            checked = bool(
-                page.evaluate(
-                    """(v) => {"""
-                    + _SERVICES_UNOCHOICE_JS_FN
-                    + r"""
-                        const root = __fpmsServicesCheckboxRoot();
-                        const el = root && __fpmsFindServiceInput(root, v);
-                        return !!(el && el.checked);
-                    }""",
-                    n,
-                )
-            )
             print(
-                f"→ Jenkins service screenshot {n!r} (checked={checked}): {pth}",
+                f"→ Jenkins service screenshot {n!r} (ticked): {pth}",
                 flush=True,
             )
         except Exception as ex:
@@ -10435,7 +10432,7 @@ def capture_jenkins_build_parameters_screenshots(
     One PNG of the filled Jenkins build-parameters form (whole form in frame).
 
     Set ``JENKINSUPDATE_FORM_SCREENSHOT_ROWS=1`` to also capture per-parameter row close-ups.
-    When ``services_expected`` is set, also captures Services row + per-service close-ups
+    When ``services_expected`` is set, also captures one close-up per ticked service
     (unless ``JENKINSUPDATE_SERVICES_DETAIL_SCREENSHOT=0``).
 
     Returns ``(file_paths, temp_dir)`` — caller should delete ``temp_dir`` after upload.
@@ -10570,18 +10567,14 @@ def _fpms_lark_send_parameter_screenshots(
         if i < len(paths):
             time.sleep(0.12)
     svc_snaps = sum(1 for p in paths if "_svc_" in os.path.basename(p))
-    has_svc_row = any(
-        os.path.basename(p).endswith("_Services_row.png") for p in paths
-    )
     if sent == 1:
         send(chat_id, f"📸 **{prof_label}** — Jenkins filled form (1 screenshot).")
     elif sent:
-        extra = ""
-        if svc_snaps or has_svc_row:
-            extra = (
-                f" Includes **Services row**"
-                + (f" + **{svc_snaps}** per-service close-up(s)." if svc_snaps else ".")
-            )
+        extra = (
+            f" Includes **{svc_snaps}** ticked-service close-up(s)."
+            if svc_snaps
+            else ""
+        )
         send(
             chat_id,
             f"📸 **{prof_label}** — {sent} Jenkins screenshot(s).{extra}",
@@ -16613,7 +16606,7 @@ def run(
                         next_build_number=next_build_number,
                         screenshot_img_key=screenshot_img_key,
                     )
-                    # After the whole-form YES/NO card, also send Services row + per-service close-ups.
+                    # After the whole-form YES/NO card, also send one close-up per ticked service.
                     if (
                         len(shot_paths) > 1
                         and not update_all_services
