@@ -8323,6 +8323,42 @@ def _jenkins_update_prefer_master_or_branch(
     return ties
 
 
+# ``NT`` as a standalone token (word- or ``_``-delimited): matches ``NT``, ``NT-UAT``, ``FPMS_NT`` —
+# but not the ``nt`` buried inside ``FNT`` / ``environment`` / ``want``.
+_JENKINS_NT_TOKEN_RE = re.compile(r"(?<![a-z0-9])nt(?![a-z0-9])", re.I)
+
+
+def _jenkins_update_tie_is_nt(t: tuple[str, float, str, str]) -> bool:
+    """True when a ranked row is an FPMS **NT** job (alias/label token or ``fpms_nt`` in the URL)."""
+    if _JENKINS_NT_TOKEN_RE.search(t[0] or "") or _JENKINS_NT_TOKEN_RE.search(t[2] or ""):
+        return True
+    return "fpms_nt" in _jenkins_update_primary_url(t[3]).casefold()
+
+
+def _jenkins_update_prefer_nt(
+    ties: list[tuple[str, float, str, str]], headline: str
+) -> list[tuple[str, float, str, str]]:
+    """
+    Resolve an NT-vs-generic tie using an explicit ``NT`` qualifier in the **headline**.
+
+    ``NT UAT MASTER`` fuzzy-matches both ``FPMS NT UAT MASTER UPDATE`` and the generic
+    ``FPMS UAT MASTER UPDATE`` at nearly the same score: users drop the ``fpms`` prefix, so neither
+    alias earns the exact-substring boost and the two land inside the tie band. When the headline
+    plainly names ``NT`` (a standalone token) keep only the NT job(s) and drop the generic ``FPMS``
+    sibling(s). No ``NT`` in the headline → leave the ties untouched: the generic aliases already
+    win outright via the substring boost (nothing to break), and we must not strip a legitimately
+    NT-only match such as the CCMS/BO job. Mirrors :func:`_jenkins_update_prefer_master_or_branch`.
+    """
+    if len(ties) < 2:
+        return ties
+    if not _JENKINS_NT_TOKEN_RE.search(headline or ""):
+        return ties
+    nt_ties = [t for t in ties if _jenkins_update_tie_is_nt(t)]
+    if nt_ties and len(nt_ties) < len(ties):
+        return nt_ties
+    return ties
+
+
 def _jenkins_update_dedupe_ties(
     ties: list[tuple[str, float, str, str]],
 ) -> list[tuple[str, float, str, str]]:
@@ -14326,6 +14362,9 @@ def _dispatch_lark_update_command_body(
     # Explicit "master" / "branch" in the headline breaks a Branch-vs-Master tie (so
     # "UPDATE FPMS UAT MASTER" goes straight to the Master job instead of asking 1/2).
     ties = _jenkins_update_prefer_master_or_branch(ties, head_line)
+    # Explicit "NT" in the headline breaks an NT-vs-generic tie (so "UPDATE NT UAT MASTER" goes
+    # straight to FPMS NT UAT MASTER UPDATE instead of asking 1/2 against FPMS UAT MASTER UPDATE).
+    ties = _jenkins_update_prefer_nt(ties, head_line)
     ties = _jenkins_update_dedupe_ties(ties)
     # Service-first routing: named services → drop jobs whose catalog cannot host them; then
     # environment narrows among survivors. No services in the message → headline/env rank only.
