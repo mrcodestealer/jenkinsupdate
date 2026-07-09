@@ -1201,6 +1201,10 @@ def _jenkins_bot_open_id() -> str:
     return (os.getenv("JENKINS_BOT_OPEN_ID") or _JENKINS_BOT_OPEN_ID_DEFAULT).strip()
 
 
+# Chat to post reply-email status into when a jenkinsbot callback / internal POST omits chat_id.
+DUTY_CHAT_ID = (os.getenv("DUTY_CHAT_ID") or "").strip() or None
+
+
 def _run_jenkins_warm_status_check(chat_id: str) -> None:
     try:
         ju = _get_jenkinsupdate()
@@ -1420,6 +1424,78 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
             pass
 
 
+# ================= jenkinsbot → reply-email callbacks (/replyupdateemail, etc.) =================
+def _dispatch_jenkins_duty_command(
+    chat_id: str,
+    sender_id: str,
+    duty_clean: str,
+    duty_orig: str,
+    send,
+    *,
+    message_content_raw: str = "",
+) -> bool:
+    """Handle a jenkinsbot callback (``/replyupdateemail`` …) — reply to the update email in-thread.
+
+    Mirrors osedutybot's duty-bot handler: routes to ``updatemore.handle_jenkinsbot_callback``
+    with the Jenkins engine's live session state when available, else a stateless fallback so a
+    single ``/replyupdateemail`` can still search the mailbox and reply.
+    """
+    ju = _get_jenkinsupdate()
+    if ju is None:
+        try:
+            import updatemore as um
+
+            if um.is_jenkinsbot_duty_command(duty_orig or duty_clean or message_content_raw):
+                send(
+                    chat_id,
+                    "⚠️ **jenkinsupdate** is not loaded (e.g. Playwright missing). "
+                    "`/replyupdateemail` can still send a **single** email if parsed, but "
+                    "**`/updatemore` batching** needs jenkinsupdate. Fix the server import error "
+                    "and set `JENKINS_BOT_OPEN_ID` in `.env`.",
+                )
+        except Exception:
+            pass
+    if ju:
+        try:
+            import updatemore as um
+
+            return um.handle_jenkinsbot_callback(
+                chat_id,
+                sender_id,
+                duty_clean,
+                duty_orig,
+                send,
+                sessions=ju._fpms_lark_sessions,
+                sessions_lock=ju._fpms_lark_sessions_lock,
+                session_key_fn=ju._fpms_lark_session_key,
+                dispatch_update_body=lambda cid, sk, body, snd, **kw: ju._dispatch_lark_update_command_body(
+                    cid, sk, body, snd, **kw
+                ),
+                message_content_raw=message_content_raw,
+            )
+        except Exception as ex:
+            print(f"[lark] jenkins duty via jenkinsupdate failed: {ex!r}", flush=True)
+    try:
+        import updatemore as um
+
+        empty_lock = threading.Lock()
+        return um.handle_jenkinsbot_callback(
+            chat_id,
+            sender_id,
+            duty_clean,
+            duty_orig,
+            send,
+            sessions={},
+            sessions_lock=empty_lock,
+            session_key_fn=lambda cid, sid: f"{(cid or '').strip()}:{(sid or '').strip()}",
+            dispatch_update_body=lambda *a, **kw: False,
+            message_content_raw=message_content_raw,
+        )
+    except Exception as ex:
+        print(f"[lark] jenkins duty fallback failed: {ex!r}", flush=True)
+        return False
+
+
 # ================= Message handler (the /update flow) =================
 # Runs INLINE inside the webhook (like osedutybot): the Jenkins engine owns its own
 # deferred-DONE lifecycle, so wrapping this in start_lark_background_thread (which auto-marks
@@ -1452,6 +1528,50 @@ def _handle_jenkins_message(
             send_message(chat_id, "❌ You are not allowed to deploy this bot.")
             return
         _handle_deploy_command(chat_id)
+        return
+
+    # jenkinsbot → reply-email callbacks (/replyupdateemail, etc.). Handle BEFORE the Jenkins
+    # update parse so a callback is never mistaken for a fresh /update request.
+    try:
+        import updatemore as _um
+
+        _duty_blob = _um.resolve_duty_command_body(
+            original_text, clean_text, message_content_raw
+        )
+        _jb_duty_cmd = _um.is_jenkinsbot_duty_command(_duty_blob) or _um.is_reply_update_email_text(
+            _duty_blob
+        )
+        if not _jb_duty_cmd:
+            for _scan in (clean_text, original_text, message_content_raw):
+                if _scan and (
+                    _um.is_jenkinsbot_duty_command(_scan)
+                    or _um.is_reply_update_email_text(_scan)
+                ):
+                    _jb_duty_cmd = True
+                    break
+    except Exception:
+        _duty_blob = (clean_text or original_text or message_content_raw or "").strip()
+        _jb_duty_cmd = bool(re.search(r"/?replyupdateemail\b", _duty_blob, re.I))
+
+    if _jb_duty_cmd:
+        print(
+            f"[lark] jenkins duty cmd sender={sender_id!r} body={(_duty_blob or original_text)!r}",
+            flush=True,
+        )
+        if _dispatch_jenkins_duty_command(
+            chat_id,
+            sender_id or "",
+            _duty_blob or clean_text,
+            _duty_blob or original_text,
+            send_message,
+            message_content_raw=message_content_raw,
+        ):
+            return
+        send_message(
+            chat_id,
+            "❌ Saw a jenkinsbot `/replyupdateemail` command but could not handle it.\n"
+            f"Body: `{(_duty_blob or original_text or '')[:200]}`",
+        )
         return
 
     _full_body = _lark_full_message_body(original_text, clean_text_multiline, message_content_raw)
@@ -1599,6 +1719,31 @@ def lark_webhook():
                     bot_mentioned = True
                     break
 
+        # jenkinsbot → reply-email commands (/replyupdateemail, etc.) work in groups WITHOUT an
+        # @mention — treat them as addressed so the group gate below lets them through (any sender).
+        if chat_type != "p2p" and not bot_mentioned:
+            try:
+                import updatemore as _um
+
+                _duty_probe = _um.resolve_duty_command_body(
+                    original_text, clean_text, message_content_raw
+                )
+                if _um.is_jenkinsbot_duty_command(_duty_probe) or _um.is_reply_update_email_text(
+                    message_content_raw or ""
+                ):
+                    bot_mentioned = True
+                    print(
+                        "✅ Jenkins reply-email command — treat as mentioned (any sender)",
+                        flush=True,
+                    )
+            except Exception:
+                if re.search(
+                    r"/?replyupdateemail\b",
+                    f"{clean_text or ''} {message_content_raw or ''}",
+                    re.I,
+                ):
+                    bot_mentioned = True
+
         ju = _get_jenkinsupdate()
         jenkins_sess_active = (
             ju.jenkins_update_has_active_lark_session(chat_id, sender_id) if ju else False
@@ -1633,6 +1778,93 @@ def lark_webhook():
         return _lark_http_card_callback_ok()
     print(f"⚠️ Unknown webhook branch hdr_et={hdr_et!r}", flush=True)
     return _lark_im_done()
+
+
+# ================= Internal HTTP: jenkinsbot → reply update email =================
+def _handle_reply_update_email_internal(payload: dict) -> tuple[bool, str, int]:
+    """Shared handler for ``POST /internal/reply-update-email``. Returns ``(ok, message, status)``."""
+    chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
+    email_title = (payload.get("email_title") or "").strip()
+    environment = (payload.get("environment") or "").strip()
+    when = (payload.get("when") or "").strip()
+    if not chat_id:
+        return False, "missing chat_id", 400
+    if not email_title or not environment or not when:
+        return False, "missing email_title, environment, or when", 400
+    ju = _get_jenkinsupdate()
+    if ju is None:
+        return False, "jenkinsupdate module unavailable", 503
+    try:
+        import updatemore as um
+    except Exception as ex:
+        return False, f"updatemore import failed: {ex}", 503
+    um.process_reply_update_email(
+        chat_id,
+        email_title,
+        environment,
+        when,
+        send_message,
+        sessions=ju._fpms_lark_sessions,
+        sessions_lock=ju._fpms_lark_sessions_lock,
+        session_key_fn=ju._fpms_lark_session_key,
+        dispatch_update_body=lambda cid, sk, body, snd, **kw: ju._dispatch_lark_update_command_body(
+            cid, sk, body, snd, **kw
+        ),
+    )
+    return True, "processed", 200
+
+
+def _run_reply_update_email_background(payload: dict) -> None:
+    """Run the IMAP reply off the HTTP thread so the caller does not hit its POST timeout."""
+    try:
+        ok, msg, code = _handle_reply_update_email_internal(payload)
+        if not ok:
+            chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
+            if chat_id:
+                send_message(chat_id, f"❌ Jenkins email callback failed ({code}): {msg}")
+    except Exception as ex:
+        chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
+        print(f"❌ reply-update-email background error: {ex}", flush=True)
+        if chat_id:
+            send_message(chat_id, f"❌ Jenkins email callback error: {ex}")
+
+
+@app.route("/internal/reply-update-email", methods=["POST"])
+def internal_reply_update_email():
+    """
+    An external jenkinsbot POSTs here when a Lark bot→bot @mention does not reach this bot.
+    Optional header ``X-Duty-Internal-Token`` must match ``DUTY_INTERNAL_TOKEN`` when that env is set.
+    """
+    token_need = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
+    if token_need:
+        got = (
+            (request.headers.get("X-Duty-Internal-Token") or "").strip()
+            or (request.headers.get("Authorization") or "").replace("Bearer", "").strip()
+        )
+        if got != token_need:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+    payload = request.get_json(silent=True) or {}
+    chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
+    email_title = (payload.get("email_title") or "").strip()
+    environment = (payload.get("environment") or "").strip()
+    when = (payload.get("when") or "").strip()
+    if not chat_id:
+        return jsonify({"ok": False, "error": "missing chat_id"}), 400
+    if not email_title or not environment or not when:
+        return jsonify({"ok": False, "error": "missing email_title, environment, or when"}), 400
+    ju = _get_jenkinsupdate()
+    if ju is None:
+        return jsonify({"ok": False, "error": "jenkinsupdate module unavailable"}), 503
+    try:
+        import updatemore  # noqa: F401
+    except Exception as ex:
+        return jsonify({"ok": False, "error": f"updatemore import failed: {ex}"}), 503
+    threading.Thread(
+        target=_run_reply_update_email_background,
+        args=(payload,),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "message": "accepted", "accepted": True}), 202
 
 
 # ================= Lark persistent connection (long connection / WebSocket) =================

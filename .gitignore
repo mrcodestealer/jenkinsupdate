@@ -4,6 +4,12 @@
 
 # Runtime state written by the bot
 jenkinsupdate.json
+# Reply-email engine (maintenance_mail.py) runtime state
+maintenance.json
+allemail.json
+egs.json
+egstest.json
+.prod_batch_sm_sessions.json
 *.log
 
 # Playwright persistent profiles / browser data

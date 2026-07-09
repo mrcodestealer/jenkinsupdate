@@ -17,9 +17,15 @@ connection / WebSocket) — no public HTTPS Request URL required.
 | `jenkinsupdate.py` | The engine (Playwright form-fill, warm pool, sessions, cards) |
 | `jenkinsupdateagent.py` | Natural-language request parser (optional LLM) |
 | `updatemore.py` | Multi-environment `/updatemore` batching (optional) |
+| `maintenance_mail.py` | Reply-email engine (IMAP search + SMTP reply-all in the original thread) |
+| `maintenance.py` | Email parsing + Lark card helpers used by `maintenance_mail.py` / `updatemore.py` |
 | `cpms_igo_uat_services.json` | Cached CPMS/IGO UAT service lists |
 | `.env` | Credentials + config (not committed) |
 | `deploy/updatejenkins.service` | systemd unit template |
+
+`maintenance.py` + `maintenance_mail.py` are copied verbatim from `osedutybot`; they are
+self-contained (stdlib + `requests`/`python-dotenv` only). `updatemore.py` imports them for the
+`/replyupdateemail` flow.
 
 `jenkinsupdate.py` calls back into `main.py` via `import main`; running `python main.py`
 aliases `import main` to the running process so nothing is loaded twice.
@@ -66,6 +72,14 @@ On startup you should see:
 - Click **Confirm** to trigger the build (or **Cancel**).
 - `rebuild` / `rebuild again` — re-run the last update.
 - `/warmstatus` — show the warm browser pool status.
+- **Reply to the update email** — `replyupdateemail | {email title} | {pipeline/env} | {time}`
+  makes the bot search the mailbox (`JENKINS_REPLY_IMAP_FOLDERS`) for the original request thread
+  and **reply-all** that the build is done. Works in a group **without** an @mention (any sender),
+  and also over HTTP: `POST /internal/reply-update-email` with JSON
+  `{"chat_id","email_title","environment","when"}` (optional `X-Duty-Internal-Token` header when
+  `DUTY_INTERNAL_TOKEN` is set). Requires `MAINTENANCE_MAIL_PASSWORD` (and the other
+  `MAINTENANCE_MAIL_*` values — see `.env.example`) so the bot can reach IMAP/SMTP; without it the
+  reply cannot be sent and the bot posts a manual-reply fallback card instead.
 - **Self-update:** `@Jenkins Update Bot git pull origin main and restart service` (or `/deploy`)
   → the bot runs `git pull origin main` in its repo, replies with the result, then restarts
   its own systemd unit so the new code takes effect. Also matches `git pull and restart`,
