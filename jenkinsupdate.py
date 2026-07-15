@@ -29,7 +29,7 @@ Browser stays open after a successful fill + review until you press **Ctrl+C** i
 
 Use ``python3 updateJenkins.py --tick`` to only tick **Refresh pipeline** (no form fill, no Build).
 
-Job URL: https://jenkins.client8.me/job/FPMS/job/FPMS_UAT_BRANCH_UPDATE/build?delay=0sec
+Job URL: https://jenkins.internal.client8.me/job/FPMS/job/FPMS_UAT_BRANCH_UPDATE/build?delay=0sec
 
 Credentials: ``JENKINS_USERNAME`` / ``JENKINS_PASSWORD`` (recommended), else defaults below.
 
@@ -138,21 +138,21 @@ except ImportError:
         )
 
 BUILD_URL = (
-    "https://jenkins.client8.me/job/FPMS/job/FPMS_UAT_BRANCH_UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_UAT_BRANCH_UPDATE/build?delay=0sec"
 )
 BI_API_UPDATE_BUILD_URL = (
-    "https://jenkins.client8.me/job/BI-GO/job/BI-API-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/BI-GO/job/BI-API-UPDATE/build?delay=0sec"
 )
 QRQM_UPDATE_BUILD_URL = (
-    "https://jenkins.client8.me/job/BI-GO/job/QRQM-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/BI-GO/job/QRQM-UPDATE/build?delay=0sec"
 )
 # QRQM-UPDATE parameters: ENVIRONMENT + SOURCE_BRANCH are both **dropdowns** (not free text).
 # SOURCE_BRANCH options on Jenkins: main, qat, uat.
 FPMS_NT_UAT_BO_UPDATE_URL = (
-    "https://jenkins.client8.me/job/FPMS_NT/job/FPMS_NT_UAT_BO_UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/FPMS_NT/job/FPMS_NT_UAT_BO_UPDATE/build?delay=0sec"
 )
 PMS_UAT_UPDATE_URL = (
-    "https://jenkins.client8.me/job/PMS/job/UAT/job/PMS-UAT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/PMS/job/UAT/job/PMS-UAT-UPDATE/build?delay=0sec"
 )
 
 # CPMS / IGO UAT update — both are FPMS-style forms (Environment <select> → reactive UnoChoice
@@ -160,15 +160,15 @@ PMS_UAT_UPDATE_URL = (
 # a different Services list. The bot scans both jobs once and caches ``environment → [services]`` so
 # routing a requested service to the correct (job, environment) is instant.
 CPMS_UAT_UPDATE_URL = (
-    "https://jenkins.client8.me/job/CPMS/job/UAT/job/CPMS-UAT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/CPMS/job/UAT/job/CPMS-UAT-UPDATE/build?delay=0sec"
 )
 IGO_UAT_UPDATE_URL = (
-    "https://jenkins.client8.me/job/IGO/job/UAT/job/IGO-UAT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/IGO/job/UAT/job/IGO-UAT-UPDATE/build?delay=0sec"
 )
 # IGO PROD SCRIPT RUN — same form as FPMS PROD SCRIPT (Environment <select> + Command), but the
 # Environment option is chosen from the chat phrase, not fixed.
 IGO_PROD_SCRIPT_RUN_URL = (
-    "https://jenkins.client8.me/job/IGO/job/PROD/job/IGO-PROD-SCRIPT-RUN/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/IGO/job/PROD/job/IGO-PROD-SCRIPT-RUN/build?delay=0sec"
 )
 # Phrase → IGO PROD SCRIPT RUN Environment option value (longest phrase first when matching).
 IGO_PROD_SCRIPT_ENV_BY_PHRASE: tuple[tuple[str, str], ...] = (
@@ -190,10 +190,10 @@ CPMS_IGO_UAT_URL_BY_KIND: dict[str, str] = {
 # (Environment <select> → Active-Choices Services checkboxes → Branch text; Version OPTIONAL).
 # Newport's form mirrors Brazil's; they differ only by build URL.
 BRAZIL_UAT_BUILD_URL = (
-    "https://jenkins.client8.me/job/BRAZIL/job/BRAZIL-UAT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/BRAZIL/job/BRAZIL-UAT-UPDATE/build?delay=0sec"
 )
 NEWPORT_UAT_BUILD_URL = (
-    "https://jenkins.client8.me/job/NEWPORT/job/UAT/job/NEWPORT-UAT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/NEWPORT/job/UAT/job/NEWPORT-UAT-UPDATE/build?delay=0sec"
 )
 # Environment <select> option *values* shared by both BRAZIL and NEWPORT UAT update jobs
 # (keep in sync with the Jenkins job parameter list).
@@ -284,7 +284,7 @@ BI_API_UPDATE_REPOSITORY_OPTIONS: list[tuple[str, str]] = [
 #   ENVIRONMENT          — dropdown (same as BI-API-UPDATE)
 #   SOURCE_BRANCH        — free text (same as BI-API-UPDATE)
 BI_SCRIPT_UPDATE_BUILD_URL = (
-    "https://jenkins.client8.me/job/BI-GO/job/BI-SCRIPT-UPDATE/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/BI-GO/job/BI-SCRIPT-UPDATE/build?delay=0sec"
 )
 # Checkbox values for DEPLOYMENT_FILE_NAME (keep in sync with the Jenkins job; order = job UI).
 BI_SCRIPT_UPDATE_DEPLOYMENT_FILES: list[str] = [
@@ -388,43 +388,43 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
     "fpms uat": ("FPMS UAT BRANCH UPDATE", BUILD_URL),
     "fpms prod script": (
         "FPMS PROD SCRIPT",
-        "https://jenkins.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/",
+        "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/",
     ),
     "frontend uat1 h5": (
         "FRONTEND UAT1 H5",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-1/job/h5-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-1/job/h5-uat/build?delay=0sec",
     ),
     "frontend uat2 h5": (
         "FRONTEND UAT2 H5",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-2/job/h5-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-2/job/h5-uat/build?delay=0sec",
     ),
     "frontend uat3 h5": (
         "FRONTEND UAT3 H5",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-3/job/h5-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-3/job/h5-uat/build?delay=0sec",
     ),
     "frontend uat4 h5": (
         "FRONTEND UAT4 H5",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-4/job/h5-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-4/job/h5-uat/build?delay=0sec",
     ),
     "frontend uat1 web": (
         "FRONTEND UAT1 WEB",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-1/job/web-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-1/job/web-uat/build?delay=0sec",
     ),
     "frontend uat2 web": (
         "FRONTEND UAT2 WEB",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-2/job/web-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-2/job/web-uat/build?delay=0sec",
     ),
     "frontend uat3 web": (
         "FRONTEND UAT3 WEB",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-3/job/web-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-3/job/web-uat/build?delay=0sec",
     ),
     "frontend uat4 web": (
         "FRONTEND UAT4 WEB",
-        "https://jenkins.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-4/job/web-uat/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FRONTEND/job/UAT/job/projects/job/uat-4/job/web-uat/build?delay=0sec",
     ),
     "fpms uat fgs": (
         "FPMS FGS",
-        "https://jenkins.client8.me/job/FGS_CLIENT/job/FGS-UAT-UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FGS_CLIENT/job/FGS-UAT-UPDATE/build?delay=0sec",
     ),
     "ccms uat fe bo": (
         "FPMS_NT_UAT_BO_UPDATE",
@@ -476,59 +476,59 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
     ),
     "igo uat script run": (
         "IGO UAT SCRIPT RUN",
-        "https://jenkins.client8.me/job/IGO/job/UAT/job/IGO-UAT-SCRIPT-RUN/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/IGO/job/UAT/job/IGO-UAT-SCRIPT-RUN/build?delay=0sec",
     ),
     "telesales": (
         "CRS UAT Master(telesales)",
-        "https://jenkins.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
     ),
     "rc uat master": (
         "FPMS FNT(RC)",
-        "https://jenkins.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
     ),
     "rc uat": (
         "FPMS FNT(RC)",
-        "https://jenkins.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
     ),
     "fnt uat script run": (
         "FNT UAT SCRIPT RUN",
-        "https://jenkins.client8.me/job/FNT/job/FNT_UAT_SCRIPT_RUN/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FNT/job/FNT_UAT_SCRIPT_RUN/build?delay=0sec",
     ),
     "sms uat update": (
         "SMS UAT UPDATE",
-        "https://jenkins.client8.me/job/SMS/job/UAT/job/SMS-UAT-UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/SMS/job/UAT/job/SMS-UAT-UPDATE/build?delay=0sec",
     ),
     "fpms nt uat branch": (
         "FPMS NT UAT BRANCH UPDATE",
-        "https://jenkins.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_BRANCH_UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_BRANCH_UPDATE/build?delay=0sec",
     ),
     "fpms nt uat master": (
         "FPMS NT UAT MASTER UPDATE",
-        "https://jenkins.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
     ),
     # Headlines like ``Update NT Auth/Player MASTER`` — must beat fuzzy ``update pms`` (chunk ``update``).
     "nt auth": (
         "FPMS NT UAT MASTER UPDATE",
-        "https://jenkins.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
     ),
     "nt auth player": (
         "FPMS NT UAT MASTER UPDATE",
-        "https://jenkins.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
     ),
     "fpms uat master": (
         "FPMS UAT MASTER UPDATE",
-        "https://jenkins.client8.me/job/FPMS/view/FPMS-UAT/job/FPMS_UAT_MASTER_UPDATE/",
+        "https://jenkins.internal.client8.me/job/FPMS/view/FPMS-UAT/job/FPMS_UAT_MASTER_UPDATE/",
     ),
     "igo prod script": ("IGO PROD SCRIPT RUN", IGO_PROD_SCRIPT_RUN_URL),
     "igo report prod script": ("IGO PROD SCRIPT RUN", IGO_PROD_SCRIPT_RUN_URL),
     "igo gov report prod script": ("IGO PROD SCRIPT RUN", IGO_PROD_SCRIPT_RUN_URL),
     "fpms prod script": (
         "FPMS PROD SCRIPT RUN",
-        "https://jenkins.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
     ),
     "fpms prod script run": (
         "FPMS PROD SCRIPT RUN",
-        "https://jenkins.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
+        "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
     ),
     "brazil uat": ("BRAZIL UAT UPDATE", BRAZIL_UAT_BUILD_URL),
     "newport uat": ("NEWPORT UAT UPDATE", NEWPORT_UAT_BUILD_URL),
@@ -577,7 +577,7 @@ _NL_VPN_FIND_RE = re.compile(
 
 FPMS_PROD_SCRIPT_FLAG_RE = re.compile(r"--fpmsprodscript\b", re.I)
 FPMS_PROD_SCRIPT_BUILD_URL = (
-    "https://jenkins.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec"
+    "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec"
 )
 
 # FNT ``RC-UAT-UPDATE`` (RC UAT master; alias ``rc uat master``) — checkbox ``value`` / ``json`` from Jenkins
@@ -1377,7 +1377,7 @@ def prewarm_vpn_browser_on_startup() -> None:
 
 
 # ===================== Warm browser POOL for (non-VPN) Jenkins updates =====================
-# One pre-launched, logged-in Chromium **per Jenkins job URL** (``jenkins.client8.me`` automation
+# One pre-launched, logged-in Chromium **per Jenkins job URL** (``jenkins.internal.client8.me`` automation
 # jobs). Each browser stays on its job's build-with-parameters page between runs. Disable with
 # ``JU_WARM_POOL=0``. Override the URL list with ``JU_WARM_URLS`` (comma-separated) on dev PCs.
 
@@ -1474,7 +1474,7 @@ def _ju_warm_urls() -> list[str]:
         if not u:
             return
         ul = u.casefold()
-        if "jenkins.client8.me" not in ul:
+        if "jenkins.internal.client8.me" not in ul:
             return
         canon = _ju_warm_canonical_build_url(u)
         key = _ju_warm_url_key(canon)
