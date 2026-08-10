@@ -1002,6 +1002,11 @@ def _send_jenkins_email_reply(
     to_line = ", ".join(sent.get("to") or []) or "(none)"
     cc_line = ", ".join(sent.get("cc") or []) or "(none)"
     rcpt_line = ", ".join(sent.get("recipients") or []) or to_line
+    quoted_line = (
+        "✅ quoted (**Show/Hide email thread**)"
+        if sent.get("quoted")
+        else "⚠️ not quoted — plain text (original body could not be read)"
+    )
     send(
         chat_id,
         f"📧 Auto-replied email ({len(completions)} done block(s))\n"
@@ -1010,7 +1015,8 @@ def _send_jenkins_email_reply(
         f"- **To:** `{to_line}`\n"
         f"- **Cc:** `{cc_line}`\n"
         f"- **Subject (search / Re:):** `{email_title}`\n"
-        f"- **Environments:** {envs}",
+        f"- **Environments:** {envs}\n"
+        f"- **Thread:** {quoted_line}",
     )
 
 

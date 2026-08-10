@@ -93,6 +93,17 @@ _JENKINS_REPLY_IMAP_TIMEOUT = float(
     or os.getenv("MAINTENANCE_MAIL_IMAP_TIMEOUT", "").strip()
     or "180"
 )
+# 1 (default) = quote the original under the Jenkins done reply, so Lark Mail renders
+# **Show/Hide email thread** like a manual Reply All. 0 = old flat plain-text reply.
+_JENKINS_REPLY_QUOTE_THREAD = (
+    os.getenv("JENKINS_REPLY_QUOTE_THREAD", "").strip() or "1"
+) not in ("0", "false", "no", "off")
+# Budget for re-reading the original just to QUOTE it (cache path). Deliberately much
+# shorter than _JENKINS_REPLY_IMAP_TIMEOUT: the cache path exists to skip IMAP, and a
+# missed quote only costs the collapsible thread — it never blocks the reply itself.
+_JENKINS_REPLY_QUOTE_TIMEOUT = float(
+    os.getenv("JENKINS_REPLY_QUOTE_TIMEOUT", "").strip() or "30"
+)
 # 1 = IMAP4_SSL on 993 (default). 0 = plain IMAP + STARTTLS (often port 143).
 IMAP_USE_SSL = (os.getenv("MAINTENANCE_MAIL_IMAP_SSL", "").strip() or "1") not in (
     "0",
@@ -759,6 +770,7 @@ def _content_hash(body: str) -> str:
 
 
 _FORWARD_SEP = "---------- Forwarded message ----------"
+_REPLY_SEP = "---------- Original message ----------"
 _FORWARD_SIGNOFF_HTML = (
     '<div style="word-break:break-word;line-height:1.6;'
     'font-size:14px;color:rgb(0,0,0);">Best Regards,<br>JC<br><br></div>'
@@ -766,6 +778,9 @@ _FORWARD_SIGNOFF_HTML = (
 _LARK_QUOTE_WRAPPER = "history-quote-wrapper"
 # Lark forward uses ``--header`` (not ``--collapsed``, which is for Re: quotes).
 _LARK_FORWARD_BLOCK = "adit-html-block--header"
+# A ``Re:`` uses the collapsed block — same wrapper, so Lark Mail still renders
+# **Show/Hide email thread**, but folded like a manual reply quote.
+_LARK_REPLY_BLOCK = "adit-html-block--collapsed"
 _LARK_QUOTE_BORDER = "border-left: none; padding-left: 0px;"
 _LARK_META_STYLE = (
     "padding: 12px; background: rgb(245, 246, 247); color: rgb(31, 35, 41); "
@@ -826,6 +841,7 @@ def _quote_labels(subject: str) -> dict[str, str]:
                 "to": "收件人",
                 "cc": "抄送",
                 "sep": "--------- 转发消息 ---------",
+                "sep_reply": "--------- 原始邮件 ---------",
             }
     return {
         "from": "From",
@@ -834,6 +850,7 @@ def _quote_labels(subject: str) -> dict[str, str]:
         "to": "To",
         "cc": "Cc",
         "sep": _FORWARD_SEP,
+        "sep_reply": _REPLY_SEP,
     }
 
 
@@ -934,13 +951,21 @@ def build_forwarded_message_body(msg: email.message.Message) -> str:
     return "\n".join(header) + (original or "")
 
 
-def _build_lark_forward_quote_html(msg: email.message.Message) -> str:
+def _build_lark_quote_html(
+    msg: email.message.Message,
+    *,
+    block_class: str = _LARK_FORWARD_BLOCK,
+    reply: bool = False,
+) -> str:
     """
-    Forward quote block per Lark composer (``history-quote-wrapper`` +
-    ``adit-html-block--header``). See larksuite/cli ``mail_quote.go``.
+    Quote block per Lark composer (``history-quote-wrapper`` + block class).
+    See larksuite/cli ``mail_quote.go``. ``reply=True`` swaps the "Forwarded
+    message" separator for the reply one; pass ``block_class`` to match
+    (``--header`` for Fw:, ``--collapsed`` for Re:).
     """
     subj = _decode_mime_header(msg.get("Subject")) or ""
     labels = _quote_labels(subj)
+    sep_label = labels["sep_reply"] if reply else labels["sep"]
     from_hdr = _decode_mime_header(msg.get("From")) or "Unknown"
     to_hdr = _decode_mime_header(msg.get("To")) or ""
     cc_hdr = _decode_mime_header(msg.get("Cc")) or ""
@@ -966,7 +991,7 @@ def _build_lark_forward_quote_html(msg: email.message.Message) -> str:
 
     sep_html = (
         f'<div class="history-quote-forward-title lme-line-signal history-quote-gap-tag" '
-        f'style="{_LARK_SEP_STYLE}">{_html_escape(labels["sep"])}</div>'
+        f'style="{_LARK_SEP_STYLE}">{_html_escape(sep_label)}</div>'
     )
 
     body_raw = extract_body_html_raw(msg)
@@ -986,11 +1011,16 @@ def _build_lark_forward_quote_html(msg: email.message.Message) -> str:
     return (
         f'<div id="{outer_id}" class="{_LARK_QUOTE_WRAPPER}">'
         f'<div data-html-block="quote" data-mail-html-ignore="">'
-        f'<div class="adit-html-block {_LARK_FORWARD_BLOCK}" '
+        f'<div class="adit-html-block {block_class}" '
         f'style="{_LARK_QUOTE_BORDER}">'
         f'<div id="{inner_id}">{sep_html}{meta_html}{body_part}</div>'
         f"</div></div></div>"
     )
+
+
+def _build_lark_forward_quote_html(msg: email.message.Message) -> str:
+    """``Fw:`` quote block (``--header``) — unchanged behaviour for the forward path."""
+    return _build_lark_quote_html(msg, block_class=_LARK_FORWARD_BLOCK)
 
 
 def build_forwarded_message_html(msg: email.message.Message) -> str:
@@ -1013,6 +1043,36 @@ def build_forwarded_message_html(msg: email.message.Message) -> str:
         '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
         "</head><body>"
         f"{inner}"
+        "</body></html>"
+    )
+
+
+def build_reply_message_html(text: str, msg: email.message.Message) -> str:
+    """``Re:`` reply HTML: our text on top, the original quoted below it.
+
+    Same Lark ``history-quote-wrapper`` machinery as :func:`build_forwarded_message_html`
+    so Lark Mail renders **Show/Hide email thread**, but with the ``--collapsed`` block
+    a reply uses instead of ``--header`` — i.e. exactly what a manual **Reply All** in the
+    Lark Mail composer produces. Sent as a single ``text/html`` part — adding a plain
+    alternative makes Lark Mail expand the quote as raw text instead.
+    """
+    body_html = "<br>".join(
+        _html_escape(line) for line in (text or "").replace("\r\n", "\n").split("\n")
+    )
+    top = (
+        '<div style="word-break:break-word;line-height:1.6;'
+        f'font-size:14px;color:rgb(0,0,0);">{body_html}</div>'
+    )
+    gap = (
+        '<div style="word-break:break-word;line-height:1.6;'
+        'font-size:14px;color:rgb(0,0,0);"><br></div>'
+    )
+    quote = _build_lark_quote_html(msg, block_class=_LARK_REPLY_BLOCK, reply=True)
+    return (
+        "<!DOCTYPE html><html><head>"
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+        "</head><body>"
+        f'<div dir="ltr">{top}{gap}{quote}</div>'
         "</body></html>"
     )
 
@@ -4312,6 +4372,75 @@ def find_jenkins_reply_message_by_subject_title(
     return find_message_by_subject_title(title, folders=JENKINS_REPLY_IMAP_FOLDERS)
 
 
+def find_message_by_message_id(
+    message_id: str, folders: list[str] | None = None
+) -> email.message.Message | None:
+    """Fetch a full message by its ``Message-ID`` (first folder hit wins).
+
+    The ``allemail.json`` cache keeps the original's Message-ID + To/Cc but **not** its
+    body, so the original has to be re-read from IMAP before it can be quoted underneath
+    a reply. Returns ``None`` on any failure: the reply still goes out, just without the
+    quoted thread.
+
+    ``folders`` are searched **first** (e.g. the folder the cache saw the mail in), then
+    ``JENKINS_REPLY_IMAP_FOLDERS`` — it narrows the common case without ever shrinking
+    the search.
+    """
+    mid = (message_id or "").strip()
+    if not mid:
+        return None
+    safe = mid.replace('"', "").replace("\\", "")
+    t0 = time.monotonic()
+    try:
+        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_QUOTE_TIMEOUT)
+    except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+        print(f"[maint-mail] quote lookup connect failed: {ex!r}", flush=True)
+        return None
+    try:
+        seen: set[str] = set()
+        scan: list[str] = []
+        for f in (folders or []) + list(JENKINS_REPLY_IMAP_FOLDERS):
+            name = (f or "").strip()
+            key = name.casefold()
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            scan.append(name)
+        for folder in scan:
+            if time.monotonic() - t0 > _JENKINS_REPLY_QUOTE_TIMEOUT:
+                print(
+                    f"[maint-mail] quote lookup budget "
+                    f"({_JENKINS_REPLY_QUOTE_TIMEOUT:.0f}s) spent before {folder!r} — "
+                    "replying without the quoted thread",
+                    flush=True,
+                )
+                break
+            try:
+                if not _select_mail_folder(mail, folder, readonly=True):
+                    continue
+                uids = _uid_search(mail, f'(HEADER Message-ID "{safe}")')
+                if not uids:
+                    continue
+                msg = _fetch_uid_message(mail, uids[-1])
+                if msg is not None:
+                    print(
+                        f"[maint-mail] quote source for {mid} found in {folder!r} "
+                        f"({time.monotonic() - t0:.1f}s)",
+                        flush=True,
+                    )
+                    return msg
+            except (imaplib.IMAP4.error, OSError, ImapStaleConnectionError) as ex:
+                print(f"[maint-mail] quote lookup {folder!r} failed: {ex!r}", flush=True)
+                continue
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    print(f"[maint-mail] quote source not found for {mid}", flush=True)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # allemail.json — rolling weekly email index + cache-first Jenkins reply
 # ---------------------------------------------------------------------------
@@ -4701,9 +4830,34 @@ def _send_jenkins_reply_all(
     recipients: list[str],
     orig_message_id: str,
     orig_references: str,
-) -> None:
-    """Build + send the plain-text Reply-All, threading in the original via In-Reply-To."""
-    msg = MIMEText(body, "plain", "utf-8")
+    quote_source: email.message.Message | None = None,
+) -> bool:
+    """Build + send the Reply-All, threading in the original via In-Reply-To.
+
+    With ``quote_source`` (the parsed original) the mail goes out as a single
+    ``text/html`` part carrying the Lark ``history-quote-wrapper`` quote, so Lark Mail
+    renders **Show/Hide email thread** with the previous email inside — exactly like a
+    manual **Reply All**. Without it (or if building the quote fails) it falls back to the
+    old plain-text body, so a reply is never lost just because quoting failed.
+
+    Returns True when the sent mail carried the quoted thread.
+    """
+    quoted = False
+    msg: MIMEText | None = None
+    if quote_source is not None:
+        try:
+            msg = MIMEText(build_reply_message_html(body, quote_source), "html", "utf-8")
+            msg.replace_header("Content-Type", 'text/html; charset="utf-8"')
+            quoted = True
+        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+            print(
+                f"[maint-mail] jenkins reply: quote build failed ({ex!r}) — "
+                "sending plain text",
+                flush=True,
+            )
+            msg = None
+    if msg is None:
+        msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = Header(reply_subject, "utf-8")
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["To"] = ", ".join(to_addrs)
@@ -4720,6 +4874,7 @@ def _send_jenkins_reply_all(
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=IMAP_TIMEOUT, context=ctx) as smtp:
         smtp.login(MAIL_USER, MAIL_PASSWORD)
         smtp.sendmail(MAIL_USER, recipients, msg.as_string())
+    return quoted
 
 
 def _reply_jenkins_update_done_email_via_cache(
@@ -4736,20 +4891,34 @@ def _reply_jenkins_update_done_email_via_cache(
         return None
     to_addrs, cc_addrs, recipients = recips
     subj = _reply_subject(cached.get("subject") or title)
-    _send_jenkins_reply_all(
+    cached_mid = (cached.get("message_id") or "").strip()
+    # The cache holds headers only — re-read the original from IMAP so the reply can quote
+    # it (Lark **Show/Hide email thread**). Best-effort: a miss just means no quote.
+    quote_src: email.message.Message | None = None
+    if cached_mid and _JENKINS_REPLY_QUOTE_THREAD:
+        cached_folder = (cached.get("folder") or "").strip()
+        try:
+            quote_src = find_message_by_message_id(
+                cached_mid, [cached_folder] if cached_folder else None
+            )
+        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+            print(f"[allemail] quote source lookup failed: {ex!r}", flush=True)
+            quote_src = None
+    quoted = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
         cc_addrs=cc_addrs,
         recipients=recipients,
-        orig_message_id=cached.get("message_id") or "",
+        orig_message_id=cached_mid,
         orig_references=cached.get("references") or "",
+        quote_source=quote_src,
     )
     envs = ", ".join(c[0] for c in completions)
     print(
         f"[allemail] jenkins done reply (cache) envs={envs!r} title={title!r} "
         f"mid={cached.get('message_id')!r} folder={cached.get('folder')!r} "
-        f"To={to_addrs!r} Cc={cc_addrs!r}",
+        f"quoted={quoted} To={to_addrs!r} Cc={cc_addrs!r}",
         flush=True,
     )
     return {
@@ -4759,6 +4928,7 @@ def _reply_jenkins_update_done_email_via_cache(
         "folder": cached.get("folder") or "",
         "subject": subj,
         "source": "allemail-cache",
+        "quoted": quoted,
     }
 
 
@@ -4913,7 +5083,7 @@ def reply_jenkins_update_done_email(
         )
     to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(orig)
     subj = _reply_subject(_decode_msg_subject(orig))
-    _send_jenkins_reply_all(
+    quoted = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
@@ -4921,6 +5091,7 @@ def reply_jenkins_update_done_email(
         recipients=recipients,
         orig_message_id=(orig.get("Message-ID") or "").strip(),
         orig_references=(orig.get("References") or "").strip(),
+        quote_source=orig if _JENKINS_REPLY_QUOTE_THREAD else None,
     )
     # Index the found original so the NEXT reply to this subject is an instant cache hit.
     # Fire-and-forget: never add file-lock latency to the reply hot path.
@@ -4935,7 +5106,7 @@ def reply_jenkins_update_done_email(
     route = ", ".join(recipients)
     print(
         f"[maint-mail] jenkins done reply envs={envs!r} title={title!r} folder={orig_folder!r} "
-        f"To={to_addrs!r} Cc={cc_addrs!r} → {route}",
+        f"quoted={quoted} To={to_addrs!r} Cc={cc_addrs!r} → {route}",
         flush=True,
     )
     return {
@@ -4945,6 +5116,7 @@ def reply_jenkins_update_done_email(
         "folder": orig_folder,
         "subject": subj,
         "source": "live-imap",
+        "quoted": quoted,
     }
 
 

@@ -80,6 +80,14 @@ On startup you should see:
   `DUTY_INTERNAL_TOKEN` is set). Requires `MAINTENANCE_MAIL_PASSWORD` (and the other
   `MAINTENANCE_MAIL_*` values — see `.env.example`) so the bot can reach IMAP/SMTP; without it the
   reply cannot be sent and the bot posts a manual-reply fallback card instead.
+
+  The reply quotes the original underneath it using Lark Mail's own quote markup
+  (`history-quote-wrapper` + `adit-html-block--collapsed`), so recipients see the collapsible
+  **Show/Hide email thread** with the previous email inside — identical to a manual **Reply All**
+  in the Lark Mail composer. It is sent as a single `text/html` part (a plain-text alternative
+  makes Lark expand the quote as raw text). On a cache hit the original is re-read from IMAP by
+  `Message-ID` just to build the quote; if that lookup fails the reply still goes out, as flat
+  plain text. Set `JENKINS_REPLY_QUOTE_THREAD=0` to force the old plain-text reply.
 - **Self-update:** `@Jenkins Update Bot git pull origin main and restart service` (or `/deploy`)
   → the bot runs `git pull origin main` in its repo, replies with the result, then restarts
   its own systemd unit so the new code takes effect. Also matches `git pull and restart`,
