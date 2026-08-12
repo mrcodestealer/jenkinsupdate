@@ -2149,17 +2149,31 @@ def _decode_msg_subject(msg: email.message.Message) -> str:
     return " ".join(out).strip()
 
 
+def _normalize_subject_for_match(s: str) -> str:
+    """Fold the whitespace differences that make hand-typed subjects unmatchable.
+
+    Real vendor subjects contain NBSP (``\\xa0``) and runs of double spaces — e.g. Evolution's
+    ``'… / Table Availability: Affected  \\xa0/  (SD-6990231)'``. Matching is a literal substring
+    test, so a human retyping that subject could never reproduce it. Collapsing whitespace and
+    folding NBSP/zero-width/dash variants costs nothing in precision and makes the common case
+    work. Applied to BOTH sides of every comparison, and shared by the cache and live pickers.
+    """
+    t = (s or "").replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
+    t = t.replace("\u2013", "-").replace("\u2014", "-")
+    return re.sub(r"\s+", " ", t).strip().casefold()
+
+
 def _subject_contains_needle(subject: str, needle: str) -> bool:
-    n = (needle or "").strip().casefold()
+    n = _normalize_subject_for_match(needle)
     if not n:
         return False
-    return n in (subject or "").casefold()
+    return n in _normalize_subject_for_match(subject)
 
 
 def _jenkins_reply_subject_score(subject: str, needle: str) -> int:
     """Prefer exact ``TESTING BOT`` over ``19 TESTING BOT Failed to send …``."""
-    s = (subject or "").strip().casefold()
-    n = (needle or "").strip().casefold()
+    s = _normalize_subject_for_match(subject)
+    n = _normalize_subject_for_match(needle)
     if not n or n not in s:
         return -999
     if "failed to send" in s:
@@ -5317,6 +5331,22 @@ def _allemail_entry_reply_recipients(
         return None
 
 
+def _auto_submitted_blocks_reply(auto_submitted: str) -> bool:
+    """Should an ``Auto-Submitted`` header stop us replying? Only for autoresponders.
+
+    RFC 3834 separates ``auto-replied`` (a vacation/out-of-office responder — replying risks a
+    loop) from ``auto-generated`` (a system notification). The update-request mails this bot
+    exists to answer ARE system-generated, and the live picker has never tested this header at
+    all — so rejecting every non-``no`` value made the cache stricter than the live path and
+    pushed legitimate threads onto the 25-150s search.
+    """
+    a = (auto_submitted or "").strip().casefold()
+    if not a or a == "no":
+        return False
+    # 'auto-replied', and defensively 'auto-notified' per RFC 5436.
+    return a.startswith("auto-replied") or a.startswith("auto-notified")
+
+
 def _allemail_subject_is_reply_or_forward(subject: str) -> bool:
     return bool(re.match(r"^\s*(?:re|fw|fwd|aw)\s*:", (subject or ""), re.I))
 
@@ -5378,8 +5408,7 @@ def _allemail_reply_lookup(title: str) -> dict[str, Any] | None:
             continue
         if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
             continue
-        auto = (e.get("auto_submitted") or "").strip().casefold()
-        if auto and auto != "no":
+        if _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
             continue
         if _allemail_entry_reply_recipients(e) is None:
             continue
@@ -7676,6 +7705,66 @@ def start_maintenance_mail_watcher(
     return True
 
 
+def debug_allemail_list(filter_text: str = "", *, limit: int = 60) -> int:
+    """List what is actually indexed — every folder, every subject, newest first.
+
+    Run: ``python3 maintenance_mail.py allemail-list [substring] [limit]``
+
+    The index is subject-agnostic: it holds EVERY message in the scanned folders within the
+    retention window. Pass a substring to narrow it (e.g. ``UPDATE PRODUCTION``) and copy a
+    subject straight out of the output — retyping one by hand is how most lookups fail.
+    ``USABLE`` marks entries the reply flow would accept as a target.
+    """
+    if not os.path.exists(ALLEMAIL_STORE_PATH):
+        print(f"{ALLEMAIL_STORE_PATH} does not exist — run `allemail-scan` first.", flush=True)
+        return 1
+    data = _allemail_load()
+    entries = data.get("emails") or []
+    needle = (filter_text or "").strip()
+    if needle:
+        nn = _normalize_subject_for_match(needle)
+        shown = [e for e in entries if nn in _normalize_subject_for_match(e.get("subject") or "")]
+    else:
+        shown = list(entries)
+    shown.sort(key=lambda e: float(e.get("date_ts") or 0.0), reverse=True)
+
+    from collections import Counter
+
+    by_folder = Counter(e.get("folder") or "?" for e in entries)
+    usable_total = sum(1 for e in entries if _allemail_entry_reply_recipients(e) is not None)
+    print(
+        f"index: {len(entries)} entries  ({_allemail_retention_label()})  "
+        f"folders: {', '.join(f'{k}={v}' for k, v in by_folder.most_common())}",
+        flush=True,
+    )
+    print(f"entries with usable Reply-All recipients: {usable_total}", flush=True)
+    if needle:
+        print(f"filter: {needle!r} → {len(shown)} match(es)", flush=True)
+    print("", flush=True)
+
+    for e in shown[:limit]:
+        subj = e.get("subject") or ""
+        usable = (
+            not _allemail_subject_is_reply_or_forward(subj)
+            and not _allemail_from_is_own(e.get("from_raw", ""))
+            and not _should_skip_jenkins_reply_thread(
+                from_hdr=e.get("from_raw", ""), subject=subj
+            )
+            and not _auto_submitted_blocks_reply(e.get("auto_submitted") or "")
+            and _allemail_entry_reply_recipients(e) is not None
+        )
+        print(
+            f"  {(e.get('date') or '')[:10]}  {'USABLE  ' if usable else 'not-target'}  "
+            f"{(e.get('folder') or '?'):<14} {(e.get('from_raw') or '')[:34]:<34} {subj}",
+            flush=True,
+        )
+    if len(shown) > limit:
+        print(f"\n  … {len(shown) - limit} more (pass a larger limit)", flush=True)
+    if not shown:
+        print("  (nothing matched — try a shorter substring)", flush=True)
+    return 0
+
+
 def debug_allemail_why(needle: str) -> int:
     """Explain why a subject does or does not resolve in ``allemail.json``.
 
@@ -8139,6 +8228,13 @@ if __name__ == "__main__":
             raise SystemExit(0)
         print(f"NO MATCH for {_t!r} in allemail.json", flush=True)
         raise SystemExit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] == "allemail-list":
+        _f = sys.argv[2] if len(sys.argv) > 2 else ""
+        try:
+            _lim = int(sys.argv[3]) if len(sys.argv) > 3 else 60
+        except ValueError:
+            _lim = 60
+        raise SystemExit(debug_allemail_list(_f, limit=_lim))
     if len(sys.argv) >= 2 and sys.argv[1] == "allemail-why":
         raise SystemExit(debug_allemail_why(sys.argv[2] if len(sys.argv) > 2 else ""))
     if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-preview":

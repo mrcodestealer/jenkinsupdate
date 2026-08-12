@@ -436,6 +436,50 @@ def test_fresh_match_beats_stale_across_the_3month_window() -> None:
     check(hit and hit["uid"] == "old", "and it is the stale entry")
 
 
+def test_hand_typed_subject_matches_nbsp_original() -> None:
+    """Real vendor subjects carry NBSP and double spaces that nobody can retype."""
+    print("test_hand_typed_subject_matches_nbsp_original")
+    real = (
+        "[Service Desk] Studio cleaning maintenance  / 12/May/26 04:00  UTC / / "
+        "Table Availability: Affected   \xa0/  (SD-6990231)"
+    )
+    typed = (
+        "[Service Desk] Studio cleaning maintenance / 12/May/26 04:00 UTC / / "
+        "Table Availability: Affected / (SD-6990231)"
+    )
+    check(mm._jenkins_reply_subject_score(real, typed) == 100, "collapsed whitespace still matches")
+    check(mm._subject_contains_needle(real, typed), "_subject_contains_needle agrees")
+    check(
+        mm._jenkins_reply_subject_score(real, "Studio cleaning maintenance") > 0,
+        "a short substring needle still matches",
+    )
+    check(
+        mm._jenkins_reply_subject_score(real, "Studio cleaning NOTHING") == -999,
+        "normalisation must not create false positives",
+    )
+
+
+def test_auto_generated_is_a_valid_reply_target() -> None:
+    """RFC 3834: auto-generated is a system notice; only auto-replied is an autoresponder.
+
+    The update-request mails this bot answers are system-generated, and the live picker never
+    tested this header — so rejecting every non-'no' value made the cache stricter than live."""
+    print("test_auto_generated_is_a_valid_reply_target")
+    check(not mm._auto_submitted_blocks_reply("auto-generated"), "auto-generated is replyable")
+    check(not mm._auto_submitted_blocks_reply("no"), "'no' is replyable")
+    check(not mm._auto_submitted_blocks_reply(""), "absent is replyable")
+    check(mm._auto_submitted_blocks_reply("auto-replied"), "auto-replied is NOT replyable")
+    check(
+        mm._auto_submitted_blocks_reply("auto-replied (vacation)"),
+        "parameterised auto-replied is NOT replyable",
+    )
+
+    entry = _entry("Widget UPDATE PRODUCTION", 1, "INBOX", "ag")
+    entry["auto_submitted"] = "auto-generated"
+    hit = _with_index([entry], lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"))
+    check(hit is not None, "an auto-generated vendor mail is a usable cache target")
+
+
 def test_retention_window_is_three_months() -> None:
     print("test_retention_window_is_three_months")
     check(mm.ALLEMAIL_RESET_MODE == "rolling", f"rolling, got {mm.ALLEMAIL_RESET_MODE!r}")
