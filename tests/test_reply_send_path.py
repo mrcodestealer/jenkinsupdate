@@ -122,6 +122,16 @@ class Patched:
         return False
 
 
+def no_network(*_a, **_kw):
+    """Backstop: any code path that tries to open IMAP during a test is a test bug.
+
+    These tests must never touch a real mail server — doing so is slow, depends on whoever
+    runs them having credentials, and (with a real .env present) actually authenticates
+    against production.
+    """
+    raise AssertionError("test attempted a real IMAP connection")
+
+
 def base_patches(**extra):
     calls: dict = {"mid_lookup": []}
 
@@ -140,6 +150,10 @@ def base_patches(**extra):
         "_allemail_reply_lookup": lambda _t: dict(CACHE_ENTRY),
         "_allemail_enabled": lambda: True,
         "find_message_by_message_id": fake_mid_lookup,
+        # Every IMAP entry point gets a stub. Tests that want a specific route override these.
+        "_fetch_cached_entry_message": lambda *_a, **_kw: None,
+        "find_jenkins_reply_message_by_subject_title": lambda _t: None,
+        "_connect_imap_simple": no_network,
     }
     kw.update(extra)
     return Patched(**kw), calls
@@ -263,10 +277,7 @@ def test_quote_failure_still_sends_unquoted() -> None:
     def no_quote(_mid, _folders=None, *, uid_hint=None, budget=None):
         return None
 
-    patches, _ = base_patches(
-        find_message_by_message_id=no_quote,
-        find_jenkins_reply_message_by_subject_title=lambda _t: None,
-    )
+    patches, _ = base_patches(find_message_by_message_id=no_quote)
     with patches:
         out = mm.reply_jenkins_update_done_email(
             email_title=CACHE_ENTRY["subject"], completions=[("fpms-uat-branch", "6:10AM")]
