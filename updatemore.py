@@ -991,6 +991,17 @@ def _send_jenkins_email_reply(
             send, chat_id, detail_md=detail, completions=completions
         )
         return
+    except mm.JenkinsReplyMaybeSentError as ex:
+        # The message was already handed to the SMTP server — re-running would double-send.
+        send(
+            chat_id,
+            f"⚠️ **Jenkins email reply: delivery unconfirmed** — the message was already sent "
+            f"to the mail server, so it **may have gone out**.\n"
+            f"Subject: `{email_title}`\n"
+            f"**Check the thread before re-running** — replying again would send it twice.\n"
+            f"_{ex}_",
+        )
+        return
     except Exception as ex:
         send(
             chat_id,
@@ -1007,6 +1018,13 @@ def _send_jenkins_email_reply(
         if sent.get("quoted")
         else "⚠️ not quoted — plain text (original body could not be read)"
     )
+    # "in the thread" and "with the quote below it" are separate properties; a reply can be
+    # correctly threaded yet unquoted, and reporting that as one line hid real failures.
+    threaded_line = (
+        "✅ in the original thread (In-Reply-To)"
+        if sent.get("threaded", False)
+        else "⚠️ not threaded — the original had no Message-ID"
+    )
     send(
         chat_id,
         f"📧 Auto-replied email ({len(completions)} done block(s))\n"
@@ -1016,7 +1034,8 @@ def _send_jenkins_email_reply(
         f"- **Cc:** `{cc_line}`\n"
         f"- **Subject (search / Re:):** `{email_title}`\n"
         f"- **Environments:** {envs}\n"
-        f"- **Thread:** {quoted_line}",
+        f"- **Thread:** {quoted_line}\n"
+        f"- **Threading:** {threaded_line}",
     )
 
 

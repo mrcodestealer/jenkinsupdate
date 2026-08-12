@@ -31,3 +31,4 @@ env/
 __MACOSX/
 .idea/
 .vscode/
+tests/__pycache__/

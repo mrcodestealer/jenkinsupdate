@@ -26,6 +26,7 @@ IMAP watcher processes **today's mail only** (local ``MAINTENANCE_MAIL_TZ``,
 
 from __future__ import annotations
 
+import copy
 import email
 import hashlib
 import html as html_mod
@@ -39,10 +40,14 @@ import smtplib
 import ssl
 import threading
 import time
+import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from email import encoders
 from email.header import Header
-from email.header import decode_header
+from email.header import decode_header, make_header
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 from typing import Any, Callable
@@ -103,6 +108,33 @@ _JENKINS_REPLY_QUOTE_THREAD = (
 # missed quote only costs the collapsible thread — it never blocks the reply itself.
 _JENKINS_REPLY_QUOTE_TIMEOUT = float(
     os.getenv("JENKINS_REPLY_QUOTE_TIMEOUT", "").strip() or "30"
+)
+# Connecting must not be allowed to eat the whole quote budget: _JENKINS_REPLY_QUOTE_TIMEOUT
+# is the WALL-CLOCK budget for the lookup, this is only the socket connect/read timeout.
+_JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT = float(
+    os.getenv("JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT", "").strip() or "10"
+)
+# Transport failures (connect/timeout) are worth one more shot inside the budget; a clean
+# "not found" is not, so this only ever retries exceptions, never an empty result.
+_JENKINS_REPLY_QUOTE_RETRIES = max(
+    1, int(os.getenv("JENKINS_REPLY_QUOTE_RETRIES", "").strip() or "2")
+)
+_JENKINS_REPLY_QUOTE_RETRY_DELAY = float(
+    os.getenv("JENKINS_REPLY_QUOTE_RETRY_DELAY", "").strip() or "2"
+)
+# The subject-search fallback is not budget-aware — it uses the much longer
+# _JENKINS_REPLY_IMAP_TIMEOUT and scans every folder. Only start it with real time left.
+_JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT = float(
+    os.getenv("JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT", "").strip() or "5"
+)
+# Inline (cid:) images referenced by the quoted original are re-attached so the reply looks
+# like a manual Reply All instead of showing broken-image placeholders. Caps keep a vendor
+# mail with huge embedded screenshots from turning a working reply into an SMTP 552.
+_JENKINS_REPLY_INLINE_MAX_PART_BYTES = max(
+    0, int(os.getenv("JENKINS_REPLY_INLINE_MAX_PART_BYTES", "").strip() or str(5 * 1024 * 1024))
+)
+_JENKINS_REPLY_INLINE_MAX_TOTAL_BYTES = max(
+    0, int(os.getenv("JENKINS_REPLY_INLINE_MAX_BYTES", "").strip() or str(8 * 1024 * 1024))
 )
 # 1 = IMAP4_SSL on 993 (default). 0 = plain IMAP + STARTTLS (often port 143).
 IMAP_USE_SSL = (os.getenv("MAINTENANCE_MAIL_IMAP_SSL", "").strip() or "1") not in (
@@ -770,7 +802,8 @@ def _content_hash(body: str) -> str:
 
 
 _FORWARD_SEP = "---------- Forwarded message ----------"
-_REPLY_SEP = "---------- Original message ----------"
+# NOTE: there is deliberately no reply separator. A Lark **reply** emits none at all — the
+# gap lives on the meta wrapper instead (see _build_lark_quote_html's ``reply=True`` branch).
 _FORWARD_SIGNOFF_HTML = (
     '<div style="word-break:break-word;line-height:1.6;'
     'font-size:14px;color:rgb(0,0,0);">Best Regards,<br>JC<br><br></div>'
@@ -787,6 +820,8 @@ _LARK_META_STYLE = (
     "border-radius: 4px; margin-bottom: 12px;"
 )
 _LARK_FWD_META_MARGIN = "margin-top: 2px;"
+# A reply has no separator line above the meta block, so the gap lives on the meta wrapper.
+_LARK_REPLY_META_MARGIN = "margin-top: 24px;"
 _LARK_SEP_STYLE = "color: rgb(100, 106, 115); margin-top: 24px; margin-bottom: 8px;"
 _LARK_ADDR_STYLE = (
     "overflow-wrap: break-word; color: inherit; text-decoration: none; "
@@ -841,7 +876,6 @@ def _quote_labels(subject: str) -> dict[str, str]:
                 "to": "收件人",
                 "cc": "抄送",
                 "sep": "--------- 转发消息 ---------",
-                "sep_reply": "--------- 原始邮件 ---------",
             }
     return {
         "from": "From",
@@ -850,26 +884,56 @@ def _quote_labels(subject: str) -> dict[str, str]:
         "to": "To",
         "cc": "Cc",
         "sep": _FORWARD_SEP,
-        "sep_reply": _REPLY_SEP,
     }
 
 
 def _address_anchor(addr: str) -> str:
+    """``mailto:`` anchor as the Lark composer writes it.
+
+    The URL is percent-escaped and the display text HTML-escaped, so a quote or ``>`` inside a
+    malformed address cannot break out of the ``href`` attribute.
+    """
     e = _html_escape(addr)
+    u = urllib.parse.quote((addr or "").strip(), safe="@!$&'()*+,;=:._~-")
     return (
-        f'<a class="quote-head-meta-mailto" data-mailto="mailto:{e}" '
-        f'href="mailto:{e}" style="{_LARK_ADDR_STYLE}">{e}</a>'
+        f'<a class="quote-head-meta-mailto" data-mailto="mailto:{u}" '
+        f'href="mailto:{u}" style="{_LARK_ADDR_STYLE}">{e}</a>'
     )
 
 
-def _address_html(from_hdr: str) -> str:
-    name, addr = parseaddr(from_hdr)
-    anchor = _address_anchor(addr) if addr else _html_escape(from_hdr)
+def _address_pair_html(name: str, addr: str) -> str:
+    """One ``"Name"&lt;anchor&gt;`` mailbox. No space before ``&lt;`` — Lark writes none."""
     if name and addr:
-        return f'"{_html_escape(name)}"&lt;{anchor}&gt;'
+        return f'"{_html_escape(name)}"&lt;{_address_anchor(addr)}&gt;'
     if addr:
-        return f"&lt;{anchor}&gt;"
-    return anchor
+        return f"&lt;{_address_anchor(addr)}&gt;"
+    return _html_escape(name)
+
+
+def _address_html(from_hdr: str) -> str:
+    """Single mailbox (the ``From`` meta row) — Lark does **not** ``<span>``-wrap this one."""
+    name, addr = parseaddr(from_hdr)
+    if not addr:
+        return _html_escape(from_hdr)
+    return _address_pair_html(name, addr)
+
+
+def _address_list_html(raw_hdr: str | None) -> str:
+    """``To`` / ``Cc`` meta row: every mailbox its own ``<span>``, joined by ``", "``.
+
+    Parses the **raw** header and MIME-decodes each display name afterwards. Decoding first
+    would be wrong: a comma inside an RFC 2047 encoded name (``=?utf-8?B?RG9lLCBKb2hu?=`` →
+    ``Doe, John``) is not an address separator, but once decoded it is indistinguishable from
+    one — and ``getaddresses`` would invent a recipient called ``Doe`` with a live mailto link.
+    """
+    raw = raw_hdr or ""
+    pairs = [
+        (_decode_mime_header(n) or "", a) for n, a in getaddresses([raw]) if n or a
+    ]
+    if not pairs:
+        # '' and group syntax such as 'undisclosed-recipients:;' both parse to [('', '')].
+        return _html_escape(_decode_mime_header(raw) or raw)
+    return ", ".join(f"<span>{_address_pair_html(n, a)}</span>" for n, a in pairs)
 
 
 def _meta_row(label: str, content: str) -> str:
@@ -889,43 +953,83 @@ def _body_is_html(s: str) -> bool:
 
 
 def _sanitize_embedded_html(html: str) -> str:
-    """Drop outer document wrappers so nested HTML does not break Lark quote detection."""
+    """Reduce an original's HTML document to a fragment safe to nest inside our quote.
+
+    Three things matter here and each was a real defect:
+
+    * the ``<body>`` capture is **non-greedy** — a greedy one spanning two documents used to
+      splice unrelated content together;
+    * the ``html``/``body``/``head`` tag strip runs on **both** exits, so a document without a
+      ``<body>`` no longer keeps its wrapper tags;
+    * ``<style>``/``<script>`` are removed **after** body extraction. Head-level styles were
+      already dropped, but body-level ones survived and restyled our own reply text above the
+      quote — mail clients have no scoping, so a vendor's CSS applied document-wide.
+    """
     t = (html or "").strip()
     if not t:
         return ""
     t = re.sub(r"(?is)<!DOCTYPE[^>]*>", "", t)
     t = re.sub(r"(?is)<head\b[^>]*>.*?</head>", "", t)
-    m = re.search(r"(?is)<body\b[^>]*>(.*)</body>", t)
+    m = re.search(r"(?is)<body\b[^>]*>(.*?)</body>", t)
     if m:
-        return m.group(1).strip()
-    t = re.sub(r"(?is)</?html\b[^>]*>", "", t)
+        t = m.group(1)
+    t = re.sub(r"(?is)</?(?:html|body|head)\b[^>]*>", "", t)
+    t = re.sub(r"(?is)<style\b[^>]*>.*?</style>", "", t)
+    t = re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", t)
     return t.strip()
 
 
+def _decode_text_part(part: email.message.Message) -> str | None:
+    try:
+        payload = part.get_payload(decode=True)
+    except Exception:
+        return None
+    if not payload:
+        return None
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except Exception:
+        return payload.decode("utf-8", errors="replace")
+
+
+def _pick_html_body(part: email.message.Message) -> str | None:
+    """The ONE ``text/html`` part a composer would treat as the message body.
+
+    ``walk()`` recurses into ``message/rfc822``, and an attached ``.eml``'s inner ``text/html``
+    carries no ``Content-Disposition`` of its own — so a flat walk used to collect it and
+    concatenate an unrelated mail into the quote. Pruning whole subtrees is what fixes that.
+    """
+    ctype = (part.get_content_type() or "").lower()
+    disp = str(part.get("Content-Disposition") or "").lower()
+    if "attachment" in disp or ctype == "message/rfc822":
+        return None
+    if ctype == "text/html":
+        return _decode_text_part(part)
+    if not part.is_multipart():
+        return None
+    children = part.get_payload()
+    if not isinstance(children, list):
+        return None
+    # multipart/alternative lists poorest-first, so the richest representation is last.
+    ordered = reversed(children) if ctype == "multipart/alternative" else children
+    for child in ordered:
+        if not isinstance(child, email.message.Message):
+            continue
+        found = _pick_html_body(child)
+        if found:
+            return found
+    return None
+
+
 def extract_body_html_raw(msg: email.message.Message) -> str | None:
-    """Original HTML part(s) without converting to plain text."""
+    """The original's own HTML body, ignoring attached messages and attachments."""
     html_parts: list[str] = []
 
     if msg.is_multipart():
-        for part in msg.walk():
-            ctype = (part.get_content_type() or "").lower()
-            disp = str(part.get("Content-Disposition") or "").lower()
-            if "attachment" in disp:
-                continue
-            if ctype != "text/html":
-                continue
-            try:
-                payload = part.get_payload(decode=True)
-            except Exception:
-                continue
-            if not payload:
-                continue
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                text = payload.decode(charset, errors="replace")
-            except Exception:
-                text = payload.decode("utf-8", errors="replace")
-            html_parts.append(text)
+        picked = _pick_html_body(msg)
+        if picked:
+            html_parts.append(picked)
     else:
         if (msg.get_content_type() or "").lower() == "text/html":
             try:
@@ -959,16 +1063,26 @@ def _build_lark_quote_html(
 ) -> str:
     """
     Quote block per Lark composer (``history-quote-wrapper`` + block class).
-    See larksuite/cli ``mail_quote.go``. ``reply=True`` swaps the "Forwarded
-    message" separator for the reply one; pass ``block_class`` to match
-    (``--header`` for Fw:, ``--collapsed`` for Re:).
+
+    Mirrors larksuite/cli ``shortcuts/mail/mail_quote.go``. The two shapes are genuinely
+    different, not one shape with a different separator string:
+
+    ``reply=True`` (``--collapsed``) — **no** separator line at all, meta wrapper
+    ``adit-html-block__attr history-quote-meta-wrapper history-quote-gap-tag``, and **no**
+    ``id`` attributes (upstream calls ``genID`` only on the forward path, and its ``-cli``
+    prefix is a provenance marker for CLI-generated mail that a reply must not carry).
+
+    ``reply=False`` (``--header``) — forward separator, meta wrapper
+    ``adit-html-block__header history-quote-meta-after-forward-title …``, ids on the wrapper
+    and the inner div. Left byte-for-byte as it was.
     """
     subj = _decode_mime_header(msg.get("Subject")) or ""
     labels = _quote_labels(subj)
-    sep_label = labels["sep_reply"] if reply else labels["sep"]
     from_hdr = _decode_mime_header(msg.get("From")) or "Unknown"
-    to_hdr = _decode_mime_header(msg.get("To")) or ""
-    cc_hdr = _decode_mime_header(msg.get("Cc")) or ""
+    # Address rows take the RAW headers — see _address_list_html on why decoding first breaks
+    # display names containing a comma.
+    to_raw = msg.get("To") or ""
+    cc_raw = msg.get("Cc") or ""
     date_line = _format_forward_date_lark(msg)
 
     meta_rows = [_meta_row(labels["from"], _address_html(from_hdr))]
@@ -976,10 +1090,42 @@ def _build_lark_quote_html(
         meta_rows.append(_meta_row(labels["date"], _html_escape(date_line)))
     if subj:
         meta_rows.append(_meta_row(labels["subject"], _html_escape(subj)))
-    meta_rows.append(_meta_row(labels["to"], _html_escape(to_hdr)))
-    if cc_hdr:
-        meta_rows.append(_meta_row(labels["cc"], _html_escape(cc_hdr)))
+    meta_rows.append(_meta_row(labels["to"], _address_list_html(to_raw)))
+    if (_decode_mime_header(cc_raw) or "").strip():
+        meta_rows.append(_meta_row(labels["cc"], _address_list_html(cc_raw)))
     meta_inner = "".join(meta_rows)
+
+    body_raw = extract_body_html_raw(msg)
+    if body_raw and _body_is_html(body_raw):
+        body_html = _sanitize_embedded_html(body_raw)
+    else:
+        plain = extract_body_from_message(msg)
+        if plain:
+            lines = plain.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            body_html = (
+                '<div style="word-break:break-word;line-height:1.6;font-size:14px;'
+                'color:rgb(31,35,41);white-space:pre-wrap;">'
+                + "<br>".join(_html_escape(ln) for ln in lines)
+                + "</div>"
+            )
+        else:
+            body_html = ""
+    body_part = f"<div>{body_html}</div>" if body_html else ""
+
+    if reply:
+        meta_html = (
+            f'<div class="adit-html-block__attr history-quote-meta-wrapper '
+            f'history-quote-gap-tag" style="{_LARK_REPLY_META_MARGIN} {_LARK_META_STYLE}">'
+            f'<div style="word-break: break-word;">{meta_inner}</div></div>'
+        )
+        return (
+            f'<div class="{_LARK_QUOTE_WRAPPER}">'
+            f'<div data-html-block="quote" data-mail-html-ignore="">'
+            f'<div class="adit-html-block {block_class}" '
+            f'style="{_LARK_QUOTE_BORDER}">'
+            f"<div>{meta_html}{body_part}</div>"
+            f"</div></div></div>"
+        )
 
     meta_id = _gen_lark_id("lark-mail-meta-cli")
     meta_html = (
@@ -991,20 +1137,8 @@ def _build_lark_quote_html(
 
     sep_html = (
         f'<div class="history-quote-forward-title lme-line-signal history-quote-gap-tag" '
-        f'style="{_LARK_SEP_STYLE}">{_html_escape(sep_label)}</div>'
+        f'style="{_LARK_SEP_STYLE}">{_html_escape(labels["sep"])}</div>'
     )
-
-    body_raw = extract_body_html_raw(msg)
-    if body_raw and _body_is_html(body_raw):
-        body_html = _sanitize_embedded_html(body_raw)
-    else:
-        plain = extract_body_from_message(msg)
-        body_html = (
-            f'<pre style="white-space:pre-wrap">{_html_escape(plain)}</pre>'
-            if plain
-            else ""
-        )
-    body_part = f"<div>{body_html}</div>" if body_html else ""
 
     outer_id = _gen_lark_id("lark-mail-quote-cli")
     inner_id = _gen_lark_id("lark-mail-quote-cli")
@@ -1075,6 +1209,137 @@ def build_reply_message_html(text: str, msg: email.message.Message) -> str:
         f'<div dir="ltr">{top}{gap}{quote}</div>'
         "</body></html>"
     )
+
+
+_CID_REF_RE = re.compile(
+    r"""(?ix)
+    (?: (?:src|background) \s* = \s* ["']? \s* cid: ([^"'>\s)]+) )
+    | (?: url \( \s* ['"]? cid: ([^'")\s]+) )
+    """
+)
+
+
+def _cids_referenced_by(html: str) -> list[str]:
+    """Content-IDs the generated HTML actually points at, normalised for comparison."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _CID_REF_RE.finditer(html or ""):
+        raw = m.group(1) or m.group(2) or ""
+        # RFC 2392 allows percent-encoding in a cid: URL; Content-ID headers are never encoded.
+        key = urllib.parse.unquote(raw).strip().strip("<>").casefold()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _part_headers_are_clean(part: email.message.Message) -> bool:
+    """False when any header value is non-ASCII (raw 8-bit bytes or surrogate-escaped).
+
+    compat32 flattens such a header by RFC 2047-encoding the **whole** value, so
+    ``Content-Type: image/png; name="截图.png"`` becomes a single ``=?unknown-8bit?b?…?=``
+    word and the receiving client reads the part as ``text/plain`` — leaving the image a
+    broken placeholder, which is exactly what re-attaching it was meant to fix.
+    """
+    return all(str(value).isascii() for _name, value in part.items())
+
+
+def _clone_inline_part(
+    part: email.message.Message, payload: bytes
+) -> email.message.Message:
+    """A sendable copy of a cid-referenced part.
+
+    Verbatim ``deepcopy`` is the fast path and keeps ``Content-Type`` params (``name=``) and
+    the transfer encoding byte-for-byte. It is only safe when the source is already 7-bit-safe:
+    a part sent ``8bit``/``binary`` keeps a non-ASCII payload, and ``smtplib`` then dies on
+    ``msg.encode("ascii")`` — losing the whole reply. Those get re-encoded as base64 instead.
+    """
+    cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+    if cte in ("base64", "quoted-printable") and _part_headers_are_clean(part):
+        # deepcopy: `source` is reused by allemail_store_message on a background thread.
+        clone = copy.deepcopy(part)
+    else:
+        clone = MIMEBase(part.get_content_maintype(), part.get_content_subtype())
+        clone.set_payload(payload)
+        encoders.encode_base64(clone)
+        cid = part.get("Content-ID")
+        if cid and _part_headers_are_clean(part):
+            clone["Content-ID"] = str(cid)
+        elif cid:
+            # Keep the id (the <img> needs it) but drop anything unrepresentable.
+            clone["Content-ID"] = str(cid).encode("utf-8", "replace").decode("ascii", "ignore")
+        name = part.get_filename()
+        if name:
+            try:
+                clone.set_param("name", name, header="Content-Type", charset="utf-8")
+            except Exception:  # noqa: BLE001 — a filename is never worth losing the image over
+                pass
+    if not clone.get("Content-Disposition"):
+        clone.add_header("Content-Disposition", "inline")
+    return clone
+
+
+def _html_message_with_inline_images(
+    html: str, source: email.message.Message
+) -> email.message.Message:
+    """``text/html``, upgraded to ``multipart/related`` when the quote references ``cid:`` parts.
+
+    Without this the quoted original keeps its ``<img src="cid:…">`` tags while the images
+    themselves are left behind, so the recipient sees broken-image placeholders exactly where
+    a manual **Reply All** shows the picture.
+
+    ``multipart/related; type="text/html"`` is *not* ``multipart/alternative``, so this does
+    not violate the single-representation rule that keeps Lark from expanding the quote as
+    raw text. With no referenced parts the result is byte-identical to the old single part.
+    """
+    text_part = MIMEText(html, "html", "utf-8")
+    wanted = _cids_referenced_by(html)
+    if not wanted:
+        return text_part
+
+    matched: list[email.message.Message] = []
+    total = 0
+    for part in source.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        cid = (part.get("Content-ID") or "").strip().strip("<>").casefold()
+        if not cid or cid not in wanted:
+            continue
+        if any(
+            (p.get("Content-ID") or "").strip().strip("<>").casefold() == cid for p in matched
+        ):
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        # Deliberately not filtered on maintype 'image' (senders use application/octet-stream)
+        # nor on Content-Disposition (a referenced part may be marked 'attachment').
+        if _JENKINS_REPLY_INLINE_MAX_PART_BYTES and len(payload) > _JENKINS_REPLY_INLINE_MAX_PART_BYTES:
+            print(
+                f"[maint-mail] inline image {cid!r} skipped: {len(payload)} bytes over cap",
+                flush=True,
+            )
+            continue
+        total += len(payload)
+        if _JENKINS_REPLY_INLINE_MAX_TOTAL_BYTES and total > _JENKINS_REPLY_INLINE_MAX_TOTAL_BYTES:
+            print(
+                "[maint-mail] inline images over total cap — replying without them "
+                f"({total} bytes)",
+                flush=True,
+            )
+            return text_part
+        matched.append(_clone_inline_part(part, payload))
+
+    if not matched:
+        return text_part
+
+    related = MIMEMultipart("related")
+    related.set_param("type", "text/html")
+    related.attach(text_part)
+    for part in matched:
+        related.attach(part)
+    return related
 
 
 def _html_to_text(html: str) -> str:
@@ -1487,13 +1752,84 @@ def _normalize_email_address(addr: str) -> str:
 
 
 def _own_smtp_identities() -> set[str]:
-    """Addresses we must not include as recipients (our sending mailbox)."""
+    """Addresses that mark a message as **ours** when picking a reply target.
+
+    Deliberately broad (sending mailbox **plus** ``JENKINS_DONE_REPLY_TO``): it is what keeps
+    our own ``Sent`` copies — a self-forward addressed ``To: junchen@, Cc: om@`` — from being
+    mistaken for a vendor thread we should reply to. It is **not** the recipient-exclusion set;
+    see :func:`_sending_mailbox_identities`.
+    """
     ids: set[str] = set()
     for raw in (MAIL_USER, JENKINS_DONE_REPLY_TO):
         a = (raw or "").strip()
         if a:
             ids.add(_normalize_email_address(a))
     return ids
+
+
+def _sending_mailbox_identities() -> set[str]:
+    """Addresses to drop from a Reply-All recipient list — only the mailbox we send *as*.
+
+    A manual **Reply All** keeps every other participant, so anything wider than this would
+    silently drop a real person from the thread. ``JENKINS_REPLY_SELF_ALIASES`` (comma list)
+    covers extra aliases that deliver to the same mailbox.
+    """
+    ids: set[str] = set()
+    raw_all = [MAIL_USER, *(os.getenv("JENKINS_REPLY_SELF_ALIASES", "") or "").split(",")]
+    for raw in raw_all:
+        a = (raw or "").strip()
+        if a:
+            ids.add(_normalize_email_address(a))
+    return ids
+
+
+def _mail_domain() -> str:
+    """Domain of our sending mailbox, or ``""`` when ``MAIL_USER`` is not a usable address."""
+    if "@" not in (MAIL_USER or ""):
+        return ""
+    dom = MAIL_USER.rsplit("@", 1)[-1].strip().lower()
+    return dom if "." in dom else ""
+
+
+def _new_msgid() -> str:
+    """``Message-ID`` on our own domain.
+
+    Bare :func:`make_msgid` falls back to ``socket.getfqdn()``, which leaks the host name
+    (``…​.local``, ``…​.ip6.arpa``) and makes one mailbox emit several Message-ID domains.
+    """
+    dom = _mail_domain()
+    return make_msgid(domain=dom) if dom else make_msgid()
+
+
+def _set_subject_header(msg: email.message.Message, subject: str) -> None:
+    """Assign ``Subject`` the way a mail client does: literal when ASCII, RFC 2047 otherwise.
+
+    ``Header(x, "utf-8")`` encodes unconditionally, so a plain ``Re: Foo`` goes out as
+    ``=?utf-8?q?Re=3A_Foo?=`` — hiding the literal ``Re:`` from subject-based threading and
+    from anyone reading the raw source. Pure-ASCII subjects are therefore written literally.
+
+    Mixed subjects are attempted per ASCII/non-ASCII run so ``Re:`` and ``[TAG]`` stay readable,
+    **but only when that survives a decode round-trip**. RFC 2047 requires linear whitespace
+    between an encoded word and adjacent text, so ``Header`` inserts a space at every run
+    boundary: ``Re: 系统maintenance`` would arrive as ``Re: 系统 maintenance``. A corrupted
+    subject breaks the reply-lookup that matches on it, so any mismatch falls back to encoding
+    the whole string — uglier on the wire, but always exact.
+
+    Scrubbing CR/LF is not cosmetic: an embedded newline makes the assignment raise
+    ``HeaderParseError``, which would lose the reply entirely.
+    """
+    subj = re.sub(r"[\r\n]+", " ", subject or "").strip()
+    if subj.isascii():
+        msg["Subject"] = subj
+        return
+    hdr = Header(header_name="Subject", continuation_ws=" ")
+    for run in re.findall(r"[^\x00-\x7f]+|[\x00-\x7f]+", subj):
+        hdr.append(run, "us-ascii" if run.isascii() else "utf-8")
+    try:
+        round_trip = str(make_header(decode_header(hdr.encode()))) == subj
+    except Exception:  # noqa: BLE001 — any decode trouble means "don't risk it"
+        round_trip = False
+    msg["Subject"] = hdr if round_trip else Header(subj, "utf-8")
 
 
 def _parse_header_address_list(msg: email.message.Message, header: str) -> list[str]:
@@ -1517,14 +1853,21 @@ def _parse_header_address_list(msg: email.message.Message, header: str) -> list[
 
 def _jenkins_reply_all_recipients(
     orig: email.message.Message,
+    *,
+    exclude: set[str] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """
     Reply-all: every address on original **To** + **Cc** (+ **From** on To).
 
     ``Cc`` keeps all original Cc lines (even when the same person is also on To).
     SMTP delivery dedupes so each mailbox gets one message.
+
+    ``exclude`` defaults to the broad :func:`_own_smtp_identities` so *candidate-selection*
+    callers keep their existing behaviour verbatim. Paths that actually build the outgoing
+    headers pass the narrow :func:`_sending_mailbox_identities` instead, so a colleague who is
+    a genuine participant is not dropped from a thread a manual Reply All would keep them on.
     """
-    own = _own_smtp_identities()
+    own = _own_smtp_identities() if exclude is None else exclude
     orig_to = _parse_header_address_list(orig, "To")
     orig_cc = _parse_header_address_list(orig, "Cc")
     orig_from = _parse_header_address_list(orig, "From")
@@ -1614,10 +1957,10 @@ def forward_maintenance_email(
         msg.replace_header("Content-Type", 'text/html; charset="utf-8"')
     else:
         msg = MIMEText("", "html", "utf-8")
-    msg["Subject"] = Header(subj, "utf-8")
+    _set_subject_header(msg, subj)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _new_msgid()
     if FORWARD_THREAD_HEADERS:
         _apply_in_reply_to_headers(msg, original_msg)
     msg["To"] = formataddr((EVO_BATCH_MAIL_TO_NAME, EVO_BATCH_MAIL_TO))
@@ -1642,10 +1985,10 @@ def send_evo_batch_maintenance_email(*, subject: str, body: str) -> None:
     if not text:
         raise ValueError("empty EVO batch email body")
     msg = MIMEText(text, "plain", "utf-8")
-    msg["Subject"] = Header(subj, "utf-8")
+    _set_subject_header(msg, subj)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _new_msgid()
     msg["To"] = formataddr((EVO_BATCH_MAIL_TO_NAME, EVO_BATCH_MAIL_TO))
     msg["Cc"] = formataddr((EVO_BATCH_MAIL_CC_NAME, EVO_BATCH_MAIL_CC))
     recipients = [EVO_BATCH_MAIL_TO, EVO_BATCH_MAIL_CC]
@@ -1680,7 +2023,7 @@ def send_egs_maintenance_email(
     if append_signature and EGS_MAIL_SIGNATURE:
         text = f"{text}\n\n{EGS_MAIL_SIGNATURE}"
     msg = MIMEText(text, "plain", "utf-8")
-    msg["Subject"] = Header(subj, "utf-8")
+    _set_subject_header(msg, subj)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["Date"] = formatdate(localtime=True)
     mid = make_msgid()
@@ -1724,6 +2067,29 @@ class EmailThreadNotFoundError(LookupError):
 
 class JenkinsReplyOnlyBouncesError(EmailThreadNotFoundError):
     """Subject matches exist but every candidate was a delivery-failure / bounce notice."""
+
+
+# Failures that mean the message was NEVER transmitted, so the caller may safely fall back
+# and retry. Resolved once at import: evaluating this inside an ``except`` clause would make a
+# lookup error silently disable the double-send protection.
+_SMTP_PRE_DELIVERY_ERRORS: tuple[type[BaseException], ...] = (
+    smtplib.SMTPHeloError,          # EHLO/HELO failed
+    smtplib.SMTPSenderRefused,      # MAIL FROM refused
+    smtplib.SMTPRecipientsRefused,  # every RCPT refused; smtplib RSETs before DATA
+    smtplib.SMTPNotSupportedError,  # capability check
+    smtplib.SMTPDataError,          # server explicitly rejected the body (e.g. 552 too big)
+    smtplib.SMTPAuthenticationError,
+    smtplib.SMTPConnectError,
+    UnicodeEncodeError,             # smtplib's encode("ascii"), before any socket I/O
+)
+
+
+class JenkinsReplyMaybeSentError(RuntimeError):
+    """SMTP failed *after* the message was handed over — it may already be delivered.
+
+    Callers must never retry or fall back to another send path on this; doing so is how the
+    same Reply-All reaches the whole thread twice.
+    """
 
 
 def _connect_imap_simple(*, timeout: float | None = None) -> imaplib.IMAP4:
@@ -2306,19 +2672,24 @@ def _header_reply_recipient_count(to_raw: str, cc_raw: str, from_raw: str) -> in
         return 0
 
 
-def _header_is_prior_bot_reply(
-    h: dict[str, Any], *, own: set[str], body_peek: str | None = None
-) -> bool:
+def _header_is_prior_bot_reply(h: dict[str, Any], *, own: set[str]) -> bool:
+    """``Re:`` from one of our own addresses — i.e. a reply we sent, not a real original.
+
+    This used to re-check the body for a marker string (``"this is just the bot auto replied
+    email"``) that **no code path has ever emitted**, so the re-check always said "not ours"
+    and our own ``Re:`` copy was accepted as a reply target on the first pass. Own-From plus a
+    leading ``Re:`` is sufficient and needs no extra IMAP round trip. This does not fail
+    closed: the later ``allow_bot=True`` pass can still pick such a message as a last resort.
+    """
     subj = (h.get("subj") or "").strip()
     from_hdr = h.get("from_hdr") or ""
-    if not re.match(r"^re:\s", subj, re.I):
+    # Tolerant of "Re:X" / "RE :" — a missing space must not turn our own reply back into a
+    # "genuine original" (this and _message_is_own_reply must never disagree).
+    if not re.match(r"^\s*re\s*:", subj, re.I):
         return False
-    for _n, addr in getaddresses([from_hdr]):
-        if _normalize_email_address(addr) in own:
-            if body_peek is None:
-                return True
-            return _body_has_bot_auto_reply_marker(body_peek)
-    return False
+    return any(
+        _normalize_email_address(addr) in own for _n, addr in getaddresses([from_hdr])
+    )
 
 
 def _fetch_header_peek_for_uid(
@@ -2458,17 +2829,14 @@ def _pick_reply_uid_among_candidates(
             else:
                 reason = "no To/Cc recipients (headers)"
         else:
-            body_peek = None
             if _header_is_prior_bot_reply(h, own=own):
-                body_peek = _fetch_body_peek_for_uid(mail, uid, limit=500)
-                if _header_is_prior_bot_reply(h, own=own, body_peek=body_peek):
-                    rcpt_n = _header_reply_recipient_count(to_raw, cc_raw, from_hdr)
-                    nonlocal bot_with_rcpt, bot_with_rcpt_n
-                    if rcpt_n > bot_with_rcpt_n:
-                        bot_with_rcpt = uid
-                        bot_with_rcpt_n = rcpt_n
-                    if not allow_bot:
-                        reason = "bot auto-reply (body)"
+                rcpt_n = _header_reply_recipient_count(to_raw, cc_raw, from_hdr)
+                nonlocal bot_with_rcpt, bot_with_rcpt_n
+                if rcpt_n > bot_with_rcpt_n:
+                    bot_with_rcpt = uid
+                    bot_with_rcpt_n = rcpt_n
+                if not allow_bot:
+                    reason = "our own Re: (prior auto-reply)"
             if not reason:
                 elapsed = time.monotonic() - t0
                 print(
@@ -4282,11 +4650,13 @@ def find_message_by_subject_title(
     title: str,
     *,
     folders: list[str] | None = None,
-) -> tuple[email.message.Message, str] | None:
+) -> tuple[email.message.Message, str, str] | None:
     """
     Search ``folders`` (in order) for the newest message matching ``title``.
 
-    Returns ``(message, folder_name)`` or ``None``.
+    Returns ``(message, folder_name, uid)`` or ``None``. The UID is carried out so callers can
+    record it in ``allemail.json`` — that is what lets a later reply re-read the original by
+    ``(folder, uid)`` instead of a server-side header search.
     """
     needle = (title or "").strip()
     if not needle:
@@ -4357,7 +4727,11 @@ def find_message_by_subject_title(
             f"({time.monotonic() - t0:.1f}s, 1× RFC822)",
             flush=True,
         )
-        return msg, best_folder
+        try:
+            best_uid_s = best_uid.decode("ascii", errors="ignore").strip()
+        except Exception:
+            best_uid_s = ""
+        return msg, best_folder, best_uid_s
     finally:
         try:
             mail.logout()
@@ -4367,13 +4741,17 @@ def find_message_by_subject_title(
 
 def find_jenkins_reply_message_by_subject_title(
     title: str,
-) -> tuple[email.message.Message, str] | None:
-    """Newest match in ``JENKINS_REPLY_IMAP_FOLDERS`` (INBOX, OSE Pending, Sent, …)."""
+) -> tuple[email.message.Message, str, str] | None:
+    """Newest match in ``JENKINS_REPLY_IMAP_FOLDERS`` — ``(message, folder, uid)``."""
     return find_message_by_subject_title(title, folders=JENKINS_REPLY_IMAP_FOLDERS)
 
 
 def find_message_by_message_id(
-    message_id: str, folders: list[str] | None = None
+    message_id: str,
+    folders: list[str] | None = None,
+    *,
+    uid_hint: tuple[str, str] | None = None,
+    budget: float | None = None,
 ) -> email.message.Message | None:
     """Fetch a full message by its ``Message-ID`` (first folder hit wins).
 
@@ -4385,18 +4763,52 @@ def find_message_by_message_id(
     ``folders`` are searched **first** (e.g. the folder the cache saw the mail in), then
     ``JENKINS_REPLY_IMAP_FOLDERS`` — it narrows the common case without ever shrinking
     the search.
+
+    ``uid_hint`` is the ``(folder, uid)`` the cache recorded for this message. A UID is only
+    meaningful inside the mailbox it came from, so both members must be present; the fetched
+    message's ``Message-ID`` is re-checked before it is trusted (a UIDVALIDITY roll can point
+    the same UID at a different mail) and anything unexpected falls through to the search.
+
+    ``budget`` is the wall-clock allowance for the whole lookup; the socket timeout is the
+    much shorter ``_JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT`` so connecting cannot consume it all.
     """
     mid = (message_id or "").strip()
+    want = _normalize_message_id(mid)
     if not mid:
         return None
     safe = mid.replace('"', "").replace("\\", "")
+    deadline = _JENKINS_REPLY_QUOTE_TIMEOUT if budget is None else budget
     t0 = time.monotonic()
     try:
-        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_QUOTE_TIMEOUT)
+        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT)
     except Exception as ex:  # noqa: BLE001 — quoting is best-effort
         print(f"[maint-mail] quote lookup connect failed: {ex!r}", flush=True)
         return None
     try:
+        hint_folder = (uid_hint[0] or "").strip() if uid_hint else ""
+        hint_uid = (uid_hint[1] or "").strip() if uid_hint else ""
+        if hint_folder and hint_uid:
+            # Direct fetch — no server-side SEARCH at all when the cache locator still holds.
+            try:
+                if _select_mail_folder(mail, hint_folder, readonly=True):
+                    hinted = _fetch_uid_message(mail, _uid_as_bytes(hint_uid))
+                    if hinted is not None:
+                        got = _normalize_message_id(hinted.get("Message-ID") or "")
+                        if want and got and got == want:
+                            print(
+                                f"[maint-mail] quote source for {mid} via uid hint "
+                                f"{hint_folder!r}:{hint_uid} ({time.monotonic() - t0:.1f}s)",
+                                flush=True,
+                            )
+                            return hinted
+                        print(
+                            f"[maint-mail] uid hint {hint_folder!r}:{hint_uid} points at "
+                            f"{got or '(no message-id)'} not {want} — falling back to search",
+                            flush=True,
+                        )
+            except (imaplib.IMAP4.error, OSError, ImapStaleConnectionError, ValueError) as ex:
+                print(f"[maint-mail] quote uid hint failed: {ex!r}", flush=True)
+
         seen: set[str] = set()
         scan: list[str] = []
         for f in (folders or []) + list(JENKINS_REPLY_IMAP_FOLDERS):
@@ -4407,10 +4819,10 @@ def find_message_by_message_id(
             seen.add(key)
             scan.append(name)
         for folder in scan:
-            if time.monotonic() - t0 > _JENKINS_REPLY_QUOTE_TIMEOUT:
+            if time.monotonic() - t0 > deadline:
                 print(
                     f"[maint-mail] quote lookup budget "
-                    f"({_JENKINS_REPLY_QUOTE_TIMEOUT:.0f}s) spent before {folder!r} — "
+                    f"({deadline:.0f}s) spent before {folder!r} — "
                     "replying without the quoted thread",
                     flush=True,
                 )
@@ -4421,6 +4833,14 @@ def find_message_by_message_id(
                 uids = _uid_search(mail, f'(HEADER Message-ID "{safe}")')
                 if not uids:
                     continue
+                if time.monotonic() - t0 > deadline:
+                    # A large RFC822 fetch must not be started outside the budget.
+                    print(
+                        f"[maint-mail] quote lookup budget ({deadline:.0f}s) spent before "
+                        f"fetching from {folder!r} — replying without the quoted thread",
+                        flush=True,
+                    )
+                    break
                 msg = _fetch_uid_message(mail, uids[-1])
                 if msg is not None:
                     print(
@@ -4439,6 +4859,48 @@ def find_message_by_message_id(
             pass
     print(f"[maint-mail] quote source not found for {mid}", flush=True)
     return None
+
+
+def _fetch_cached_entry_message(
+    folder: str, uid: str, *, expect_subject: str = ""
+) -> email.message.Message | None:
+    """Fetch a cached entry straight by ``(folder, uid)`` — for entries with no Message-ID.
+
+    Without a Message-ID there is nothing to re-check against, so the subject is verified
+    instead; on a mismatch this returns ``None``. Quoting the wrong mail underneath a reply
+    is worse than quoting nothing.
+    """
+    fold = (folder or "").strip()
+    u = (uid or "").strip()
+    if not fold or not u:
+        return None
+    try:
+        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT)
+    except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+        print(f"[maint-mail] quote uid fetch connect failed: {ex!r}", flush=True)
+        return None
+    try:
+        if not _select_mail_folder(mail, fold, readonly=True):
+            return None
+        msg = _fetch_uid_message(mail, _uid_as_bytes(u))
+        if msg is None:
+            return None
+        want = (expect_subject or "").strip()
+        if want and _decode_msg_subject(msg).strip() != want:
+            print(
+                f"[maint-mail] quote uid fetch {fold!r}:{u} subject mismatch — discarding",
+                flush=True,
+            )
+            return None
+        return msg
+    except (imaplib.IMAP4.error, OSError, ImapStaleConnectionError, ValueError) as ex:
+        print(f"[maint-mail] quote uid fetch {fold!r}:{u} failed: {ex!r}", flush=True)
+        return None
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -4673,8 +5135,14 @@ def scan_allemail_cache() -> int:
     return len(scanned)
 
 
-def allemail_store_message(orig: email.message.Message, *, folder: str = "") -> None:
-    """Best-effort: index a live-fetched message so the next reply hits the cache."""
+def allemail_store_message(
+    orig: email.message.Message, *, folder: str = "", uid: str = ""
+) -> None:
+    """Best-effort: index a live-fetched message so the next reply hits the cache.
+
+    ``uid`` is what makes the entry fetch-addressable — without it the next reply has to fall
+    back to a server-side ``HEADER Message-ID`` search to re-read the body for the quote.
+    """
     if not _allemail_enabled():
         return
     try:
@@ -4708,7 +5176,7 @@ def allemail_store_message(orig: email.message.Message, *, folder: str = "") -> 
             "date_ts": ts,
             "auto_submitted": (_decode_mime_header(orig.get("Auto-Submitted")) or "").strip(),
             "folder": folder,
-            "uid": "",
+            "uid": (uid or "").strip(),
         }
         with _allemail_lock:
             emails = _allemail_load().get("emails", [])
@@ -4745,9 +5213,16 @@ def _allemail_entry_stub(entry: dict[str, Any]) -> email.message.Message:
 
 def _allemail_entry_reply_recipients(
     entry: dict[str, Any],
+    *,
+    for_send: bool = False,
 ) -> tuple[list[str], list[str], list[str]] | None:
+    """``for_send=True`` builds the real recipient list (drops only our sending mailbox);
+    the default is the broad candidate-screening set — see :func:`_jenkins_reply_all_recipients`."""
     try:
-        return _jenkins_reply_all_recipients(_allemail_entry_stub(entry))
+        return _jenkins_reply_all_recipients(
+            _allemail_entry_stub(entry),
+            exclude=_sending_mailbox_identities() if for_send else None,
+        )
     except ValueError:
         return None
 
@@ -4843,11 +5318,14 @@ def _send_jenkins_reply_all(
     Returns True when the sent mail carried the quoted thread.
     """
     quoted = False
-    msg: MIMEText | None = None
+    msg: email.message.Message | None = None
     if quote_source is not None:
         try:
-            msg = MIMEText(build_reply_message_html(body, quote_source), "html", "utf-8")
-            msg.replace_header("Content-Type", 'text/html; charset="utf-8"')
+            msg = _html_message_with_inline_images(
+                build_reply_message_html(body, quote_source), quote_source
+            )
+            if msg.get_content_type() == "text/html":
+                msg.replace_header("Content-Type", 'text/html; charset="utf-8"')
             quoted = True
         except Exception as ex:  # noqa: BLE001 — quoting is best-effort
             print(
@@ -4858,23 +5336,190 @@ def _send_jenkins_reply_all(
             msg = None
     if msg is None:
         msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = Header(reply_subject, "utf-8")
+    _set_subject_header(msg, reply_subject)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["To"] = ", ".join(to_addrs)
     if cc_addrs:
         msg["Cc"] = ", ".join(cc_addrs)
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _new_msgid()
     omid = (orig_message_id or "").strip()
     if omid:
         msg["In-Reply-To"] = omid
         refs = (orig_references or "").strip()
         msg["References"] = f"{refs} {omid}".strip() if refs else omid
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=IMAP_TIMEOUT, context=ctx) as smtp:
-        smtp.login(MAIL_USER, MAIL_PASSWORD)
-        smtp.sendmail(MAIL_USER, recipients, msg.as_string())
+    # Serialise before connecting: a MIME/encoding fault here never touched the wire.
+    payload = msg.as_string()
+    # Only failures that can leave the message mid-transaction may be re-tagged as
+    # maybe-delivered — a timeout reading the 250 after DATA still leaves it delivered, and a
+    # caller that "recovers" from that sends the same Reply-All to the whole thread twice.
+    # Pre-DATA refusals are the opposite case: nothing was transmitted, so they must stay
+    # recoverable or a single dead Cc address would permanently block the reply.
+    sent_attempted = False
+    try:
+        with smtplib.SMTP_SSL(
+            SMTP_HOST, SMTP_PORT, timeout=IMAP_TIMEOUT, context=ctx
+        ) as smtp:
+            smtp.login(MAIL_USER, MAIL_PASSWORD)
+            sent_attempted = True
+            smtp.sendmail(MAIL_USER, recipients, payload)
+    except _SMTP_PRE_DELIVERY_ERRORS:
+        raise  # rejected before delivery — nothing on the wire, so a retry is safe
+    except Exception as ex:
+        if sent_attempted:
+            raise JenkinsReplyMaybeSentError(
+                f"SMTP failed after the message was handed to the server: {ex!r}"
+            ) from ex
+        raise
     return quoted
+
+
+def _resolve_cache_quote_source(
+    *,
+    title: str,
+    cached_mid: str,
+    cached_folder: str,
+    cached_uid: str,
+    cached_subject: str,
+) -> tuple[email.message.Message | None, str]:
+    """Re-read the original so the reply can quote it. Returns ``(message, route_label)``.
+
+    The cache is header-only by design, so this is the one step that decides whether the reply
+    looks like a manual **Reply All** or like a flat note. Routes are tried cheapest-first:
+    the recorded ``(folder, uid)``, then a Message-ID header search, then a UID-only fetch for
+    entries the cache never got a Message-ID for, then a subject search whose Message-ID must
+    match. Transport failures get a bounded retry; a clean "not found" does not.
+    """
+    if not _JENKINS_REPLY_QUOTE_THREAD:
+        return None, "disabled"
+
+    deadline = time.monotonic() + _JENKINS_REPLY_QUOTE_TIMEOUT
+
+    def _left() -> float:
+        return deadline - time.monotonic()
+
+    hint = (cached_folder, cached_uid) if (cached_folder and cached_uid) else None
+    last_err: Exception | None = None
+
+    if cached_mid:
+        # find_message_by_message_id swallows transport faults and returns None, so "retry on
+        # exception" would never fire. Retrying a plain None is cheap next to losing the quote.
+        for attempt in range(1, _JENKINS_REPLY_QUOTE_RETRIES + 1):
+            if _left() <= 0:
+                break
+            try:
+                found = find_message_by_message_id(
+                    cached_mid,
+                    [cached_folder] if cached_folder else None,
+                    uid_hint=hint,
+                    budget=_left(),
+                )
+                if found is not None:
+                    return found, ("uid-hint" if hint else "mid-search")
+            except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+                last_err = ex
+                print(
+                    f"[allemail] quote lookup attempt {attempt}/"
+                    f"{_JENKINS_REPLY_QUOTE_RETRIES} raised: {ex!r}",
+                    flush=True,
+                )
+            if attempt < _JENKINS_REPLY_QUOTE_RETRIES:
+                if _left() <= _JENKINS_REPLY_QUOTE_RETRY_DELAY:
+                    break
+                time.sleep(_JENKINS_REPLY_QUOTE_RETRY_DELAY)
+
+    if hint and _left() > 0:
+        # Direct UID fetch. Reached both when no Message-ID was ever indexed and when the
+        # searches above came back empty — the subject check keeps it from quoting a stranger.
+        got = _fetch_cached_entry_message(
+            cached_folder, cached_uid, expect_subject=cached_subject
+        )
+        if got is not None:
+            return got, "uid-only"
+
+    # Last resort: the live subject search. It is NOT budget-aware (it connects with the much
+    # longer _JENKINS_REPLY_IMAP_TIMEOUT and scans every folder), so only start it with real
+    # time left — otherwise a slow quote lookup would delay the reply itself by minutes.
+    if _left() >= _JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT:
+        try:
+            found = find_jenkins_reply_message_by_subject_title(title)
+        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+            last_err = ex
+            found = None
+        if found is not None:
+            msg, found_folder = found[0], found[1]
+            same = _normalize_message_id(msg.get("Message-ID") or "")
+            if cached_mid and same != _normalize_message_id(cached_mid):
+                print(
+                    "[allemail] subject fallback landed on a different message "
+                    f"({same} != {_normalize_message_id(cached_mid)}) — not quoting",
+                    flush=True,
+                )
+            else:
+                # This picker deliberately falls back to our OWN prior auto-replies on its
+                # last pass, so apply the same guard the live path uses — quoting one would
+                # nest a history-quote-wrapper inside itself.
+                _anchor, resolved, note = _resolve_live_quote_anchor(msg, found_folder)
+                if resolved is not None:
+                    return resolved, (
+                        "subject-fallback" if note == "original" else "subject-fallback-parent"
+                    )
+
+    print(
+        f"[allemail] no quote source for title={title!r} mid={cached_mid!r} "
+        f"folder={cached_folder!r} uid={cached_uid!r} last_err={last_err!r} — "
+        "replying WITHOUT the collapsible thread",
+        flush=True,
+    )
+    return None, "none"
+
+
+def _message_is_own_reply(msg: email.message.Message) -> bool:
+    """True when ``msg`` is one of our own ``Re:`` auto-replies rather than a real original."""
+    return _header_is_prior_bot_reply(
+        {"subj": _decode_msg_subject(msg), "from_hdr": _decode_mime_header(msg.get("From")) or ""},
+        own=_own_smtp_identities(),
+    )
+
+
+def _resolve_live_quote_anchor(
+    orig: email.message.Message, orig_folder: str
+) -> tuple[email.message.Message, email.message.Message | None, str]:
+    """Pick what to thread on and what to quote. Returns ``(anchor, quote_source, note)``.
+
+    Normally both are the found original. When the picker fell back to one of our own prior
+    auto-replies, quoting it would embed our quote block inside itself — so this walks up to
+    the parent via ``In-Reply-To`` (or the last id in ``References``) and uses that for both,
+    keeping the meta rows and the ``In-Reply-To`` chain consistent. If the parent cannot be
+    read, nothing is quoted: a missing thread block beats quoting our own bot mail.
+    """
+    if not _message_is_own_reply(orig):
+        return orig, orig, "original"
+    parent_mid = (orig.get("In-Reply-To") or "").strip()
+    if not _normalize_message_id(parent_mid):
+        refs = (orig.get("References") or "").split()
+        parent_mid = refs[-1].strip() if refs else ""
+    if _normalize_message_id(parent_mid):
+        try:
+            parent = find_message_by_message_id(
+                parent_mid, [orig_folder] if orig_folder else None
+            )
+        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
+            print(f"[maint-mail] bot-reply parent lookup failed: {ex!r}", flush=True)
+            parent = None
+        if parent is not None:
+            print(
+                f"[maint-mail] matched our own auto-reply — quoting its parent {parent_mid}",
+                flush=True,
+            )
+            return parent, parent, "bot-reply-parent"
+    print(
+        "[maint-mail] matched our own auto-reply and its parent is unreadable — "
+        "replying WITHOUT the collapsible thread",
+        flush=True,
+    )
+    return orig, None, "skipped-bot-reply"
 
 
 def _reply_jenkins_update_done_email_via_cache(
@@ -4886,49 +5531,63 @@ def _reply_jenkins_update_done_email_via_cache(
     cached = _allemail_reply_lookup(title)
     if not cached:
         return None
-    recips = _allemail_entry_reply_recipients(cached)
+    recips = _allemail_entry_reply_recipients(cached, for_send=True)
     if recips is None:
         return None
     to_addrs, cc_addrs, recipients = recips
     subj = _reply_subject(cached.get("subject") or title)
-    cached_mid = (cached.get("message_id") or "").strip()
-    # The cache holds headers only — re-read the original from IMAP so the reply can quote
-    # it (Lark **Show/Hide email thread**). Best-effort: a miss just means no quote.
-    quote_src: email.message.Message | None = None
-    if cached_mid and _JENKINS_REPLY_QUOTE_THREAD:
-        cached_folder = (cached.get("folder") or "").strip()
-        try:
-            quote_src = find_message_by_message_id(
-                cached_mid, [cached_folder] if cached_folder else None
-            )
-        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
-            print(f"[allemail] quote source lookup failed: {ex!r}", flush=True)
-            quote_src = None
+    cached_mid_raw = (cached.get("message_id") or "").strip()
+    # `<>` is degenerate: it would produce In-Reply-To: <> and an unmatchable header search.
+    cached_mid = cached_mid_raw if _normalize_message_id(cached_mid_raw) else ""
+    cached_folder = (cached.get("folder") or "").strip()
+    cached_uid = (cached.get("uid") or "").strip()
+    cached_refs = cached.get("references") or ""
+
+    quote_src, quote_route = _resolve_cache_quote_source(
+        title=title,
+        cached_mid=cached_mid,
+        cached_folder=cached_folder,
+        cached_uid=cached_uid,
+        cached_subject=cached.get("subject") or "",
+    )
+    # A UID-only hit carries the headers the cache lacked — prefer the real ones for threading.
+    orig_mid = cached_mid
+    orig_refs = cached_refs
+    if quote_src is not None and not orig_mid:
+        fetched_mid = (quote_src.get("Message-ID") or "").strip()
+        if _normalize_message_id(fetched_mid):
+            orig_mid = fetched_mid
+            orig_refs = (quote_src.get("References") or "").strip() or cached_refs
+
     quoted = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
         cc_addrs=cc_addrs,
         recipients=recipients,
-        orig_message_id=cached_mid,
-        orig_references=cached.get("references") or "",
+        orig_message_id=orig_mid,
+        orig_references=orig_refs,
         quote_source=quote_src,
     )
     envs = ", ".join(c[0] for c in completions)
+    level = "" if quoted else "⚠️ "
     print(
-        f"[allemail] jenkins done reply (cache) envs={envs!r} title={title!r} "
-        f"mid={cached.get('message_id')!r} folder={cached.get('folder')!r} "
-        f"quoted={quoted} To={to_addrs!r} Cc={cc_addrs!r}",
+        f"{level}[allemail] jenkins done reply (cache) envs={envs!r} title={title!r} "
+        f"mid={orig_mid!r} folder={cached_folder!r} uid={cached_uid!r} "
+        f"quote_route={quote_route} quoted={quoted} threaded={bool(orig_mid)} "
+        f"To={to_addrs!r} Cc={cc_addrs!r}",
         flush=True,
     )
     return {
         "to": to_addrs,
         "cc": cc_addrs,
         "recipients": recipients,
-        "folder": cached.get("folder") or "",
+        "folder": cached_folder,
         "subject": subj,
         "source": "allemail-cache",
         "quoted": quoted,
+        "threaded": bool(orig_mid),
+        "quote_route": quote_route,
     }
 
 
@@ -5010,6 +5669,10 @@ def reply_jenkins_update_done_email(
             )
             if cached_result is not None:
                 return cached_result
+        except JenkinsReplyMaybeSentError:
+            # The cache path already handed the message to SMTP. Falling through to the live
+            # search here is how the same Reply-All used to reach the whole thread twice.
+            raise
         except Exception as ex:
             print(
                 f"[allemail] cache reply for {title!r} failed "
@@ -5056,7 +5719,7 @@ def reply_jenkins_update_done_email(
             f"Email not found — no message with subject matching {title!r} "
             f"in folder(s): {folders}.{hint}"
         )
-    orig, orig_folder = orig_found
+    orig, orig_folder, orig_uid = orig_found
     from_hdr = _decode_mime_header(orig.get("From")) or ""
     subj = _decode_msg_subject(orig)
     body_snip = ""
@@ -5081,32 +5744,44 @@ def reply_jenkins_update_done_email(
             f"(only bounces or invalid To/Cc). Check folder(s): "
             f"{', '.join(JENKINS_REPLY_IMAP_FOLDERS)}."
         )
-    to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(orig)
+    to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(
+        orig, exclude=_sending_mailbox_identities()
+    )
     subj = _reply_subject(_decode_msg_subject(orig))
+    # The picker's last-resort pass can hand back one of OUR OWN prior auto-replies. Quoting
+    # that would nest our history-quote-wrapper inside the new one, which no manual Reply All
+    # ever produces — so quote (and thread on) its parent instead, or quote nothing.
+    anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
+    anchor_mid_raw = (anchor.get("Message-ID") or "").strip()
+    # `<>` is degenerate — it would emit an unmatchable `In-Reply-To: <>`. Same guard the
+    # cache path applies to its cached id.
+    anchor_mid = anchor_mid_raw if _normalize_message_id(anchor_mid_raw) else ""
     quoted = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
         cc_addrs=cc_addrs,
         recipients=recipients,
-        orig_message_id=(orig.get("Message-ID") or "").strip(),
-        orig_references=(orig.get("References") or "").strip(),
-        quote_source=orig if _JENKINS_REPLY_QUOTE_THREAD else None,
+        orig_message_id=anchor_mid,
+        orig_references=(anchor.get("References") or "").strip(),
+        quote_source=quote_src if _JENKINS_REPLY_QUOTE_THREAD else None,
     )
-    # Index the found original so the NEXT reply to this subject is an instant cache hit.
-    # Fire-and-forget: never add file-lock latency to the reply hot path.
+    # Index the found original so the NEXT reply to this subject is an instant cache hit —
+    # with its UID, so that reply can fetch it directly instead of searching by Message-ID.
     threading.Thread(
         target=allemail_store_message,
         args=(orig,),
-        kwargs={"folder": orig_folder},
+        kwargs={"folder": orig_folder, "uid": orig_uid},
         name="allemail-store",
         daemon=True,
     ).start()
     envs = ", ".join(c[0] for c in completions)
     route = ", ".join(recipients)
+    level = "" if quoted else "⚠️ "
     print(
-        f"[maint-mail] jenkins done reply envs={envs!r} title={title!r} folder={orig_folder!r} "
-        f"quoted={quoted} To={to_addrs!r} Cc={cc_addrs!r} → {route}",
+        f"{level}[maint-mail] jenkins done reply envs={envs!r} title={title!r} "
+        f"folder={orig_folder!r} uid={orig_uid!r} quote={quote_note} quoted={quoted} "
+        f"threaded={bool(anchor_mid)} To={to_addrs!r} Cc={cc_addrs!r} → {route}",
         flush=True,
     )
     return {
@@ -5117,6 +5792,8 @@ def reply_jenkins_update_done_email(
         "subject": subj,
         "source": "live-imap",
         "quoted": quoted,
+        "threaded": bool(anchor_mid),
+        "quote_route": quote_note,
     }
 
 
@@ -5361,7 +6038,9 @@ def reply_egs_email(*, email_title: str, body: str, test: bool = False) -> dict[
                 to_addrs, cc_addrs, recipients = _test_recipients()
             else:
                 try:
-                    to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(orig)
+                    to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(
+                        orig, exclude=_sending_mailbox_identities()
+                    )
                 except ValueError as ex:
                     raise EmailThreadNotFoundError(
                         f"Matched {subj!r} but it has no usable Reply-All recipients "
@@ -5374,13 +6053,13 @@ def reply_egs_email(*, email_title: str, body: str, test: bool = False) -> dict[
             to_addrs, cc_addrs, recipients = _test_recipients()
 
     msg = MIMEText(text, "plain", "utf-8")
-    msg["Subject"] = Header(subj, "utf-8")
+    _set_subject_header(msg, subj)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["To"] = ", ".join(to_addrs)
     if cc_addrs:
         msg["Cc"] = ", ".join(cc_addrs)
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _new_msgid()
     if orig_mid:
         msg["In-Reply-To"] = orig_mid
         msg["References"] = f"{orig_refs} {orig_mid}".strip() if orig_refs else orig_mid
@@ -5418,10 +6097,10 @@ def reply_not_in_cp_email(
         raise RuntimeError("MAINTENANCE_MAIL_PASSWORD not set")
     subj = _reply_subject(subject)
     msg = MIMEText(_maint_mod.NOT_IN_CP_WEBSITE_BODY, "plain", "utf-8")
-    msg["Subject"] = Header(subj, "utf-8")
+    _set_subject_header(msg, subj)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
+    msg["Message-ID"] = _new_msgid()
     msg["To"] = formataddr((NOT_CP_REPLY_CC_NAME, FORWARD_CC))
     recipients: list[str] = [FORWARD_CC]
     if original_msg is not None:
@@ -6877,11 +7556,17 @@ def debug_jenkins_reply_search(needle: str = "TESTING BOT") -> int:
             print(f"find_jenkins_reply: ONLY_BOUNCES — {ex}", flush=True)
             return 2
         if found:
-            msg, folder = found
+            msg, folder, uid_found = found
             subj = _decode_msg_subject(msg)
-            print(f"find_jenkins_reply: OK folder={folder!r} subj={subj!r}", flush=True)
+            print(
+                f"find_jenkins_reply: OK folder={folder!r} uid={uid_found!r} subj={subj!r}",
+                flush=True,
+            )
             try:
-                to, cc, _rcpt = _jenkins_reply_all_recipients(msg)
+                # Mirror the SEND path's exclusion set, so this previews who really gets it.
+                to, cc, _rcpt = _jenkins_reply_all_recipients(
+                    msg, exclude=_sending_mailbox_identities()
+                )
                 print(f"  Reply-All To={to} Cc={cc}", flush=True)
             except Exception as ex:
                 print(f"  Reply-All failed: {ex}", flush=True)
