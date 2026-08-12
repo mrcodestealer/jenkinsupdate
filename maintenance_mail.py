@@ -5724,10 +5724,21 @@ def reply_jenkins_update_done_email(
             f"{', '.join(JENKINS_REPLY_IMAP_FOLDERS)}."
         )
     if not _jenkins_message_has_reply_recipients(orig):
+        # Name the real cause. "Only bounces or invalid To/Cc" was misleading for by far the
+        # most common case: a thread we sent ourselves whose only participants are our own
+        # addresses, so a Reply-All has nobody external to go to.
+        own_sent = _allemail_from_is_own(from_hdr)
+        why = (
+            "it was sent by us and its only To/Cc participants are our own addresses "
+            f"({', '.join(sorted(_own_smtp_identities()))}), so a Reply-All has no external "
+            "recipient"
+            if own_sent
+            else "its To/Cc are empty or invalid (bounce / mailer-daemon notices)"
+        )
         raise EmailThreadNotFoundError(
-            f"Email not found — messages matching {title!r} have no Reply-All recipients "
-            f"(only bounces or invalid To/Cc). Check folder(s): "
-            f"{', '.join(JENKINS_REPLY_IMAP_FOLDERS)}."
+            f"No reply target for {title!r} — the newest matching mail is unusable: {why}. "
+            f"Reply to a thread that has an external sender or recipient. "
+            f"Folder(s) searched: {', '.join(JENKINS_REPLY_IMAP_FOLDERS)}."
         )
     to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(
         orig, exclude=_sending_mailbox_identities()
