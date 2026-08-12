@@ -741,19 +741,49 @@ def handle_test_reply_email(
             f"`{TEST_REPLY_EMAIL_BODY}`.",
         )
         return True
+    cached = None
+    try:
+        import maintenance_mail as _mm_probe
+
+        cached = _mm_probe._allemail_reply_lookup(title)
+    except Exception:
+        cached = None
+    slow_note = (
+        ""
+        if cached
+        else (
+            "\n⏳ Not in `allemail.json` — falling back to the **live IMAP search**, which can "
+            "take **2–3 minutes** on large folders. Waiting…"
+        )
+    )
     send(
         chat_id,
         f"📨 **Test reply-all** for `{title}` — body `{TEST_REPLY_EMAIL_BODY}`.\n"
-        "_Real email to every To/Cc participant on that thread._",
+        f"_Real email to every To/Cc participant on that thread._{slow_note}",
     )
-    _send_jenkins_email_reply(
-        send,
-        chat_id,
-        email_title=title,
-        completions=[("TEST", TEST_REPLY_EMAIL_BODY)],
-        body_override=TEST_REPLY_EMAIL_BODY,
-        label=f"Test reply-all sent — body `{TEST_REPLY_EMAIL_BODY}`",
-    )
+    # The Lark background-thread runner has no `except`, so an unexpected raise here would kill
+    # the thread and post NOTHING — leaving "did it send?" unanswerable from the chat alone.
+    try:
+        _send_jenkins_email_reply(
+            send,
+            chat_id,
+            email_title=title,
+            completions=[("TEST", TEST_REPLY_EMAIL_BODY)],
+            body_override=TEST_REPLY_EMAIL_BODY,
+            label=f"Test reply-all sent — body `{TEST_REPLY_EMAIL_BODY}`",
+        )
+    except BaseException as ex:
+        print(f"[testreplyemail] {title!r} crashed: {ex!r}", flush=True)
+        try:
+            send(
+                chat_id,
+                f"❌ **`/testreplyemail` crashed** for `{title}`\n"
+                f"```\n{type(ex).__name__}: {ex}\n```\n"
+                "Delivery is **unknown** — check the thread before re-running.",
+            )
+        except Exception:
+            pass
+        raise
     return True
 
 
