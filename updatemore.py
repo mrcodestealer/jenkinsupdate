@@ -742,18 +742,25 @@ def handle_test_reply_email(
         )
         return True
     cached = None
+    miss_reason = ""
     try:
         import maintenance_mail as _mm_probe
 
         cached = _mm_probe._allemail_reply_lookup(title)
-    except Exception:
+        if not cached:
+            miss_reason = _mm_probe.explain_reply_target_miss(title)
+    except Exception as _probe_ex:
         cached = None
+        miss_reason = f"index probe failed: {_probe_ex!r}"
+    # "Not in allemail.json" was wrong for the commonest case: the mail IS indexed but screened
+    # out as a reply target. Say which, so nobody debugs the scanner over a self-sent email.
     slow_note = (
         ""
         if cached
         else (
-            "\n⏳ Not in `allemail.json` — falling back to the **live IMAP search**, which can "
-            "take **2–3 minutes** on large folders. Waiting…"
+            f"\n⏳ No **cached** reply target — {miss_reason}.\n"
+            "Falling back to the **live IMAP search**, which can take **2–3 minutes** on large "
+            "folders. Waiting…"
         )
     )
     send(

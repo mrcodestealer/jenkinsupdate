@@ -7705,6 +7705,51 @@ def start_maintenance_mail_watcher(
     return True
 
 
+def explain_reply_target_miss(title: str) -> str:
+    """Why did the cache not yield a reply target for ``title``? One short human sentence.
+
+    ``_allemail_reply_lookup`` returns ``None`` both when nothing is indexed and when entries are
+    indexed but screened out — reporting those as the same thing ("not in allemail.json") sends
+    people looking for a scanning problem when the real answer is "you sent that mail yourself".
+    """
+    t = (title or "").strip()
+    if not t:
+        return "no subject was given"
+    if not _allemail_enabled():
+        return "the index is disabled (`ALLEMAIL_CACHE=0` or no mail password)"
+    if not os.path.exists(ALLEMAIL_STORE_PATH):
+        return "`allemail.json` does not exist yet — run `allemail-scan`"
+    entries = _allemail_load().get("emails") or []
+    if not entries:
+        return "`allemail.json` is empty — run `allemail-scan`"
+    matched = [e for e in entries if _jenkins_reply_subject_score(e.get("subject") or "", t) > 0]
+    if not matched:
+        return (
+            f"no subject in the {len(entries)}-entry index contains that text — check the exact "
+            "wording with `allemail-list`, or the mail is outside the retention window"
+        )
+    reasons: list[str] = []
+    for e in matched:
+        subj = e.get("subject") or ""
+        if _allemail_from_is_own(e.get("from_raw", "")):
+            reasons.append("you sent it yourself (From is our own mailbox)")
+        elif _allemail_subject_is_reply_or_forward(subj):
+            reasons.append("the only match is a Re:/Fw: copy")
+        elif _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
+            reasons.append("the only match is a bounce / mailer-daemon notice")
+        elif _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
+            reasons.append("the only match is an auto-responder")
+        elif _allemail_entry_reply_recipients(e) is None:
+            reasons.append("its To/Cc contain only our own addresses")
+        else:
+            reasons.append("screened out for an unknown reason")
+    uniq = list(dict.fromkeys(reasons))
+    return (
+        f"{len(matched)} subject match(es) in the index, all rejected as reply targets: "
+        + "; ".join(uniq)
+    )
+
+
 def debug_allemail_list(filter_text: str = "", *, limit: int = 60) -> int:
     """List what is actually indexed — every folder, every subject, newest first.
 
