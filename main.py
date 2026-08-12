@@ -1763,6 +1763,22 @@ def lark_webhook():
             ju.jenkins_update_has_active_lark_session(chat_id, sender_id) if ju else False
         )
         if chat_type != "p2p" and not bot_mentioned and not jenkins_sess_active:
+            # Say WHY the message was ignored. This used to return silently, so a group message
+            # that @mentioned the wrong bot looked identical to a crash: "dispatched status=200"
+            # and nothing else. Print the mentioned open_ids so a mismatch is obvious.
+            _mentioned_ids = []
+            for _m in mentions or []:
+                _mo = _m.get("id")
+                _mid = _mo.get("open_id", "") if isinstance(_mo, dict) else _mo
+                _mentioned_ids.append(f"{_m.get('name') or '?'}={_mid or '?'}")
+            print(
+                f"⏭️  group message IGNORED (not addressed to this bot): "
+                f"chat={chat_id!r} mentions=[{', '.join(_mentioned_ids) or 'none'}] "
+                f"my BOT_OPEN_ID={BOT_OPEN_ID or '(unset)'} "
+                f"text={(clean_text or '')[:90]!r}\n"
+                f"    → @mention THIS bot, or DM it, for the command to run.",
+                flush=True,
+            )
             return _lark_im_ack()
 
         msg_obj = (data.get("event") or {}).get("message") or {}
