@@ -689,6 +689,74 @@ def is_reply_update_email_text(text: str) -> bool:
     return bool(re.search(r"/?replyupdateemail\b", text or "", re.I))
 
 
+_TEST_REPLY_EMAIL_RE = re.compile(r"/?testreplyemail\b", re.I)
+# Body of a /testreplyemail send. Deliberately unmistakable: this really does Reply-All to the
+# whole thread, so the recipients must be able to see at a glance that it is not a real notice.
+TEST_REPLY_EMAIL_BODY = "JC TESTING"
+
+
+def is_test_reply_email_text(text: str) -> bool:
+    return bool(_TEST_REPLY_EMAIL_RE.search(text or ""))
+
+
+def parse_test_reply_email(text: str) -> str | None:
+    """``/testreplyemail {email title}`` → the title, or ``None`` when it is missing.
+
+    Accepts an optional leading ``|`` so it reads the same as ``/replyupdateemail | …``.
+    """
+    raw = (text or "").strip()
+    for pat in (r"@_user_\d+", r"<[^>]+>"):
+        raw = re.sub(pat, "", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    m = _TEST_REPLY_EMAIL_RE.search(raw)
+    if not m:
+        return None
+    rest = raw[m.end() :].strip()
+    if rest.startswith("|"):
+        rest = rest[1:].strip()
+    # A trailing "| env | time" is tolerated so the command can be pasted over a
+    # /replyupdateemail line; only the title is used.
+    if "|" in rest:
+        rest = rest.split("|", 1)[0].strip()
+    return rest or None
+
+
+def handle_test_reply_email(
+    chat_id: str,
+    text: str,
+    send: Callable[..., Any],
+) -> bool:
+    """``/testreplyemail {email title}`` — real **Reply-All + Cc-all** with body ``JC TESTING``.
+
+    Runs the identical engine the Jenkins done-reply uses (same thread lookup, recipients,
+    In-Reply-To, Lark quote block and MIME) with only the body text swapped, so what it proves
+    is what production will do. It genuinely emails every To/Cc participant on the thread.
+    """
+    title = parse_test_reply_email(text)
+    if not title:
+        send(
+            chat_id,
+            "❌ **Usage:** `/testreplyemail {email title}`\n"
+            "Sends a **real Reply-All (To + Cc)** on that thread with the body "
+            f"`{TEST_REPLY_EMAIL_BODY}`.",
+        )
+        return True
+    send(
+        chat_id,
+        f"📨 **Test reply-all** for `{title}` — body `{TEST_REPLY_EMAIL_BODY}`.\n"
+        "_Real email to every To/Cc participant on that thread._",
+    )
+    _send_jenkins_email_reply(
+        send,
+        chat_id,
+        email_title=title,
+        completions=[("TEST", TEST_REPLY_EMAIL_BODY)],
+        body_override=TEST_REPLY_EMAIL_BODY,
+        label=f"Test reply-all sent — body `{TEST_REPLY_EMAIL_BODY}`",
+    )
+    return True
+
+
 def is_success_proceed_message(text: str) -> bool:
     return bool(_SUCCESS_PROCEED_RE.search(text or ""))
 
@@ -954,6 +1022,8 @@ def _send_jenkins_email_reply(
     *,
     email_title: str,
     completions: list[tuple[str, str]],
+    body_override: str | None = None,
+    label: str = "Auto-replied email",
 ) -> None:
     import maintenance_mail as mm
 
@@ -961,6 +1031,7 @@ def _send_jenkins_email_reply(
         sent = mm.reply_jenkins_update_done_email(
             email_title=email_title,
             completions=completions,
+            body_override=body_override,
         )
     except mm.JenkinsReplyOnlyBouncesError as ex:
         folders = ", ".join(mm.JENKINS_REPLY_IMAP_FOLDERS)
@@ -1027,7 +1098,7 @@ def _send_jenkins_email_reply(
     )
     send(
         chat_id,
-        f"📧 Auto-replied email ({len(completions)} done block(s))\n"
+        f"📧 {label} ({len(completions)} done block(s))\n"
         f"- **From:** `{mm.MAIL_USER}`\n"
         f"- **Reply-All (all To + Cc):** `{rcpt_line}`\n"
         f"- **To:** `{to_line}`\n"

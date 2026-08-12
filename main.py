@@ -1522,6 +1522,20 @@ def _handle_jenkins_message(
         _handle_jenkins_warm_status(chat_id)
         return
 
+    # /testreplyemail {email title} — REAL Reply-All + Cc-all on that thread, body "JC TESTING".
+    # Handled before the Jenkins update parse so the title text is never read as an /update body.
+    try:
+        import updatemore as _um_tre
+
+        for _probe in (clean_text_multiline, clean_text, original_text, message_content_raw):
+            if _probe and _um_tre.is_test_reply_email_text(_probe):
+                start_lark_background_thread(
+                    _um_tre.handle_test_reply_email, chat_id, _probe, send_message
+                )
+                return
+    except Exception as _tre_err:
+        print(f"[testreplyemail] dispatch failed: {_tre_err!r}", flush=True)
+
     # Admin: self-deploy — "git pull origin main and restart service" / /deploy.
     if _looks_like_deploy_command(clean_text) or _looks_like_deploy_command(clean_text_multiline):
         if not _deploy_allowed(sender_id):

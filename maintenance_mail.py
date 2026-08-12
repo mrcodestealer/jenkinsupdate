@@ -5608,12 +5608,17 @@ def reply_jenkins_update_done_email(
     email_title: str,
     completions: list[tuple[str, str]],
     use_cache: bool = True,
+    body_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Auto-reply after Jenkins success (``/SuccessInformMeTime`` flow).
 
     ``completions`` is a list of ``(environment, time)`` pairs. Multiple pairs are
     combined into one email when several segments share the same subject.
+
+    ``body_override`` replaces the generated ``Done …/Remarks …`` text and changes nothing
+    else — same recipients, threading, quote and MIME. It exists so ``/testreplyemail`` can
+    exercise this exact path instead of a parallel copy that could drift out of sync.
 
     Cache-first: when ``use_cache`` and the ``allemail.json`` index has the original
     (matched by subject), the reply is built straight from the stored Message-ID + To/Cc
@@ -5631,13 +5636,16 @@ def reply_jenkins_update_done_email(
     title = (email_title or "").strip()
     if not completions:
         raise ValueError("completions required")
-    blocks = [f"Done {env.strip()}\nRemarks : {when.strip()}" for env, when in completions]
-    body = (
-        "Hi team,\n\n"
-        + "\n\n".join(blocks)
-        + "\n\nBest Regards,\n"
-        "JC\n"
-    )
+    if body_override is not None:
+        body = body_override
+    else:
+        blocks = [f"Done {env.strip()}\nRemarks : {when.strip()}" for env, when in completions]
+        body = (
+            "Hi team,\n\n"
+            + "\n\n".join(blocks)
+            + "\n\nBest Regards,\n"
+            "JC\n"
+        )
     # Cache-first: reply straight off the indexed original (exact Message-ID + reply-all).
     if use_cache:
         try:
@@ -7500,6 +7508,86 @@ def start_maintenance_mail_watcher(
     return True
 
 
+def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
+    """Send the Jenkins done-reply for real, but **only to yourself**.
+
+    Run: ``python3 maintenance_mail.py jenkins-reply-send-test "<email subject>" [you@dom.com]``
+
+    Exercises the *entire* production path — cache lookup, IMAP re-read, Lark quote HTML,
+    inline-image MIME, SMTP — while replacing the recipient list with a single address
+    (``JENKINS_REPLY_TEST_TO``, default: our own mailbox). Threading headers are kept, so the
+    result lands in the real conversation in your own mailbox and you can confirm Lark renders
+    **Show/Hide email thread** exactly like a manual Reply All.
+
+    The production senders are deliberately untouched by this: there is no "test" flag inside
+    :func:`reply_jenkins_update_done_email` that could ever leak into a real reply.
+
+    Exit codes: 0 = sent quoted, 1 = could not build, 2 = sent unquoted.
+    """
+    t = (title or "").strip()
+    if not t:
+        print('Usage: jenkins-reply-send-test "<email subject>" [you@example.com]', flush=True)
+        return 1
+    if not MAIL_PASSWORD:
+        print("MAINTENANCE_MAIL_PASSWORD not set in .env", flush=True)
+        return 1
+
+    dest = (
+        (to or "").strip()
+        or (os.getenv("JENKINS_REPLY_TEST_TO", "") or "").strip()
+        or MAIL_USER
+    )
+    if "@" not in dest:
+        print(f"Refusing to send: {dest!r} is not an email address.", flush=True)
+        return 1
+
+    cached = _allemail_reply_lookup(t)
+    if not cached:
+        print(f"NO cache match for {t!r} — run `allemail-scan` first.", flush=True)
+        return 1
+
+    mid_raw = (cached.get("message_id") or "").strip()
+    mid = mid_raw if _normalize_message_id(mid_raw) else ""
+    quote_src, route = _resolve_cache_quote_source(
+        title=t,
+        cached_mid=mid,
+        cached_folder=(cached.get("folder") or "").strip(),
+        cached_uid=(cached.get("uid") or "").strip(),
+        cached_subject=cached.get("subject") or "",
+    )
+    real = _allemail_entry_reply_recipients(cached, for_send=True)
+    subj = _reply_subject(cached.get("subject") or t)
+    body = (
+        "Hi team,\n\nDone <environment>\nRemarks : <time>\n\n"
+        "(TEST SEND from jenkins-reply-send-test — not a real completion notice.)\n\n"
+        "Best Regards,\nJC\n"
+    )
+
+    print(f"Subject:     {subj}", flush=True)
+    print(f"Quote route: {route}", flush=True)
+    if real:
+        print(f"Real reply would go to: {', '.join(real[2])}", flush=True)
+    print(f"*** TEST SEND — delivering ONLY to: {dest} ***", flush=True)
+
+    quoted = _send_jenkins_reply_all(
+        reply_subject=subj,
+        body=body,
+        to_addrs=[dest],
+        cc_addrs=[],
+        recipients=[dest],
+        orig_message_id=mid,
+        orig_references=cached.get("references") or "",
+        quote_source=quote_src,
+    )
+    print(
+        f"Sent to {dest} — quoted={quoted} threaded={bool(mid)}.\n"
+        "Open it in Lark Mail: the previous email should be folded behind "
+        "**Show/Hide email thread**.",
+        flush=True,
+    )
+    return 0 if quoted else 2
+
+
 def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
     """Dry-run the Jenkins done-reply: resolve, build, and dump it — **without sending**.
 
@@ -7814,6 +7902,13 @@ if __name__ == "__main__":
             debug_jenkins_reply_preview(
                 sys.argv[2] if len(sys.argv) > 2 else "",
                 out_path=sys.argv[3] if len(sys.argv) > 3 else "",
+            )
+        )
+    if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-send-test":
+        raise SystemExit(
+            debug_jenkins_reply_send_test(
+                sys.argv[2] if len(sys.argv) > 2 else "",
+                to=sys.argv[3] if len(sys.argv) > 3 else "",
             )
         )
     if len(sys.argv) >= 2 and sys.argv[1] in (

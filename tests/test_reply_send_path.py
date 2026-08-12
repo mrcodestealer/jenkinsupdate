@@ -318,6 +318,61 @@ def test_quote_path_never_runs_a_subject_search() -> None:
     check(out.get("threaded") is True, "while still threaded on the cached original")
 
 
+def test_testreplyemail_sends_real_reply_all() -> None:
+    """`/testreplyemail {title}` must Reply-All to the WHOLE thread with body 'JC TESTING'."""
+    print("test_testreplyemail_sends_real_reply_all")
+    import updatemore as um
+
+    reset()
+    bodies: list[str] = []
+    real_send = mm._send_jenkins_reply_all
+
+    def capturing_send(*, body, **kw):
+        bodies.append(body)
+        return real_send(body=body, **kw)
+
+    posted: list[str] = []
+    patches, _ = base_patches(_send_jenkins_reply_all=capturing_send)
+    with patches:
+        um.handle_test_reply_email(
+            "chat1",
+            f"/testreplyemail {CACHE_ENTRY['subject']}",
+            lambda _c, t, **_kw: posted.append(t),
+        )
+
+    check(len(FakeSMTP.calls) == 1, f"sent exactly once, got {len(FakeSMTP.calls)}")
+    check(bodies == ["JC TESTING"], f"body is exactly 'JC TESTING', got {bodies!r}")
+    if FakeSMTP.calls:
+        got = FakeSMTP.calls[0][1]
+        # Reply-All + Cc-all: every participant, minus only our own sending mailbox.
+        for addr in ("bob@example.com", "alice@example.com", "carol@example.com"):
+            check(addr in got, f"{addr} is on the real reply-all envelope")
+        check(mm.MAIL_USER not in got, "our own mailbox is still excluded")
+    check(
+        any("JC TESTING" in p for p in posted),
+        "the chat is told what body was sent",
+    )
+    check(
+        any("Test reply-all sent" in p for p in posted),
+        f"the result card is labelled as a test, got {posted!r}",
+    )
+
+
+def test_testreplyemail_without_title_sends_nothing() -> None:
+    print("test_testreplyemail_without_title_sends_nothing")
+    import updatemore as um
+
+    reset()
+    posted: list[str] = []
+    patches, _ = base_patches()
+    with patches:
+        um.handle_test_reply_email(
+            "chat1", "/testreplyemail", lambda _c, t, **_kw: posted.append(t)
+        )
+    check(len(FakeSMTP.calls) == 0, "a missing title must not send anything")
+    check(any("Usage" in p for p in posted), f"usage is shown, got {posted!r}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:
