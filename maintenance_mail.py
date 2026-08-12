@@ -509,6 +509,36 @@ _ALLEMAIL_HEADER_FETCH_SPEC = (
 )
 _allemail_lock = threading.Lock()
 _allemail_scanner_started = False
+# ((mtime, size), tokenised entries, idf table) — see _allemail_match_view.
+_allemail_view_cache: tuple[tuple[float, int], list[dict[str, Any]], dict[str, Any]] | None = None
+
+# The subject matcher lives in its own module. Imported DEFENSIVELY and at module scope only for
+# the name: a missing/broken subject_match.py must not take down the whole bot (Jenkins form
+# filling, VPN creation and every card work fine without it). The reply path raises a clear
+# error at USE time instead — see _require_subject_match.
+try:
+    import subject_match
+except Exception as _sm_err:  # noqa: BLE001 — availability is what matters, not the cause
+    subject_match = None  # type: ignore[assignment]
+    _SUBJECT_MATCH_ERROR = repr(_sm_err)
+    print(
+        f"⚠️  [maint-mail] subject_match.py unavailable ({_SUBJECT_MATCH_ERROR}) — the Jenkins "
+        "email-reply feature is DISABLED. Everything else still works. Ensure subject_match.py "
+        "is committed and deployed alongside maintenance_mail.py.",
+        flush=True,
+    )
+else:
+    _SUBJECT_MATCH_ERROR = ""
+
+
+def _require_subject_match() -> None:
+    """Raise a diagnosable error if the matcher module is missing, at the point of use."""
+    if subject_match is None:
+        raise RuntimeError(
+            "subject_match.py is missing or failed to import "
+            f"({_SUBJECT_MATCH_ERROR}); the email reply cannot resolve a target. "
+            "Deploy subject_match.py next to maintenance_mail.py."
+        )
 
 
 def _allemail_enabled() -> bool:
@@ -5368,78 +5398,104 @@ def _allemail_folder_priority(folder: str) -> int:
     return len(JENKINS_REPLY_IMAP_FOLDERS)
 
 
+def _allemail_entry_ineligible_reason(e: dict[str, Any]) -> str | None:
+    """Why this entry cannot be a reply target, or ``None`` if it can.
+
+    Eligibility is per-message and separate from *matching*: an entry can be the right thread
+    and still be unusable (we sent it; its only participants are us). Keeping the two apart is
+    what lets the caller say "that IS the thread, but you sent it yourself" instead of a bare
+    "not found".
+    """
+    subj = e.get("subject") or ""
+    if _allemail_from_is_own(e.get("from_raw", "")):
+        return "you sent it yourself (From is our own mailbox)"
+    if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
+        return "it is a bounce / mailer-daemon notice"
+    if _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
+        return "it is an auto-responder reply"
+    if _allemail_entry_reply_recipients(e) is None:
+        return "its To/Cc contain only our own addresses"
+    return None
+
+
+def _allemail_match_view() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Tokenised index + IDF table, memoised on the store file's (mtime, size).
+
+    Tokenising 13,559 subjects costs ~0.5s, so it must not run per lookup — but the file is
+    rewritten by an out-of-process scanner, hence keying the cache on stat() rather than time.
+    """
+    global _allemail_view_cache
+    try:
+        st = os.stat(ALLEMAIL_STORE_PATH)
+        stamp = (st.st_mtime, st.st_size)
+    except OSError:
+        stamp = (0.0, 0)
+    cached = _allemail_view_cache
+    if cached is not None and cached[0] == stamp:
+        return cached[1], cached[2]
+    with _allemail_lock:
+        emails = _allemail_load().get("emails", [])
+    _require_subject_match()
+    entries: list[dict[str, Any]] = []
+    for e in emails:
+        entries.append(
+            dict(
+                e,
+                _t=subject_match.match_tokens(e.get("subject") or ""),
+                _k=(e.get("uid") or e.get("message_id") or "?"),
+                _elig=_allemail_entry_ineligible_reason(e),
+            )
+        )
+    idf_table = subject_match.build_idf(
+        [e.get("subject") or "" for e in emails],
+        anchors=[float(e.get("date_ts") or 0.0) for e in emails],
+    )
+    _allemail_view_cache = (stamp, entries, idf_table)
+    return entries, idf_table
+
+
+def resolve_reply_target(title: str) -> subject_match.Res:
+    """Which email does ``title`` mean? Returns a :class:`subject_match.Res`.
+
+    ``kind`` is one of ``ok`` / ``ok_stale`` / ``ambiguous`` / ``too_broad`` /
+    ``all_ineligible`` / ``none``. Callers must handle ``ambiguous`` by ASKING rather than
+    picking — that is the whole point of the resolver.
+    """
+    _require_subject_match()
+    entries, idf_table = _allemail_match_view()
+    return subject_match.resolve(
+        (title or "").strip(),
+        entries,
+        idf_table,
+        now=time.time(),
+        max_age_days=ALLEMAIL_REPLY_MAX_AGE_DAYS,
+    )
+
+
 def _allemail_reply_lookup(title: str) -> dict[str, Any] | None:
     """
     Best cached ORIGINAL email whose subject matches ``title`` and is a safe reply target.
 
-    Only genuine originals qualify: entries are rejected when the subject is a reply/forward
-    (``Re:``/``Fw:``), the From is our own mailbox, the sender looks like a bounce daemon, or
-    ``Auto-Submitted`` is set. Ranked by subject score, then folder priority (OSE Pending
-    first), then recency — but in TWO tiers: a match newer than
-    ``ALLEMAIL_REPLY_MAX_AGE_DAYS`` always beats an older one regardless of score or folder,
-    because the index spans ~3 months while a Jenkins "Done" notice is only meaningful against
-    a currently-open request. An older match is still returned when nothing fresh matches.
-
-    Body-level screening (a "Failed to send" notice that kept the original subject) cannot
-    happen here — the index holds no bodies. It is applied in
-    :func:`_reply_jenkins_update_done_email_via_cache` once the original has been re-read.
+    Thin wrapper over :func:`resolve_reply_target`: returns an entry ONLY when the resolver
+    committed to one thread (``ok`` / ``ok_stale``). An ambiguous title yields ``None`` here so
+    that no legacy caller can accidentally act on a guess; callers that can ask the user should
+    use :func:`resolve_reply_target` directly and render the candidate list.
     """
-    needle = (title or "").strip()
-    if not needle:
-        return None
-    with _allemail_lock:
-        emails = _allemail_load().get("emails", [])
-    best: dict[str, Any] | None = None
-    best_rank: tuple[int, int, float] = (-(10**9), -(10**9), -(10**9))
-    best_fresh: dict[str, Any] | None = None
-    best_fresh_rank: tuple[int, int, float] = (-(10**9), -(10**9), -(10**9))
-    fresh_cutoff = time.time() - (ALLEMAIL_REPLY_MAX_AGE_DAYS * 86400)
-    for e in emails:
-        subj = e.get("subject") or ""
-        score = _jenkins_reply_subject_score(subj, needle)
-        if score <= 0:
-            continue
-        # Never reply from cache into a reply/forward/bounce or our own sent copy — the
-        # header-only index can't run the live path's body-level bounce checks, so restrict
-        # cache hits to genuine (plain-subject, external-From) originals.
-        if _allemail_subject_is_reply_or_forward(subj):
-            continue
-        if _allemail_from_is_own(e.get("from_raw", "")):
-            continue
-        if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
-            continue
-        if _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
-            continue
-        if _allemail_entry_reply_recipients(e) is None:
-            continue
-        rank = (
-            int(score),
-            -_allemail_folder_priority(e.get("folder", "")),
-            float(e.get("date_ts") or 0.0),
-        )
-        # Two independent tiers, not one comparable tuple: a fresh match always beats a stale
-        # one regardless of score or folder priority, but a stale match is still returned when
-        # nothing fresh exists — a hard cutoff would make a 3-month index worse than a 1-week
-        # one on older threads. This read-time gate also covers the window between
-        # _allemail_save's write-time prune and the next scan, which _allemail_load never prunes.
-        if float(e.get("date_ts") or 0.0) >= fresh_cutoff:
-            if rank > best_fresh_rank:
-                best_fresh_rank = rank
-                best_fresh = e
-        elif rank > best_rank:
-            best_rank = rank
-            best = e
-    if best_fresh is not None:
-        return best_fresh
-    if best is not None:
-        age_d = (time.time() - float(best.get("date_ts") or 0.0)) / 86400.0
-        print(
-            f"[allemail] only STALE matches for {needle!r} — using one dated "
-            f"{(best.get('date') or '?')[:10]} ({age_d:.0f}d old, over "
-            f"ALLEMAIL_REPLY_MAX_AGE_DAYS={ALLEMAIL_REPLY_MAX_AGE_DAYS})",
-            flush=True,
-        )
-    return best
+    res = resolve_reply_target(title)
+    if res.kind in ("ok", "ok_stale"):
+        if res.kind == "ok_stale":
+            print(
+                f"[allemail] {title!r} resolved to a STALE thread ({res.reason}) — over "
+                f"ALLEMAIL_REPLY_MAX_AGE_DAYS={ALLEMAIL_REPLY_MAX_AGE_DAYS}",
+                flush=True,
+            )
+        return res.target
+    print(
+        f"[allemail] {title!r} did not resolve to a single thread: kind={res.kind} "
+        f"groups={len(res.groups)} reason={res.reason!r}",
+        flush=True,
+    )
+    return None
 
 
 def _send_jenkins_reply_all(
@@ -8261,8 +8317,11 @@ if __name__ == "__main__":
             flush=True,
         )
         raise SystemExit(0 if _n >= 0 else 1)
+    # Subjects contain spaces and are routinely pasted unquoted, which used to silently pass
+    # only the first word. Join the remaining argv instead; quoting still works unchanged.
+    _rest = " ".join(sys.argv[2:]).strip()
     if len(sys.argv) >= 2 and sys.argv[1] == "allemail-lookup":
-        _t = sys.argv[2] if len(sys.argv) > 2 else ""
+        _t = _rest
         _hit = _allemail_reply_lookup(_t)
         if _hit:
             print(
@@ -8274,27 +8333,34 @@ if __name__ == "__main__":
         print(f"NO MATCH for {_t!r} in allemail.json", flush=True)
         raise SystemExit(1)
     if len(sys.argv) >= 2 and sys.argv[1] == "allemail-list":
-        _f = sys.argv[2] if len(sys.argv) > 2 else ""
-        try:
-            _lim = int(sys.argv[3]) if len(sys.argv) > 3 else 60
-        except ValueError:
-            _lim = 60
-        raise SystemExit(debug_allemail_list(_f, limit=_lim))
+        # A trailing bare integer is the limit; everything before it is the filter text.
+        _parts = sys.argv[2:]
+        _lim = 60
+        if _parts and _parts[-1].isdigit():
+            _lim = int(_parts[-1])
+            _parts = _parts[:-1]
+        raise SystemExit(debug_allemail_list(" ".join(_parts).strip(), limit=_lim))
     if len(sys.argv) >= 2 and sys.argv[1] == "allemail-why":
-        raise SystemExit(debug_allemail_why(sys.argv[2] if len(sys.argv) > 2 else ""))
+        raise SystemExit(debug_allemail_why(_rest))
     if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-preview":
+        # A trailing *.html argument is the output path; everything before it is the subject.
+        _parts = sys.argv[2:]
+        _out = ""
+        if _parts and _parts[-1].lower().endswith(".html"):
+            _out = _parts[-1]
+            _parts = _parts[:-1]
         raise SystemExit(
-            debug_jenkins_reply_preview(
-                sys.argv[2] if len(sys.argv) > 2 else "",
-                out_path=sys.argv[3] if len(sys.argv) > 3 else "",
-            )
+            debug_jenkins_reply_preview(" ".join(_parts).strip(), out_path=_out)
         )
     if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-send-test":
+        # A trailing argument containing '@' is the test recipient; the rest is the subject.
+        _parts = sys.argv[2:]
+        _to = ""
+        if _parts and "@" in _parts[-1] and " " not in _parts[-1]:
+            _to = _parts[-1]
+            _parts = _parts[:-1]
         raise SystemExit(
-            debug_jenkins_reply_send_test(
-                sys.argv[2] if len(sys.argv) > 2 else "",
-                to=sys.argv[3] if len(sys.argv) > 3 else "",
-            )
+            debug_jenkins_reply_send_test(" ".join(_parts).strip(), to=_to)
         )
     if len(sys.argv) >= 2 and sys.argv[1] in (
         "audit-window",
@@ -8316,13 +8382,26 @@ if __name__ == "__main__":
                 _ch = sys.argv[_i + 1]
         raise SystemExit(reset_maintenance_ticket(sys.argv[2], content_hash=_ch))
     print(
-        "Usage:\n"
-        "  python3 maintenance_mail.py audit-window [--fresh] [--quiet]\n"
-        "  python3 maintenance_mail.py reset-ticket TINC-720579 [--hash <sha256>]\n"
-        "  python3 maintenance_mail.py jenkins-reply-search [subject]\n"
-        "  python3 maintenance_mail.py allemail-scan\n"
-        "  python3 maintenance_mail.py allemail-lookup <subject>\n"
-        "  python3 maintenance_mail.py test-confirm-group",
+        "Usage:  python3 maintenance_mail.py <command> [args]\n"
+        "\n"
+        "Reply index (allemail.json — local, no network except allemail-scan):\n"
+        "  allemail-scan                     rebuild the index over the retention window\n"
+        "  allemail-list [text] [limit]      list indexed mail (newest first), USABLE flagged\n"
+        "  allemail-why <subject>            why a subject does / does not resolve\n"
+        "  allemail-lookup <subject>         the entry the reply flow would target\n"
+        "\n"
+        "Jenkins done-reply:\n"
+        "  jenkins-reply-preview <subject> [out.html]   dry run — builds it, sends NOTHING\n"
+        "  jenkins-reply-send-test <subject> [addr]     real send, to ONE address only\n"
+        "  jenkins-reply-search [subject]    live IMAP search (SLOW on large folders)\n"
+        "\n"
+        "Other:\n"
+        "  audit-window [--fresh] [--quiet]\n"
+        "  reset-ticket TINC-720579 [--hash <sha256>]\n"
+        "  test-confirm-group\n"
+        "\n"
+        "Subjects may be quoted or not — trailing words are joined automatically.\n"
+        f"Retention: {_allemail_retention_label()}   index: {ALLEMAIL_STORE_PATH}",
         flush=True,
     )
     raise SystemExit(2)

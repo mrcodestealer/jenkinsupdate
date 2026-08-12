@@ -403,37 +403,60 @@ def _with_index(entries, fn):
         os.unlink(path)
 
 
-def test_fresh_match_beats_stale_across_the_3month_window() -> None:
-    """The index spans ~3 months but reply-eligibility must not.
+def test_two_threads_same_subject_are_never_guessed_between() -> None:
+    """Two DIFFERENT threads carrying the same subject must produce a pick-list, not a guess.
 
-    _allemail_reply_lookup ranks (score, -folder_priority, date_ts), so without the freshness
-    tier a 60-day-old copy in a higher-priority folder — or a stale exact-subject match scoring
-    100 against a fresh superstring scoring 70 — would outrank today's mail."""
-    print("test_fresh_match_beats_stale_across_the_3month_window")
+    This replaces an earlier expectation that the fresher copy silently won on a
+    (score, -folder_priority, date_ts) tie-break. With a 92-day index that tie-break is exactly
+    how a "Done" notice lands on the wrong thread: nothing in the title distinguishes them, so
+    the resolver returns `ambiguous` and the caller has to ask. Recency now only downgrades a
+    single committed match to `ok_stale` — it never arbitrates between rival threads."""
+    print("test_two_threads_same_subject_are_never_guessed_between")
 
-    # Folder priority would otherwise win: OSE Pending outranks INBOX.
-    hit = _with_index(
+    def res(entries, needle):
+        return _with_index(entries, lambda: mm.resolve_reply_target(needle))
+
+    r = res(
         [_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old"),
          _entry("Widget UPDATE PRODUCTION", 2, "INBOX", "new")],
-        lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"),
+        "Widget UPDATE PRODUCTION",
     )
-    check(hit and hit["uid"] == "new", f"fresh INBOX copy wins, got {hit and hit['uid']!r}")
+    check(r.kind == "ambiguous", f"identical subjects -> ambiguous, got {r.kind}")
+    check(len(r.groups) == 2, f"both threads offered, got {len(r.groups)}")
+    check(
+        _with_index(
+            [_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old"),
+             _entry("Widget UPDATE PRODUCTION", 2, "INBOX", "new")],
+            lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"),
+        )
+        is None,
+        "the legacy wrapper returns None on ambiguity so no caller can act on a guess",
+    )
 
-    # Score would otherwise win: exact match = 100, superstring = 70.
-    hit = _with_index(
-        [_entry("Widget UPDATE", 45, "INBOX", "exact_old"),
-         _entry("Widget UPDATE PRODUCTION - CP", 1, "INBOX", "super_new")],
-        lambda: mm._allemail_reply_lookup("Widget UPDATE"),
-    )
-    check(hit and hit["uid"] == "super_new", f"fresh wins over score, got {hit and hit['uid']!r}")
+    # A single match older than the age limit still resolves — as ok_stale, for confirmation.
+    r = res([_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old")], "Widget UPDATE PRODUCTION")
+    check(r.kind == "ok_stale", f"stale-only single match -> ok_stale, got {r.kind}")
+    check(r.target and r.target["uid"] == "old", "and it points at that entry")
 
-    # Stale-only must still reply — a hard cutoff would make 3 months worse than 1 week.
-    hit = _with_index(
-        [_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old")],
-        lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"),
-    )
-    check(hit is not None, "a stale-only match is still returned, not refused")
-    check(hit and hit["uid"] == "old", "and it is the stale entry")
+    # A single fresh match resolves outright.
+    r = res([_entry("Widget UPDATE PRODUCTION", 2, "INBOX", "new")], "Widget UPDATE PRODUCTION")
+    check(r.kind == "ok", f"fresh single match -> ok, got {r.kind}")
+
+
+def test_contradiction_vetoes_refuse_rather_than_mismatch() -> None:
+    """A version or date the title states, contradicted by the subject, must never match."""
+    print("test_contradiction_vetoes_refuse_rather_than_mismatch")
+
+    idx = [_entry("NT auth/player v2.0.6 UPDATE PRODUCTION - CP (2026-08-12)", 0, "INBOX", "a")]
+
+    def kind(needle):
+        return _with_index(idx, lambda: mm.resolve_reply_target(needle)).kind
+
+    check(kind("NT auth/player v2.0.6 UPDATE PRODUCTION - CP (2026-08-12)") == "ok", "exact resolves")
+    check(kind("NT auth/player v2.0.16 UPDATE PRODUCTION") == "none", "version contradiction vetoes")
+    check(kind("NT auth/player v2.0.6 UPDATE PRODUCTION cancelled") == "none", "status vetoes")
+    # Substring matching used to score this -999; token coverage resolves it.
+    check(kind("NT auth player UPDATE PRODUCTION v2.0.6") == "ok", "word order does not matter")
 
 
 def test_hand_typed_subject_matches_nbsp_original() -> None:

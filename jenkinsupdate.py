@@ -350,9 +350,23 @@ BI_SCRIPT_UPDATE_DEPLOYMENT_FILES: list[str] = [
 
 # Catalog entries are already lowercase-with-hyphens, so casefold == _normalize_service_query_key here.
 # (Defined before _normalize_service_query_key, so avoid calling it at module load.)
-_BI_SCRIPT_FILE_IDS_CASEFOLD = frozenset(
+_BI_SCRIPT_SEED_IDS_CASEFOLD = frozenset(
     s.casefold() for s in BI_SCRIPT_UPDATE_DEPLOYMENT_FILES
 )
+# The list above is only a *seed*. BI adds scripts to the Jenkins job without touching this file,
+# and a name missing here used to be misrouted to BI-API-UPDATE (see _body_requests_bi_script_update).
+# Names learned off the job form are persisted here and unioned in by bi_script_deployment_files().
+_BI_SCRIPT_FILES_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bi_script_deployment_files.json"
+)
+_bi_script_files_cache_lock = threading.Lock()
+# Don't re-scan Jenkins on every typo: a miss may trigger at most one scan per this window.
+_BI_SCRIPT_RESCAN_MIN_INTERVAL_SEC = int(
+    os.environ.get("BI_SCRIPT_RESCAN_MIN_INTERVAL_SEC", "600")
+)
+# A scan returning fewer than this is treated as a bad read (login page, UI change) and discarded,
+# so a flaky scrape degrades to the seed list instead of emptying the catalog.
+_BI_SCRIPT_MIN_PLAUSIBLE_SCAN = 5
 
 _BI_UPDATE_NOISE_TOKENS = frozenset(
     {
@@ -2312,9 +2326,9 @@ def _rank_pms_uat_services_by_query(
 def _rank_bi_script_files_by_query(
     query: str, limit: int = 12, *, for_menu: bool = False
 ) -> list[str]:
-    """Like ``_rank_services_by_query`` but against ``BI_SCRIPT_UPDATE_DEPLOYMENT_FILES``."""
+    """Like ``_rank_services_by_query`` but against the BI-SCRIPT DEPLOYMENT_FILE_NAME catalog."""
     return _rank_catalog_services_by_query(
-        BI_SCRIPT_UPDATE_DEPLOYMENT_FILES, query, limit, for_menu=for_menu
+        bi_script_deployment_files(), query, limit, for_menu=for_menu
     )
 
 
@@ -3426,8 +3440,37 @@ def _body_requests_bi_script_update(body: str) -> bool:
     raw = (body or "").strip()
     if not raw:
         return False
+    ids = _bi_script_file_ids_casefold()
     for tok in _bi_script_extract_file_tokens(raw):
-        if _normalize_service_query_key(tok) in _BI_SCRIPT_FILE_IDS_CASEFOLD:
+        if _normalize_service_query_key(tok) in ids:
+            return True
+    return False
+
+
+_BI_SCRIPT_JOB_PHRASE_RE = re.compile(r"(?i)\bbi[\s_-]*scripts?(?:[\s_-]*update)?\b")
+
+
+def _body_mentions_bi_script_job(body: str) -> bool:
+    """
+    True when the wording says **script** but the named file is not in the catalog (yet).
+
+    :func:`_body_requests_bi_script_update` only matches names it already knows, so a script BI
+    added to the Jenkins job but not to our list fell through to BI-API-UPDATE — silently, even
+    when the requester wrote "update bi script". Honour the wording too, and let the dispatcher
+    rescan DEPLOYMENT_FILE_NAME before it gives up. Names that *are* BI-API REPOSITORY options
+    stay on BI-API-UPDATE — both jobs use ``bi-…`` ids, so the catalogs break the tie.
+    """
+    raw = (body or "").strip()
+    if not raw or not re.search(r"(?i)\bscripts?\b", raw):
+        return False
+    tokens = _bi_script_extract_file_tokens(raw)
+    if not tokens:
+        # ``/update bi script`` with no file named — the dispatcher asks for one.
+        return bool(_BI_SCRIPT_JOB_PHRASE_RE.search(raw))
+    api_repos = {str(v).casefold() for _t, v in BI_API_UPDATE_REPOSITORY_OPTIONS}
+    for tok in tokens:
+        key = _normalize_service_query_key(tok)
+        if key and key not in api_repos:
             return True
     return False
 
@@ -6451,6 +6494,48 @@ def read_ecp_checked_values(page, label: str = "Services") -> list[str]:
     return [normalize_parameter_text(str(x)) for x in out if str(x).strip()]
 
 
+def read_ecp_all_values(page, label: str = "Services") -> list[str]:
+    """
+    **Every** checkbox id under a Jenkins **Extended Choice (ECP)** parameter, ticked or not.
+
+    The ECP counterpart to :func:`read_all_service_values` (which reads the FPMS UnoChoice root).
+    Used to learn a job's catalog straight off the form — see
+    :func:`discover_bi_script_deployment_files` for ``DEPLOYMENT_FILE_NAME``.
+    """
+    out = page.evaluate(
+        r"""(label) => {
+            const want = (label || "").replace(/\s+/g, " ").trim().toLowerCase();
+            const items = document.querySelectorAll("div.jenkins-form-item");
+            for (const item of items) {
+                const lab = item.querySelector(".jenkins-form-label");
+                if (!lab) continue;
+                const t = (lab.textContent || "").replace(/\s+/g, " ").trim();
+                if (t.toLowerCase() !== want) continue;
+                const acc = [];
+                for (const el of item.querySelectorAll(
+                    '[id^="tbl_ecp_"] input[type="checkbox"]'
+                )) {
+                    const v = (el.getAttribute("value") || el.getAttribute("json") || "").trim();
+                    if (v) acc.push(v);
+                }
+                return acc;
+            }
+            return [];
+        }""",
+        label,
+    )
+    if not isinstance(out, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for x in out:
+        v = normalize_parameter_text(str(x))
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
 def read_fnt_rc_services_checked_values(page) -> list[str]:
     """Checked service ids under **Services** for FNT ECP extended-choice."""
     return read_ecp_checked_values(page, "Services")
@@ -7791,6 +7876,172 @@ def discover_cpms_igo_env_services(
     return cache
 
 
+# ===================== BI-SCRIPT-UPDATE DEPLOYMENT_FILE_NAME discovery =====================
+# Same idea as the CPMS/IGO cache above: read the catalog off the Jenkins form instead of
+# hand-maintaining it, so a script BI added yesterday routes to BI-SCRIPT-UPDATE today.
+
+
+def _load_bi_script_files_cache() -> dict:
+    """Read the persisted ``{"deployment_files": [...], "scanned_at": ts}`` map (``{}`` if absent)."""
+    with _bi_script_files_cache_lock:
+        try:
+            with open(_BI_SCRIPT_FILES_CACHE_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    files = data.get("deployment_files")
+    if not isinstance(files, list):
+        return {}
+    try:
+        scanned_at = float(data.get("scanned_at") or 0.0)
+    except (TypeError, ValueError):
+        scanned_at = 0.0
+    return {
+        "deployment_files": [str(s).strip() for s in files if str(s).strip()],
+        "scanned_at": scanned_at,
+    }
+
+
+def _save_bi_script_files_cache(files: Sequence[str]) -> None:
+    payload = {
+        "deployment_files": [str(s).strip() for s in files if str(s).strip()],
+        "scanned_at": time.time(),
+        "source_url": BI_SCRIPT_UPDATE_BUILD_URL,
+    }
+    with _bi_script_files_cache_lock:
+        try:
+            with open(_BI_SCRIPT_FILES_CACHE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+        except OSError as ex:
+            print(f"[bi_script] cache save failed: {ex!r}", flush=True)
+
+
+def bi_script_deployment_files() -> list[str]:
+    """
+    DEPLOYMENT_FILE_NAME catalog: the seed list first, then anything learned off the job form.
+
+    Union rather than replace — a scan only ever *adds*. If Jenkins drops a script the seed keeps
+    it around as a stale pick option, which is harmless; trusting a single scrape to delete entries
+    is not (one bad read would wipe routing for every BI script).
+    """
+    cached = _load_bi_script_files_cache().get("deployment_files") or []
+    if not cached:
+        return list(BI_SCRIPT_UPDATE_DEPLOYMENT_FILES)
+    out = list(BI_SCRIPT_UPDATE_DEPLOYMENT_FILES)
+    seen = {s.casefold() for s in out}
+    for s in cached:
+        k = s.casefold()
+        if k not in seen:
+            seen.add(k)
+            out.append(s)
+    return out
+
+
+def _bi_script_file_ids_casefold() -> frozenset[str]:
+    """Membership set for :func:`bi_script_deployment_files` (seed + learned)."""
+    cached = _load_bi_script_files_cache().get("deployment_files") or []
+    if not cached:
+        return _BI_SCRIPT_SEED_IDS_CASEFOLD
+    return frozenset(_BI_SCRIPT_SEED_IDS_CASEFOLD).union(
+        _normalize_service_query_key(s) for s in cached if str(s).strip()
+    )
+
+
+def _bi_script_rescan_allowed() -> bool:
+    """True when the last scan is old enough to justify another (throttles typo-driven scans)."""
+    scanned_at = _load_bi_script_files_cache().get("scanned_at") or 0.0
+    return (time.time() - float(scanned_at)) >= _BI_SCRIPT_RESCAN_MIN_INTERVAL_SEC
+
+
+def _bi_script_learn_deployment_files(page) -> list[str]:
+    """
+    Snapshot DEPLOYMENT_FILE_NAME off a build page we already have open, and persist it.
+
+    Called on every real BI-SCRIPT run: the page is loaded and authenticated already, so keeping
+    the catalog current costs one ``page.evaluate``. Never raises — learning is best-effort and
+    must not be able to break a run that was otherwise going to succeed.
+    """
+    try:
+        found = read_ecp_all_values(page, "DEPLOYMENT_FILE_NAME")
+    except Exception as ex:
+        print(f"[bi_script] catalog read skipped: {ex!r}", flush=True)
+        return []
+    if len(found) < _BI_SCRIPT_MIN_PLAUSIBLE_SCAN:
+        print(
+            f"[bi_script] catalog read returned {len(found)} value(s) — ignoring as implausible.",
+            flush=True,
+        )
+        return []
+    known = _bi_script_file_ids_casefold()
+    fresh = [s for s in found if _normalize_service_query_key(s) not in known]
+    try:
+        _save_bi_script_files_cache(found)
+    except Exception as ex:
+        print(f"[bi_script] catalog persist failed: {ex!r}", flush=True)
+        return []
+    if fresh:
+        print(
+            f"[bi_script] learned {len(fresh)} new DEPLOYMENT_FILE_NAME(s): {', '.join(fresh)}",
+            flush=True,
+        )
+    return found
+
+
+def discover_bi_script_deployment_files(*, headless: bool = True) -> list[str]:
+    """
+    Open BI-SCRIPT-UPDATE and read the full DEPLOYMENT_FILE_NAME checkbox list, then persist it.
+
+    Only reads the form — never clicks Build (same contract as
+    :func:`discover_cpms_igo_env_services`). Returns the values read, or ``[]`` on any failure;
+    callers fall back to :func:`bi_script_deployment_files`, which still has the seed list.
+    """
+    user, pw = _credentials()
+    url = BI_SCRIPT_UPDATE_BUILD_URL
+
+    def _read_on_page(page) -> list[str]:
+        open_fpms_build_with_login(
+            page, user, pw, first_visit=False, warmup=False, build_url=url
+        )
+        page.wait_for_selector("div.jenkins-form-item", timeout=60_000)
+        _safe_page_wait(page, _MS_FORM_READY)
+        _safe_page_wait(page, _MS_POST_LOGIN_BEFORE_FORM)
+        return _bi_script_learn_deployment_files(page)
+
+    if _ju_warm_pool_enabled():
+        try:
+            print("[bi_script] discover via JU warm pool.", flush=True)
+            pool = _ju_warm_pool_get()
+            return pool.run_with_page_blocking(_read_on_page, build_url=url) or []
+        except Exception as ex:
+            print(f"[bi_script] warm-pool discover failed: {ex!r}", flush=True)
+            if not _ju_warm_allow_cold_fallback():
+                return []
+
+    bname = (os.environ.get("FPMS_PLAYWRIGHT_BROWSER") or "chromium").strip().lower()
+    if bname not in ("chromium", "firefox"):
+        bname = "chromium"
+    with sync_playwright() as p:
+        browser_obj, context, page = _playwright_browser_context_and_page(
+            p, browser_name=bname, headless=headless, slow_mo=0, user_data_dir=None
+        )
+        try:
+            return _read_on_page(page)
+        except Exception as ex:
+            print(f"[bi_script] discover failed: {ex!r}", flush=True)
+            return []
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser_obj.close()
+            except Exception:
+                pass
+
+
 def _cpms_igo_all_entries(cache: dict) -> list[tuple[str, str, str]]:
     """Flatten cache to ``(kind, env, service_id)`` rows."""
     rows: list[tuple[str, str, str]] = []
@@ -8422,7 +8673,7 @@ def _jenkins_job_service_catalog_for_url(raw_url: str) -> frozenset[str] | None:
     if prof == "pms_uat":
         return _PMS_UAT_SERVICE_IDS_CASEFOLD
     if prof == "bi_script_update":
-        return _BI_SCRIPT_FILE_IDS_CASEFOLD
+        return _bi_script_file_ids_casefold()
     if prof == "cpms_igo_uat":
         cache = _load_cpms_igo_cache()
         merged: set[str] = set()
@@ -8457,7 +8708,7 @@ def _jenkins_job_service_catalog_list_for_url(raw_url: str) -> list[str] | None:
     if prof == "pms_uat":
         return list(PMS_UAT_UPDATE_SERVICES)
     if prof == "bi_script_update":
-        return list(BI_SCRIPT_UPDATE_DEPLOYMENT_FILES)
+        return bi_script_deployment_files()
     if prof == "cpms_igo_uat":
         cache = _load_cpms_igo_cache()
         seen: set[str] = set()
@@ -13081,8 +13332,22 @@ def _fpms_lark_dispatch_bi_script_update_parameter_flow(
             "(e.g. `API: bi-dim-game-checking`).",
         )
         return True
+    # A name we don't know may simply be newer than our catalog — read the job form once before
+    # falling back to fuzzy matching, throttled so a typo can't trigger a scan per message.
+    known = _bi_script_file_ids_casefold()
+    unknown = [t for t in tokens if _normalize_service_query_key(t) not in known]
+    if unknown and _bi_script_rescan_allowed():
+        send(
+            chat_id,
+            f"🔎 `{unknown[0]}` is not in my **DEPLOYMENT_FILE_NAME** list — "
+            "rescanning the BI-SCRIPT-UPDATE job once (~30s)…",
+        )
+        try:
+            discover_bi_script_deployment_files(headless=True)
+        except Exception as ex:
+            print(f"[bi_script] rescan failed: {ex!r}", flush=True)
     resolved_ids, tokens_to_pick = _split_unambiguous_service_tokens(
-        tokens, BI_SCRIPT_UPDATE_DEPLOYMENT_FILES
+        tokens, bi_script_deployment_files()
     )
     if not tokens_to_pick:
         _fpms_lark_begin_jenkins_run(
@@ -14298,8 +14563,9 @@ def _dispatch_lark_update_command_body(
             lark_thread_root_id=lark_thread_root_id,
         )
 
-    # BI-SCRIPT-UPDATE wins over BI-API-UPDATE when the named API is a DEPLOYMENT_FILE_NAME.
-    if _body_requests_bi_script_update(body):
+    # BI-SCRIPT-UPDATE wins over BI-API-UPDATE when the named API is a DEPLOYMENT_FILE_NAME,
+    # or when the wording says "script" and the name is not a BI-API REPOSITORY option.
+    if _body_requests_bi_script_update(body) or _body_mentions_bi_script_job(body):
         return _fpms_lark_dispatch_bi_script_update_parameter_flow(
             chat_id,
             key,
@@ -16339,6 +16605,9 @@ def run(
                 select_choice_parameter_by_value(page, "SOURCE_BRANCH", branch)
             elif is_bi_script_update:
                 # DEPLOYMENT_FILE_NAME multi-select checkboxes + ENVIRONMENT dropdown + SOURCE_BRANCH text.
+                # The form is already open and authenticated — refresh the catalog for free so it
+                # self-heals after any successful run, no separate scan needed.
+                _bi_script_learn_deployment_files(page)
                 if services:
                     select_ecp_multi_checkboxes(page, "DEPLOYMENT_FILE_NAME", services)
                 select_choice_parameter_by_value(page, "ENVIRONMENT", environment)
