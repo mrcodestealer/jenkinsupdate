@@ -122,11 +122,6 @@ _JENKINS_REPLY_QUOTE_RETRIES = max(
 _JENKINS_REPLY_QUOTE_RETRY_DELAY = float(
     os.getenv("JENKINS_REPLY_QUOTE_RETRY_DELAY", "").strip() or "2"
 )
-# The subject-search fallback is not budget-aware — it uses the much longer
-# _JENKINS_REPLY_IMAP_TIMEOUT and scans every folder. Only start it with real time left.
-_JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT = float(
-    os.getenv("JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT", "").strip() or "5"
-)
 # Inline (cid:) images referenced by the quoted original are re-attached so the reply looks
 # like a manual Reply All instead of showing broken-image placeholders. Caps keep a vendor
 # mail with huge embedded screenshots from turning a working reply into an SMTP 552.
@@ -5388,8 +5383,11 @@ def _resolve_cache_quote_source(
     The cache is header-only by design, so this is the one step that decides whether the reply
     looks like a manual **Reply All** or like a flat note. Routes are tried cheapest-first:
     the recorded ``(folder, uid)``, then a Message-ID header search, then a UID-only fetch for
-    entries the cache never got a Message-ID for, then a subject search whose Message-ID must
-    match. Transport failures get a bounded retry; a clean "not found" does not.
+    entries the cache never got a Message-ID for. There is deliberately no subject-search
+    fallback — see the note at the end of this function.
+
+    The whole thing is bounded by ``_JENKINS_REPLY_QUOTE_TIMEOUT`` and never raises: failing to
+    quote costs the collapsible thread, while stalling here delays the reply itself.
     """
     if not _JENKINS_REPLY_QUOTE_THREAD:
         return None, "disabled"
@@ -5438,34 +5436,13 @@ def _resolve_cache_quote_source(
         if got is not None:
             return got, "uid-only"
 
-    # Last resort: the live subject search. It is NOT budget-aware (it connects with the much
-    # longer _JENKINS_REPLY_IMAP_TIMEOUT and scans every folder), so only start it with real
-    # time left — otherwise a slow quote lookup would delay the reply itself by minutes.
-    if _left() >= _JENKINS_REPLY_QUOTE_FALLBACK_MIN_LEFT:
-        try:
-            found = find_jenkins_reply_message_by_subject_title(title)
-        except Exception as ex:  # noqa: BLE001 — quoting is best-effort
-            last_err = ex
-            found = None
-        if found is not None:
-            msg, found_folder = found[0], found[1]
-            same = _normalize_message_id(msg.get("Message-ID") or "")
-            if cached_mid and same != _normalize_message_id(cached_mid):
-                print(
-                    "[allemail] subject fallback landed on a different message "
-                    f"({same} != {_normalize_message_id(cached_mid)}) — not quoting",
-                    flush=True,
-                )
-            else:
-                # This picker deliberately falls back to our OWN prior auto-replies on its
-                # last pass, so apply the same guard the live path uses — quoting one would
-                # nest a history-quote-wrapper inside itself.
-                _anchor, resolved, note = _resolve_live_quote_anchor(msg, found_folder)
-                if resolved is not None:
-                    return resolved, (
-                        "subject-fallback" if note == "original" else "subject-fallback-parent"
-                    )
-
+    # Deliberately NO subject-search fallback here. find_jenkins_reply_message_by_subject_title
+    # is not budget-aware (own connection on _JENKINS_REPLY_IMAP_TIMEOUT, every folder, tail
+    # scans of 30k+ message mailboxes) and has been measured at ~150s on a real mailbox — it
+    # would stall the reply itself for minutes to win, at best, a collapsible quote. It also
+    # earns nothing the routes above do not: to be safe to quote its hit must have the cached
+    # Message-ID, and `mid-search` already scans the same folders by HEADER Message-ID far more
+    # cheaply. Quoting is best-effort; the reply goes out unquoted instead.
     print(
         f"[allemail] no quote source for title={title!r} mid={cached_mid!r} "
         f"folder={cached_folder!r} uid={cached_uid!r} last_err={last_err!r} — "

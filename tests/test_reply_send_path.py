@@ -288,25 +288,34 @@ def test_quote_failure_still_sends_unquoted() -> None:
     check(out.get("quote_route") == "none", f"route recorded, got {out.get('quote_route')}")
 
 
-def test_wrong_message_fallback_is_rejected() -> None:
-    print("test_wrong_message_fallback_is_rejected")
+def test_quote_path_never_runs_a_subject_search() -> None:
+    """The quote path must not fall back to the subject search.
+
+    find_jenkins_reply_message_by_subject_title is not budget-aware — measured at ~150s against
+    a real mailbox with 36k-message folders — so reaching it here would stall the reply for
+    minutes to win, at best, a collapsible quote."""
+    print("test_quote_path_never_runs_a_subject_search")
     reset()
     other = quote_source()
     other.replace_header("Message-ID", "<some-other-mail@example.com>")
+    ran = {"n": 0}
+
+    def tattling_subject_search(_t):
+        ran["n"] += 1
+        return (other, "INBOX", "9")
 
     patches, _ = base_patches(
         find_message_by_message_id=lambda *_a, **_kw: None,
-        find_jenkins_reply_message_by_subject_title=lambda _t: (other, "INBOX", "9"),
+        find_jenkins_reply_message_by_subject_title=tattling_subject_search,
     )
     with patches:
         out = mm.reply_jenkins_update_done_email(
             email_title=CACHE_ENTRY["subject"], completions=[("fpms-uat-branch", "6:10AM")]
         )
-    check(len(FakeSMTP.calls) == 1, "still sends")
-    check(
-        out.get("quoted") is False,
-        "a subject-fallback landing on a DIFFERENT message must not be quoted",
-    )
+    check(len(FakeSMTP.calls) == 1, "the reply still goes out")
+    check(ran["n"] == 0, f"no subject search from the quote path, ran {ran['n']}×")
+    check(out.get("quoted") is False, "and it is honestly reported as unquoted")
+    check(out.get("threaded") is True, "while still threaded on the cached original")
 
 
 def main() -> int:
