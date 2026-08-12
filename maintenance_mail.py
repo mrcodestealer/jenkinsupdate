@@ -7500,6 +7500,96 @@ def start_maintenance_mail_watcher(
     return True
 
 
+def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
+    """Dry-run the Jenkins done-reply: resolve, build, and dump it — **without sending**.
+
+    Run: ``python3 maintenance_mail.py jenkins-reply-preview "<email subject>" [out.html]``
+
+    Exercises every step the real reply takes except the SMTP transaction: the allemail.json
+    lookup, the Reply-All recipient computation, the IMAP re-read of the original, and the Lark
+    quote HTML. It reads IMAP but never writes and never sends.
+
+    Exit codes: 0 = built with the quoted thread, 1 = no reply target, 2 = built unquoted.
+    """
+    t = (title or "").strip()
+    if not t:
+        print('Usage: jenkins-reply-preview "<email subject>" [out.html]', flush=True)
+        return 1
+    if not MAIL_PASSWORD:
+        print("MAINTENANCE_MAIL_PASSWORD not set in .env", flush=True)
+        return 1
+
+    cached = _allemail_reply_lookup(t)
+    if not cached:
+        print(
+            f"NO cache match for {t!r} — the live IMAP search would run instead "
+            "(slow on large folders). Try `allemail-scan` first.",
+            flush=True,
+        )
+        return 1
+    recips = _allemail_entry_reply_recipients(cached, for_send=True)
+    if recips is None:
+        print("Cache hit has no usable Reply-All recipients.", flush=True)
+        return 1
+    to_addrs, cc_addrs, recipients = recips
+
+    mid_raw = (cached.get("message_id") or "").strip()
+    mid = mid_raw if _normalize_message_id(mid_raw) else ""
+    quote_src, route = _resolve_cache_quote_source(
+        title=t,
+        cached_mid=mid,
+        cached_folder=(cached.get("folder") or "").strip(),
+        cached_uid=(cached.get("uid") or "").strip(),
+        cached_subject=cached.get("subject") or "",
+    )
+
+    body = (
+        "Hi team,\n\nDone <environment>\nRemarks : <time>\n\nBest Regards,\nJC\n"
+    )
+    print(f"Subject:   {_reply_subject(cached.get('subject') or t)}", flush=True)
+    print(f"From:      {formataddr((FORWARD_FROM_NAME, MAIL_USER))}", flush=True)
+    print(f"To:        {', '.join(to_addrs) or '(none)'}", flush=True)
+    print(f"Cc:        {', '.join(cc_addrs) or '(none)'}", flush=True)
+    print(f"Envelope:  {', '.join(recipients)}", flush=True)
+    print(f"In-Reply-To: {mid or '(none — reply would NOT be threaded)'}", flush=True)
+    print(f"Folder/UID: {cached.get('folder')!r}/{cached.get('uid')!r}", flush=True)
+    print(f"Quote route: {route}", flush=True)
+
+    if quote_src is None:
+        print(
+            "\n⚠️  No quote source — the reply would go out as FLAT TEXT with no "
+            "**Show/Hide email thread**.",
+            flush=True,
+        )
+        return 2
+
+    html = build_reply_message_html(body, quote_src)
+    built = _html_message_with_inline_images(html, quote_src)
+    inline = [
+        p for p in built.walk() if p.get_content_maintype() != "multipart"
+    ][1:]
+    print(f"MIME:      {built.get_content_type()}", flush=True)
+    print(
+        f"Inline images re-attached: {len(inline)}"
+        + (f" ({', '.join((p.get('Content-ID') or '?') for p in inline)})" if inline else ""),
+        flush=True,
+    )
+    for cls in (
+        "history-quote-wrapper",
+        "adit-html-block--collapsed",
+        "adit-html-block__attr",
+    ):
+        print(f"  {'✅' if cls in html else '❌'} {cls}", flush=True)
+    for cls in ("adit-html-block__header", "history-quote-forward-title", 'id="lark-mail-'):
+        print(f"  {'✅ absent' if cls not in html else '❌ PRESENT'}: {cls}", flush=True)
+
+    dest = (out_path or "").strip() or os.path.join(_CHBOX_DIR, "reply_preview.html")
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"\nHTML written to {dest} ({len(html)} bytes) — nothing was sent.", flush=True)
+    return 0
+
+
 def debug_jenkins_reply_search(needle: str = "TESTING BOT") -> int:
     """
     Debug Jenkins Reply-All IMAP search (subject needle → folders).
@@ -7719,6 +7809,13 @@ if __name__ == "__main__":
             raise SystemExit(0)
         print(f"NO MATCH for {_t!r} in allemail.json", flush=True)
         raise SystemExit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-preview":
+        raise SystemExit(
+            debug_jenkins_reply_preview(
+                sys.argv[2] if len(sys.argv) > 2 else "",
+                out_path=sys.argv[3] if len(sys.argv) > 3 else "",
+            )
+        )
     if len(sys.argv) >= 2 and sys.argv[1] in (
         "audit-window",
         "audit-maintenance-mail",
