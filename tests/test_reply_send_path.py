@@ -373,6 +373,108 @@ def test_testreplyemail_without_title_sends_nothing() -> None:
     check(any("Usage" in p for p in posted), f"usage is shown, got {posted!r}")
 
 
+def _entry(subject, days_old, folder="INBOX", uid="1"):
+    import time as _t
+
+    now = _t.time()
+    return {
+        "subject": subject, "message_id": f"<{uid}@x>", "references": "",
+        "from_raw": '"V" <vendor@example.com>', "to_raw": "om@hotelstotsenberg.com",
+        "cc_raw": "", "from": ["vendor@example.com"], "to": ["om@hotelstotsenberg.com"],
+        "cc": [], "date": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime(now - days_old * 86400)),
+        "date_ts": now - days_old * 86400, "auto_submitted": "", "folder": folder, "uid": uid,
+    }
+
+
+def _with_index(entries, fn):
+    import json as _j
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    saved = mm.ALLEMAIL_STORE_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            _j.dump({"emails": entries}, fh)
+        mm.ALLEMAIL_STORE_PATH = path
+        return fn()
+    finally:
+        mm.ALLEMAIL_STORE_PATH = saved
+        os.unlink(path)
+
+
+def test_fresh_match_beats_stale_across_the_3month_window() -> None:
+    """The index spans ~3 months but reply-eligibility must not.
+
+    _allemail_reply_lookup ranks (score, -folder_priority, date_ts), so without the freshness
+    tier a 60-day-old copy in a higher-priority folder — or a stale exact-subject match scoring
+    100 against a fresh superstring scoring 70 — would outrank today's mail."""
+    print("test_fresh_match_beats_stale_across_the_3month_window")
+
+    # Folder priority would otherwise win: OSE Pending outranks INBOX.
+    hit = _with_index(
+        [_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old"),
+         _entry("Widget UPDATE PRODUCTION", 2, "INBOX", "new")],
+        lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"),
+    )
+    check(hit and hit["uid"] == "new", f"fresh INBOX copy wins, got {hit and hit['uid']!r}")
+
+    # Score would otherwise win: exact match = 100, superstring = 70.
+    hit = _with_index(
+        [_entry("Widget UPDATE", 45, "INBOX", "exact_old"),
+         _entry("Widget UPDATE PRODUCTION - CP", 1, "INBOX", "super_new")],
+        lambda: mm._allemail_reply_lookup("Widget UPDATE"),
+    )
+    check(hit and hit["uid"] == "super_new", f"fresh wins over score, got {hit and hit['uid']!r}")
+
+    # Stale-only must still reply — a hard cutoff would make 3 months worse than 1 week.
+    hit = _with_index(
+        [_entry("Widget UPDATE PRODUCTION", 60, "OSE Pending", "old")],
+        lambda: mm._allemail_reply_lookup("Widget UPDATE PRODUCTION"),
+    )
+    check(hit is not None, "a stale-only match is still returned, not refused")
+    check(hit and hit["uid"] == "old", "and it is the stale entry")
+
+
+def test_retention_window_is_three_months() -> None:
+    print("test_retention_window_is_three_months")
+    check(mm.ALLEMAIL_RESET_MODE == "rolling", f"rolling, got {mm.ALLEMAIL_RESET_MODE!r}")
+    check(mm.ALLEMAIL_WINDOW_DAYS >= 90, f"window >= 90d, got {mm.ALLEMAIL_WINDOW_DAYS}")
+    check(
+        mm.ALLEMAIL_WINDOW_DAYS >= mm._JENKINS_REPLY_SINCE_DAYS,
+        "the cache window never covers less than the live search",
+    )
+    check(
+        mm.ALLEMAIL_REPLY_MAX_AGE_DAYS < mm.ALLEMAIL_WINDOW_DAYS,
+        "reply-eligibility is narrower than retention",
+    )
+    check("rolling" in mm._allemail_retention_label(), "label reflects rolling mode")
+
+
+def test_empty_scan_never_wipes_a_good_index() -> None:
+    print("test_empty_scan_never_wipes_a_good_index")
+    import json as _j
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    saved = mm.ALLEMAIL_STORE_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            _j.dump({"emails": [_entry("Keep me", 1, "INBOX", "keep")]}, fh)
+        mm.ALLEMAIL_STORE_PATH = path
+        mm._allemail_save([])
+        with open(path, encoding="utf-8") as fh:
+            after = _j.load(fh)
+        check(
+            len(after.get("emails") or []) == 1,
+            f"an empty save is refused, got {len(after.get('emails') or [])} entries",
+        )
+    finally:
+        mm.ALLEMAIL_STORE_PATH = saved
+        os.unlink(path)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

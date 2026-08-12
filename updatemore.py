@@ -1126,6 +1126,23 @@ def _send_jenkins_email_reply(
         if sent.get("threaded", False)
         else "⚠️ not threaded — the original had no Message-ID"
     )
+    # Which mail we actually replied into. The picker has no date filter, and the index now spans
+    # ~3 months, so an old-thread mis-pick has to be visible instead of silent.
+    age = sent.get("target_age_days")
+    tgt_date = sent.get("target_date") or "?"
+    tgt_subj = sent.get("target_subject") or email_title
+    stale = isinstance(age, (int, float)) and age > mm.ALLEMAIL_REPLY_MAX_AGE_DAYS
+    target_line = (
+        f"{'⚠️ ' if stale else ''}`{tgt_subj}` in **{sent.get('folder') or '?'}** "
+        f"dated **{tgt_date}**"
+        + (f" ({age:.0f} days old)" if isinstance(age, (int, float)) else "")
+        + (
+            f" — older than `ALLEMAIL_REPLY_MAX_AGE_DAYS={mm.ALLEMAIL_REPLY_MAX_AGE_DAYS}`, "
+            "check this is the thread you meant"
+            if stale
+            else ""
+        )
+    )
     send(
         chat_id,
         f"📧 {label} ({len(completions)} done block(s))\n"
@@ -1134,6 +1151,7 @@ def _send_jenkins_email_reply(
         f"- **To:** `{to_line}`\n"
         f"- **Cc:** `{cc_line}`\n"
         f"- **Subject (search / Re:):** `{email_title}`\n"
+        f"- **Replied into:** {target_line}\n"
         f"- **Environments:** {envs}\n"
         f"- **Thread:** {quoted_line}\n"
         f"- **Threading:** {threaded_line}",

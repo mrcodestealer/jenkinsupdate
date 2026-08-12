@@ -447,27 +447,61 @@ JENKINS_REPLY_IMAP_SCAN_LIMIT = int(
     os.getenv("JENKINS_REPLY_IMAP_SCAN_LIMIT", "").strip() or "1200"
 )
 
-# ===================== allemail.json — 1-week email index =====================
-# A local index of every email seen in the reply folders for the current week, keyed by
-# subject + Message-ID (with the original From/To/Cc). When a Jenkins update carries an
-# ``Email:`` line, the reply is built straight from this index — replying IN the original
-# thread (In-Reply-To/References) with the SAME To/Cc (reply-all) — no fragile live IMAP
-# subject search. Refreshed by a background scanner; falls back to live search on a miss.
+# ================ allemail.json — 3-month rolling email index ================
+# A local index of every email seen in the reply folders over the retention window, keyed by
+# subject + Message-ID (with the original From/To/Cc **and** its folder + UID). When a Jenkins
+# update carries an ``Email:`` line, the reply is built straight from this index — replying IN
+# the original thread (In-Reply-To/References) with the SAME To/Cc (reply-all), and the body is
+# re-read by ``(folder, uid)`` so the Lark quote block can be built.
 #
-# Retention: ``ALLEMAIL_RESET_MODE=weekly`` (default) → HARD reset at the start of each
-# local week (Monday 00:00 ``MAINTENANCE_MAIL_TZ``): the file is cleared and re-indexed
-# from that Monday. ``rolling`` → keep a trailing ``ALLEMAIL_WINDOW_DAYS`` window instead.
+# This is not merely an optimisation on this mailbox: the live subject search is unreliable at
+# scale (a 191k-message INBOX cannot be tail-scanned, and the per-folder UID SEARCH caps at 500),
+# and a miss costs 25-150s. A hit costs ~1.5s. Keep the index warm.
+#
+# NOTE the index only stores HEADERS — never a body. Quoting always re-reads from IMAP.
+#
+# Retention: ``rolling`` (default) keeps a trailing ``ALLEMAIL_WINDOW_DAYS`` window — ~3 months,
+# so any mail from the last quarter can be found and replied to without the slow live search.
+# ``ALLEMAIL_RESET_MODE=weekly`` restores the old behaviour: a HARD reset at the start of each
+# local week (Monday 00:00 ``MAINTENANCE_MAIL_TZ``), re-indexed from that Monday. In weekly mode
+# ``ALLEMAIL_WINDOW_DAYS`` is never consulted, so it and the window are mutually exclusive.
 ALLEMAIL_STORE_PATH = os.path.join(_CHBOX_DIR, "allemail.json")
-ALLEMAIL_RESET_MODE = (os.getenv("ALLEMAIL_RESET_MODE", "").strip().lower() or "weekly")
-ALLEMAIL_WINDOW_DAYS = min(60, max(1, int(os.getenv("ALLEMAIL_WINDOW_DAYS", "").strip() or "7")))
-ALLEMAIL_SCAN_INTERVAL_SEC = max(
-    60, int(os.getenv("ALLEMAIL_SCAN_INTERVAL_SEC", "").strip() or "1800")
+_ALLEMAIL_RESET_MODES = ("rolling", "weekly")
+ALLEMAIL_RESET_MODE = (os.getenv("ALLEMAIL_RESET_MODE", "").strip().lower() or "rolling")
+if ALLEMAIL_RESET_MODE not in _ALLEMAIL_RESET_MODES:
+    # A typo used to fall through to weekly silently, quietly reinstating the Monday wipe.
+    print(
+        f"[allemail] ALLEMAIL_RESET_MODE={ALLEMAIL_RESET_MODE!r} is not one of "
+        f"{_ALLEMAIL_RESET_MODES} — using 'rolling'.",
+        flush=True,
+    )
+    ALLEMAIL_RESET_MODE = "rolling"
+# The window the LIVE subject search covers. The cache default is derived from it below so the
+# index can never cover less than the live search — a gap there is a subject findable by neither.
+_JENKINS_REPLY_SINCE_DAYS = min(
+    365, max(7, int(os.getenv("JENKINS_REPLY_SINCE_DAYS", "").strip() or "92"))
 )
+ALLEMAIL_WINDOW_DAYS = min(
+    400,
+    max(1, int(os.getenv("ALLEMAIL_WINDOW_DAYS", "").strip() or str(_JENKINS_REPLY_SINCE_DAYS))),
+)
+ALLEMAIL_SCAN_INTERVAL_SEC = max(
+    60, int(os.getenv("ALLEMAIL_SCAN_INTERVAL_SEC", "").strip() or "3600")
+)
+# Binds BEFORE the window does: _allemail_scan_folder keeps only the newest ``uids[-CAP:]``, so a
+# cap below the window's UID count silently drops the OLDEST part of the window.
 ALLEMAIL_SCAN_CAP_PER_FOLDER = min(
-    5000, max(50, int(os.getenv("ALLEMAIL_SCAN_CAP_PER_FOLDER", "").strip() or "1500"))
+    50000, max(50, int(os.getenv("ALLEMAIL_SCAN_CAP_PER_FOLDER", "").strip() or "20000"))
 )
 ALLEMAIL_MAX_ENTRIES = min(
-    50000, max(200, int(os.getenv("ALLEMAIL_MAX_ENTRIES", "").strip() or "8000"))
+    200000, max(200, int(os.getenv("ALLEMAIL_MAX_ENTRIES", "").strip() or "30000"))
+)
+# Retention is NOT reply-eligibility. Indexing a quarter must not mean the bot will reply into a
+# 3-month-old thread as readily as today's — a Jenkins "Done" notice only makes sense against a
+# currently-open request, and ``CLOSED EMAILS`` (an archive of finished threads) is indexed too.
+# Entries older than this are still usable, but only when nothing fresher matches.
+ALLEMAIL_REPLY_MAX_AGE_DAYS = min(
+    365, max(1, int(os.getenv("ALLEMAIL_REPLY_MAX_AGE_DAYS", "").strip() or "14"))
 )
 _ALLEMAIL_HEADER_FETCH_SPEC = (
     "(BODY.PEEK[HEADER.FIELDS "
@@ -2339,9 +2373,8 @@ def _uid_search_subject_variants(mail: imaplib.IMAP4, needle: str) -> list[bytes
     return []
 
 
-_JENKINS_REPLY_SINCE_DAYS = min(
-    365, max(7, int(os.getenv("JENKINS_REPLY_SINCE_DAYS", "").strip() or "90"))
-)
+# _JENKINS_REPLY_SINCE_DAYS is defined with the ALLEMAIL_* knobs above, because the cache window
+# default is derived from it. Do not redefine it here.
 _JENKINS_REPLY_SINCE_UID_CAP = min(
     800, max(50, int(os.getenv("JENKINS_REPLY_SINCE_UID_CAP", "").strip() or "500"))
 )
@@ -4975,7 +5008,26 @@ def _allemail_save(emails: list[dict[str, Any]]) -> None:
     fresh = [e for e in emails if float(e.get("date_ts") or 0.0) >= cutoff]
     fresh.sort(key=lambda e: float(e.get("date_ts") or 0.0))
     if len(fresh) > ALLEMAIL_MAX_ENTRIES:
+        print(
+            f"[allemail] {len(fresh)} entries in the window exceeds "
+            f"ALLEMAIL_MAX_ENTRIES={ALLEMAIL_MAX_ENTRIES} — dropping the OLDEST "
+            f"{len(fresh) - ALLEMAIL_MAX_ENTRIES}.",
+            flush=True,
+        )
         fresh = fresh[-ALLEMAIL_MAX_ENTRIES:]
+    if not fresh:
+        # Belt and braces: never let a failed/empty scan replace a good index. The caller is
+        # supposed to bail before reaching here, so this only fires on an unforeseen path.
+        try:
+            had = len((_allemail_load().get("emails") or []))
+        except Exception:
+            had = 0
+        if had:
+            print(
+                f"[allemail] refusing to overwrite {had} stored entr(y/ies) with an EMPTY index.",
+                flush=True,
+            )
+            return
     data = {
         "version": 1,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -5057,6 +5109,15 @@ def _allemail_scan_folder(mail: imaplib.IMAP4, folder: str) -> list[dict[str, An
     if not uids:
         return []
     if len(uids) > ALLEMAIL_SCAN_CAP_PER_FOLDER:
+        # Keeps the NEWEST slice, so the OLDEST part of the window is what gets dropped. Logged
+        # because otherwise the index silently covers less than ALLEMAIL_WINDOW_DAYS claims.
+        print(
+            f"[allemail] {folder!r}: {len(uids)} UIDs in the {ALLEMAIL_WINDOW_DAYS}d window "
+            f"exceeds ALLEMAIL_SCAN_CAP_PER_FOLDER={ALLEMAIL_SCAN_CAP_PER_FOLDER} — dropping the "
+            f"OLDEST {len(uids) - ALLEMAIL_SCAN_CAP_PER_FOLDER}. Raise the cap to index the "
+            "whole window.",
+            flush=True,
+        )
         uids = uids[-ALLEMAIL_SCAN_CAP_PER_FOLDER:]
     out: list[dict[str, Any]] = []
     chunk = 50
@@ -5084,22 +5145,56 @@ def _allemail_scan_folder(mail: imaplib.IMAP4, folder: str) -> list[dict[str, An
 
 
 def scan_allemail_cache() -> int:
-    """Refresh allemail.json; hard-reset the index at the start of each local week."""
+    """Refresh allemail.json over the retention window.
+
+    A 3-month window holds the IMAP session for minutes rather than seconds, so a mid-scan
+    disconnect goes from unlikely to routine. Two protections follow from that: each folder gets
+    one reconnect-and-retry, and if any folder still fails the whole cycle is abandoned WITHOUT
+    saving — because :func:`_allemail_save` prunes to the cutoff and re-stamps ``week_id`` on
+    every call, so saving a partial scan would discard good entries rather than merely fail.
+    """
     if not _allemail_enabled():
         return 0
     mail = _connect_imap_simple(timeout=_JENKINS_REPLY_IMAP_TIMEOUT)
     scanned: list[dict[str, Any]] = []
+    failed: list[str] = []
     try:
         for folder in _allemail_folders():
-            try:
-                scanned.extend(_allemail_scan_folder(mail, folder))
-            except Exception as ex:
-                print(f"[allemail] scan folder {folder!r} failed: {ex!r}", flush=True)
+            for attempt in (1, 2):
+                try:
+                    scanned.extend(_allemail_scan_folder(mail, folder))
+                    break
+                except Exception as ex:
+                    print(
+                        f"[allemail] scan folder {folder!r} attempt {attempt}/2 failed: {ex!r}",
+                        flush=True,
+                    )
+                    if attempt == 2:
+                        failed.append(folder)
+                        break
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+                    try:
+                        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_IMAP_TIMEOUT)
+                    except Exception as rex:
+                        print(f"[allemail] reconnect failed: {rex!r}", flush=True)
+                        failed.append(folder)
+                        break
     finally:
         try:
             mail.logout()
         except Exception:
             pass
+    if failed:
+        print(
+            f"[allemail] ABANDONING this scan — folder(s) {', '.join(failed)} could not be read. "
+            f"The existing index is left untouched ({len(scanned)} entr(y/ies) discarded) rather "
+            "than pruned against a partial scan.",
+            flush=True,
+        )
+        return 0
     with _allemail_lock:
         prior = _allemail_load()
         existing = prior.get("emails", [])
@@ -5248,11 +5343,16 @@ def _allemail_reply_lookup(title: str) -> dict[str, Any] | None:
     Best cached ORIGINAL email whose subject matches ``title`` and is a safe reply target.
 
     Only genuine originals qualify: entries are rejected when the subject is a reply/forward
-    (``Re:``/``Fw:``) or the From is our own mailbox — those cover prior bot auto-replies and
-    Lark "Failed to send" delivery notices (whose bounce marker lives in the BODY, which a
-    header-only cache can't inspect). Those rare cases fall through to the live IMAP search,
-    which does the full body-level bounce/auto-reply filtering. Ranked by subject score, then
-    folder priority (OSE Pending first), then recency.
+    (``Re:``/``Fw:``), the From is our own mailbox, the sender looks like a bounce daemon, or
+    ``Auto-Submitted`` is set. Ranked by subject score, then folder priority (OSE Pending
+    first), then recency — but in TWO tiers: a match newer than
+    ``ALLEMAIL_REPLY_MAX_AGE_DAYS`` always beats an older one regardless of score or folder,
+    because the index spans ~3 months while a Jenkins "Done" notice is only meaningful against
+    a currently-open request. An older match is still returned when nothing fresh matches.
+
+    Body-level screening (a "Failed to send" notice that kept the original subject) cannot
+    happen here — the index holds no bodies. It is applied in
+    :func:`_reply_jenkins_update_done_email_via_cache` once the original has been re-read.
     """
     needle = (title or "").strip()
     if not needle:
@@ -5261,6 +5361,9 @@ def _allemail_reply_lookup(title: str) -> dict[str, Any] | None:
         emails = _allemail_load().get("emails", [])
     best: dict[str, Any] | None = None
     best_rank: tuple[int, int, float] = (-(10**9), -(10**9), -(10**9))
+    best_fresh: dict[str, Any] | None = None
+    best_fresh_rank: tuple[int, int, float] = (-(10**9), -(10**9), -(10**9))
+    fresh_cutoff = time.time() - (ALLEMAIL_REPLY_MAX_AGE_DAYS * 86400)
     for e in emails:
         subj = e.get("subject") or ""
         score = _jenkins_reply_subject_score(subj, needle)
@@ -5285,9 +5388,28 @@ def _allemail_reply_lookup(title: str) -> dict[str, Any] | None:
             -_allemail_folder_priority(e.get("folder", "")),
             float(e.get("date_ts") or 0.0),
         )
-        if rank > best_rank:
+        # Two independent tiers, not one comparable tuple: a fresh match always beats a stale
+        # one regardless of score or folder priority, but a stale match is still returned when
+        # nothing fresh exists — a hard cutoff would make a 3-month index worse than a 1-week
+        # one on older threads. This read-time gate also covers the window between
+        # _allemail_save's write-time prune and the next scan, which _allemail_load never prunes.
+        if float(e.get("date_ts") or 0.0) >= fresh_cutoff:
+            if rank > best_fresh_rank:
+                best_fresh_rank = rank
+                best_fresh = e
+        elif rank > best_rank:
             best_rank = rank
             best = e
+    if best_fresh is not None:
+        return best_fresh
+    if best is not None:
+        age_d = (time.time() - float(best.get("date_ts") or 0.0)) / 86400.0
+        print(
+            f"[allemail] only STALE matches for {needle!r} — using one dated "
+            f"{(best.get('date') or '?')[:10]} ({age_d:.0f}d old, over "
+            f"ALLEMAIL_REPLY_MAX_AGE_DAYS={ALLEMAIL_REPLY_MAX_AGE_DAYS})",
+            flush=True,
+        )
     return best
 
 
@@ -5527,6 +5649,17 @@ def _reply_jenkins_update_done_email_via_cache(
         cached_uid=cached_uid,
         cached_subject=cached.get("subject") or "",
     )
+    # The cache screens HEADERS only. Now that the original body is in hand at zero extra IMAP
+    # cost, run the body-level screen too — a "Failed to send" notice that kept the original
+    # subject, from a sender that is not a literal mailer-daemon, passes every header filter.
+    if quote_src is not None and _should_skip_jenkins_reply_message(quote_src):
+        print(
+            f"[allemail] cache hit for {title!r} is a bounce / auto-reply by BODY — "
+            "falling back to the live search",
+            flush=True,
+        )
+        return None
+
     # A UID-only hit carries the headers the cache lacked — prefer the real ones for threading.
     orig_mid = cached_mid
     orig_refs = cached_refs
@@ -5535,6 +5668,9 @@ def _reply_jenkins_update_done_email_via_cache(
         if _normalize_message_id(fetched_mid):
             orig_mid = fetched_mid
             orig_refs = (quote_src.get("References") or "").strip() or cached_refs
+
+    target_ts = float(cached.get("date_ts") or 0.0)
+    age_days = (time.time() - target_ts) / 86400.0 if target_ts > 0 else -1.0
 
     quoted = _send_jenkins_reply_all(
         reply_subject=subj,
@@ -5551,6 +5687,7 @@ def _reply_jenkins_update_done_email_via_cache(
     print(
         f"{level}[allemail] jenkins done reply (cache) envs={envs!r} title={title!r} "
         f"mid={orig_mid!r} folder={cached_folder!r} uid={cached_uid!r} "
+        f"target_date={(cached.get('date') or '?')[:10]} age_days={age_days:.0f} "
         f"quote_route={quote_route} quoted={quoted} threaded={bool(orig_mid)} "
         f"To={to_addrs!r} Cc={cc_addrs!r}",
         flush=True,
@@ -5565,6 +5702,9 @@ def _reply_jenkins_update_done_email_via_cache(
         "quoted": quoted,
         "threaded": bool(orig_mid),
         "quote_route": quote_route,
+        "target_subject": cached.get("subject") or "",
+        "target_date": (cached.get("date") or "")[:10],
+        "target_age_days": round(age_days, 1) if age_days >= 0 else None,
     }
 
 
@@ -5747,6 +5887,20 @@ def reply_jenkins_update_done_email(
     # The picker's last-resort pass can hand back one of OUR OWN prior auto-replies. Quoting
     # that would nest our history-quote-wrapper inside the new one, which no manual Reply All
     # ever produces — so quote (and thread on) its parent instead, or quote nothing.
+    # Age of the thread we are replying into — reported so a mis-pick over a 3-month index is
+    # visible rather than silent (the picker has no date filter of its own).
+    target_date = ""
+    target_age = -1.0
+    try:
+        _dt = parsedate_to_datetime((orig.get("Date") or "").strip())
+        if _dt is not None:
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            target_date = _dt.date().isoformat()
+            target_age = (datetime.now(timezone.utc) - _dt).total_seconds() / 86400.0
+    except Exception:
+        pass
+
     anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
     anchor_mid_raw = (anchor.get("Message-ID") or "").strip()
     # `<>` is degenerate — it would emit an unmatchable `In-Reply-To: <>`. Same guard the
@@ -5790,6 +5944,9 @@ def reply_jenkins_update_done_email(
         "quoted": quoted,
         "threaded": bool(anchor_mid),
         "quote_route": quote_note,
+        "target_subject": _decode_msg_subject(orig),
+        "target_date": target_date,
+        "target_age_days": round(target_age, 1) if target_age >= 0 else None,
     }
 
 
@@ -7519,6 +7676,80 @@ def start_maintenance_mail_watcher(
     return True
 
 
+def debug_allemail_why(needle: str) -> int:
+    """Explain why a subject does or does not resolve in ``allemail.json``.
+
+    Run: ``python3 maintenance_mail.py allemail-why "<email subject>"``
+
+    Lists every indexed entry sharing a significant word with ``needle``, its subject score, and
+    the exact filter that rejects it — so a miss is never just "NO MATCH". Local file only, no
+    network. Exit codes: 0 = a usable entry was chosen, 1 = nothing usable.
+    """
+    n = (needle or "").strip()
+    if not n:
+        print('Usage: allemail-why "<email subject>"', flush=True)
+        return 1
+    if not os.path.exists(ALLEMAIL_STORE_PATH):
+        print(f"{ALLEMAIL_STORE_PATH} does not exist — run `allemail-scan` first.", flush=True)
+        return 1
+    data = _allemail_load()
+    entries = data.get("emails") or []
+    print(
+        f"index: {len(entries)} entries  reset_mode={data.get('reset_mode')!r}  "
+        f"window_days={data.get('window_days')!r}  week_id={data.get('week_id')!r}",
+        flush=True,
+    )
+    print(f"needle: {n!r}\n", flush=True)
+
+    # Significant words, so a subject that merely shares "the" is not reported.
+    words = [w for w in re.split(r"[^\w/]+", n.casefold()) if len(w) >= 4]
+    related = [
+        e
+        for e in entries
+        if any(w in (e.get("subject") or "").casefold() for w in words)
+    ]
+    print(f"{len(related)} entry(ies) sharing a word with the needle:\n", flush=True)
+    for e in sorted(related, key=lambda x: x.get("date_ts") or 0, reverse=True):
+        subj = e.get("subject") or ""
+        score = _jenkins_reply_subject_score(subj, n)
+        why: list[str] = []
+        if score <= 0:
+            why.append(f"subject score {score} — needle is not contained in this subject")
+        if _allemail_subject_is_reply_or_forward(subj):
+            why.append("subject is a Re:/Fw:")
+        if _allemail_from_is_own(e.get("from_raw", "")):
+            why.append("From is one of our own addresses")
+        if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
+            why.append("bounce / mailer-daemon")
+        auto = (e.get("auto_submitted") or "").strip().casefold()
+        if auto and auto != "no":
+            why.append(f"Auto-Submitted={auto}")
+        if _allemail_entry_reply_recipients(e) is None:
+            why.append("no Reply-All recipients left after removing our own addresses")
+        print(
+            f"  {(e.get('date') or '')[:10]}  score={score:>4}  uid={e.get('uid') or '-':>8}  "
+            f"{(e.get('folder') or '?'):<14} {(e.get('from_raw') or '')[:36]:<36} "
+            + ("USABLE" if not why else "REJECTED: " + "; ".join(why)),
+            flush=True,
+        )
+        print(f"        subject={subj!r}", flush=True)
+
+    chosen = _allemail_reply_lookup(n)
+    if chosen:
+        print(
+            f"\n✅ would reply to: {chosen.get('subject')!r} "
+            f"({chosen.get('folder')!r}/{chosen.get('uid')!r})",
+            flush=True,
+        )
+        return 0
+    print(
+        "\n❌ NO usable entry. If nothing is listed above, that subject is not indexed at all — "
+        "check the exact wording, or run `allemail-scan`.",
+        flush=True,
+    )
+    return 1
+
+
 def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
     """Send the Jenkins done-reply for real, but **only to yourself**.
 
@@ -7908,6 +8139,8 @@ if __name__ == "__main__":
             raise SystemExit(0)
         print(f"NO MATCH for {_t!r} in allemail.json", flush=True)
         raise SystemExit(1)
+    if len(sys.argv) >= 2 and sys.argv[1] == "allemail-why":
+        raise SystemExit(debug_allemail_why(sys.argv[2] if len(sys.argv) > 2 else ""))
     if len(sys.argv) >= 2 and sys.argv[1] == "jenkins-reply-preview":
         raise SystemExit(
             debug_jenkins_reply_preview(
