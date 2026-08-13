@@ -2199,20 +2199,28 @@ def _service_search_score(query: str, service: str) -> float:
     return best
 
 
-def _rank_services_by_query(query: str, limit: int = 12, *, for_menu: bool = False) -> list[str]:
+def _rank_services_by_query(
+    query: str, limit: int = 12, *, for_menu: bool = False, catalog: Sequence[str] | None = None
+) -> list[str]:
     """
     Return up to ``limit`` service names, best fuzzy match first.
 
     ``for_menu=True`` (numbered pick lists): keep the list **short** — substring hits on the full
     query first, then only services whose score stays in a tight band vs the best match (avoids
     unrelated names that barely pass the loose 0.32 floor).
+
+    ``catalog`` overrides the static FPMS union — pass the job's own list so a pick menu can never
+    offer a name that job does not have (see :func:`_fpms_pick_catalog_for_job`).
     """
     q_raw = (query or "").strip()
     q = q_raw.casefold()
     if not q:
         return []
 
-    scored = [(_service_search_score(q_raw, s), s) for s in FPMS_UAT_BRANCH_SERVICES]
+    scored = [
+        (_service_search_score(q_raw, s), s)
+        for s in (catalog if catalog is not None else FPMS_UAT_BRANCH_SERVICES)
+    ]
     scored.sort(key=lambda x: (-x[0], x[1]))
     if not scored:
         return []
@@ -9141,6 +9149,34 @@ def _peek_service_tokens_from_update_body(body: str) -> list[str]:
     return list(dict.fromkeys(tokens))
 
 
+def _fpms_pick_catalog_for_job(raw_url: str, job_profile: str) -> list[str]:
+    """
+    The services a pick menu may offer for this job.
+
+    A completed per-environment scan is ground truth — it was read off the job's own form — so it
+    wins outright over any hardcoded list. Offering anything else means suggesting names Jenkins no
+    longer has: the static master catalog still carries ``player-rollout``, which has since split
+    into ``player-public-rollout`` / ``player-private-rollout``. Picking a dead name fails at tick
+    time and drops into the recovery Build, so a stale suggestion is worse than no suggestion.
+    """
+    for svcs in (job_env_services_for_url(raw_url),):
+        if svcs:
+            out: list[str] = []
+            seen: set[str] = set()
+            for names in svcs.values():
+                for s in names:
+                    k = s.casefold()
+                    if k and k not in seen:
+                        seen.add(k)
+                        out.append(s)
+            if out:
+                return out
+    if job_profile == "pms_uat":
+        return list(PMS_UAT_UPDATE_SERVICES)
+    cat = _jenkins_job_service_catalog_list_for_url(raw_url)
+    return list(cat) if cat else list(FPMS_UAT_BRANCH_SERVICES)
+
+
 def _jenkins_update_jobs_hosting_services(
     service_tokens: Sequence[str],
 ) -> list[tuple[str, float, str, str]]:
@@ -13428,7 +13464,7 @@ def _fpms_lark_dispatch_fpms_parameter_flow(
             lark_message_id=lark_message_id,
         )
         return True
-    catalog = PMS_UAT_UPDATE_SERVICES if jp == "pms_uat" else FPMS_UAT_BRANCH_SERVICES
+    catalog = _fpms_pick_catalog_for_job(jenkins_build_url, jp)
     resolved_ids: list[str] = []
     tokens_to_pick: list[str] = []
     for tok in tokens:
@@ -13503,10 +13539,7 @@ def _fpms_lark_dispatch_fpms_parameter_flow(
         )
         return True
     q0 = first.replace("_", "-")
-    if jp == "pms_uat":
-        ranked0 = _rank_pms_uat_services_by_query(q0, limit=12, for_menu=True)
-    else:
-        ranked0 = _rank_services_by_query(q0, limit=12, for_menu=True)
+    ranked0 = _rank_services_by_query(q0, limit=12, for_menu=True, catalog=catalog)
     if not ranked0:
         send(chat_id, f"❌ No Jenkins service matches first text token `{first}`.")
         return True
@@ -15960,7 +15993,16 @@ def handle_lark_jenkins_update_message(
                 elif jp_sess == "bi_script_update":
                     nranked = _rank_bi_script_files_by_query(q, limit=12, for_menu=True)
                 else:
-                    nranked = _rank_services_by_query(q, limit=12, for_menu=True)
+                    # Same per-job catalog as the first pick, so later service lines in one
+                    # request cannot be offered names the job does not have.
+                    nranked = _rank_services_by_query(
+                        q,
+                        limit=12,
+                        for_menu=True,
+                        catalog=_fpms_pick_catalog_for_job(
+                            str(sess.get("jenkins_job_url") or ""), jp_sess
+                        ),
+                    )
                 if not nranked:
                     _fpms_lark_clear_session(chat_id, sender_id)
                     send(chat_id, f"❌ No Jenkins service matches `{next_tok}`. Cancelled.")
