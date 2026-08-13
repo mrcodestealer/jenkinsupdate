@@ -9350,6 +9350,118 @@ def _updatemore_split_segments_by_environment(segments: list[dict]) -> list[dict
     return out
 
 
+def _fpms_split_resolved_ids_by_environment(
+    jenkins_build_url: str, resolved_ids: Sequence[str]
+) -> dict[str, list[str]]:
+    """
+    Group already-resolved service ids by the Environment that owns them on this job.
+
+    ``{}`` unless the job has several learned environments, every id maps to exactly one of them,
+    and the ids genuinely span more than one — i.e. only when a split is both possible and needed.
+    """
+    envs = job_env_services_for_url(jenkins_build_url)
+    if len(envs) < 2 or len(resolved_ids) < 2:
+        return {}
+    owner: dict[str, list[str]] = {}
+    for sid in resolved_ids:
+        key = _normalize_service_query_key(sid)
+        hits = [
+            e
+            for e, names in envs.items()
+            if any(_normalize_service_query_key(n) == key for n in names)
+        ]
+        if len(hits) != 1:
+            return {}
+        owner.setdefault(hits[0], []).append(sid)
+    return owner if len(owner) >= 2 else {}
+
+
+def _fpms_maybe_split_run_by_environment(
+    chat_id: str,
+    session_key: str,
+    data: dict,
+    resolved_ids: Sequence[str],
+    send,
+    *,
+    raw_prompt_body: str,
+    jenkins_build_url: str,
+    job_profile: str,
+    lark_message_id: str | None = None,
+) -> bool:
+    """
+    Turn one run whose services span several Environments of the same job into a sequential queue.
+
+    The parse-time splitter cannot cover misspelled names — those are only resolved by the pick
+    card, after segmentation. By this point the ids are real, so re-check: a run holding both
+    ``player-public-rollout`` and ``player-private-rollout`` would otherwise settle on the public
+    Environment and silently fail to tick the private service.
+
+    Returns True when it has taken over (queue started); False to let the caller run normally.
+    """
+    owner = _fpms_split_resolved_ids_by_environment(jenkins_build_url, resolved_ids)
+    if not owner:
+        return False
+    try:
+        import updatemore as um
+
+        branch = str(data.get("branch") or "").strip()
+        version = str(data.get("version") or "").strip()
+        headline = _jenkins_update_first_non_empty_line(raw_prompt_body or "")
+        headline = JENKINS_UPDATE_CMD_RE.sub("", headline, count=1).strip() or "update"
+        segments: list[dict] = []
+        for i, (env, svcs) in enumerate(owner.items()):
+            lines = [f"environment: {env}"]
+            if branch:
+                lines.append(f"branch: {branch}")
+            if version:
+                lines.append(f"version: {version}")
+            lines += ["services:", *svcs]
+            segments.append(
+                {
+                    "env_line": headline,
+                    "lines": lines,
+                    "email_subject": None,
+                    "same_as_prev": i > 0,
+                }
+            )
+        um.assign_email_batches(segments)
+        q = um.init_queue(
+            segments,
+            chat_id=chat_id,
+            sender_id=session_key.split(":", 1)[-1],
+            skip_build=False,
+        )
+    except Exception as ex:
+        print(f"[fpms] post-pick env split skipped: {ex!r}", flush=True)
+        return False
+    with _fpms_lark_sessions_lock:
+        prev = _fpms_lark_sessions.get(session_key)
+        if isinstance(prev, dict):
+            _fpms_lark_unregister_picker_sid_from_sess(prev)
+        _fpms_lark_sessions[session_key] = {"updatemore_queue": q}
+    send(
+        chat_id,
+        "🔀 Those services live in **"
+        + str(len(owner))
+        + " different Environments** of the same Jenkins job, so this becomes "
+        + str(len(owner))
+        + " builds — one after the other:\n"
+        + "\n".join(
+            f"{i + 1}. `{env}` — {', '.join(svcs)}" for i, (env, svcs) in enumerate(owner.items())
+        ),
+    )
+    import updatemore as um2
+
+    return _dispatch_lark_update_command_body(
+        chat_id,
+        session_key,
+        um2.segment_to_update_body(segments[0]),
+        send,
+        from_updatemore=True,
+        lark_message_id=lark_message_id,
+    )
+
+
 def _jenkins_update_filter_ties_by_services(
     ties: list[tuple[str, float, str, str]], service_tokens: Sequence[str]
 ) -> list[tuple[str, float, str, str]]:
@@ -13631,6 +13743,18 @@ def _fpms_lark_dispatch_fpms_parameter_flow(
         if not resolved_ids:
             send(chat_id, "❌ No services parsed after resolving ports.")
             return True
+        if jp == "fpms" and _fpms_maybe_split_run_by_environment(
+            chat_id,
+            session_key,
+            data,
+            resolved_ids,
+            send,
+            raw_prompt_body=body,
+            jenkins_build_url=jenkins_build_url,
+            job_profile=jp,
+            lark_message_id=lark_message_id,
+        ):
+            return True
         _fpms_lark_begin_jenkins_run(
             chat_id,
             session_key,
@@ -16045,6 +16169,20 @@ def handle_lark_jenkins_update_message(
             ju_pick = str(sess.get("jenkins_job_url") or BUILD_URL).strip() or BUILD_URL
 
             def _run_jenkins_when_pick_done() -> None:
+                # Names are real only now, so this is the first chance to notice that the picks
+                # span two Environments of one job — the parse-time splitter never saw the typos.
+                if jp_sess == "fpms" and _fpms_maybe_split_run_by_environment(
+                    chat_id,
+                    key,
+                    data_pick,
+                    list(sess["resolved_ids"]),
+                    send,
+                    raw_prompt_body=raw_pb,
+                    jenkins_build_url=ju_pick,
+                    job_profile=jp_sess,
+                    lark_message_id=lark_message_id,
+                ):
+                    return
                 _fpms_lark_begin_jenkins_run(
                     chat_id,
                     key,
