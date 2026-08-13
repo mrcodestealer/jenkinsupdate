@@ -2494,6 +2494,22 @@ def _environment_hint_from_banner(line: str) -> str | None:
     return None
 
 
+def _service_token_is_reordering_of(tok: str, candidate: str) -> bool:
+    """
+    True when ``tok`` is ``candidate``'s words in a different order.
+
+    ``player-rollout-public`` vs ``player-public-rollout``: identical word multiset, different
+    sequence. Word-for-word identity is what makes this safe to auto-correct — unlike a fuzzy
+    score, it cannot land on a service the user never typed.
+    """
+
+    def _words(s: str) -> list[str]:
+        return [p for p in re.split(r"[^a-z0-9]+", _normalize_service_query_key(s)) if p]
+
+    a, b = _words(tok), _words(candidate)
+    return bool(a) and len(a) > 1 and a != b and sorted(a) == sorted(b)
+
+
 def _catalog_exact_service_id(tok: str, catalog: Sequence[str]) -> str | None:
     """Return canonical Jenkins checkbox id when ``tok`` matches ``catalog`` after normalize."""
     k = _normalize_service_query_key(tok)
@@ -2557,6 +2573,13 @@ def _resolve_catalog_token_or_menu(tok: str, catalog: Sequence[str]) -> tuple[st
         return None, True
     exact = _catalog_exact_service_id(tok, catalog)
     if exact is None:
+        # Same words in a different order — ``player-rollout-public`` for
+        # ``player-public-rollout`` — has exactly one possible reading, so asking adds a tap and no
+        # safety. Only accepted when a single catalog entry is a reordering: it can never resolve
+        # to a service the user did not actually name.
+        reordered = [c for c in catalog if _service_token_is_reordering_of(tok, c)]
+        if len(reordered) == 1:
+            return reordered[0], False
         return None, True
     # Full exact catalog id typed (e.g. ``risk-analysis-worker``) — use it even when a
     # longer sibling exists (``risk-analysis-worker-inactive-player-snapshot``).
