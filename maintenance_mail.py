@@ -2324,8 +2324,18 @@ def _should_skip_jenkins_reply_message(msg: email.message.Message) -> bool:
 
 
 def _jenkins_message_has_reply_recipients(msg: email.message.Message) -> bool:
+    """Can we Reply-All to this at all — i.e. is anyone left after removing ourselves?
+
+    Uses the NARROW sending-mailbox set, deliberately, so this answers the same question the
+    send path answers. With the broad set it stripped ``JENKINS_DONE_REPLY_TO`` too, and a mail
+    addressed only to that colleague was reported as "no To/Cc recipients" even though the
+    reply would have been perfectly deliverable to them. Screening and sending must agree.
+
+    Detecting *our own* messages is a different question and still uses the broad set — see
+    :func:`_own_smtp_identities`.
+    """
     try:
-        _jenkins_reply_all_recipients(msg)
+        _jenkins_reply_all_recipients(msg, exclude=_sending_mailbox_identities())
         return True
     except ValueError:
         return False
@@ -5424,8 +5434,10 @@ def _allemail_entry_ineligible_reason(e: dict[str, Any]) -> str | None:
         return "it is a bounce / mailer-daemon notice"
     if _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
         return "it is an auto-responder reply"
-    if _allemail_entry_reply_recipients(e) is None:
-        return "its To/Cc contain only our own addresses"
+    # Narrow set: "can we reply" must match "who would receive it" (see
+    # _jenkins_message_has_reply_recipients).
+    if _allemail_entry_reply_recipients(e, for_send=True) is None:
+        return "its To/Cc contain only our own sending address"
     return None
 
 
