@@ -5600,21 +5600,22 @@ def _allemail_thread_members(entry: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _allemail_thread_quote_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    """The message whose body should be quoted — the NEWEST in the thread, not the root.
+    """The message whose body should be quoted — the NEWEST in the thread, whoever sent it.
 
     A manual **Reply All** is performed on the latest mail in a conversation, and that mail's
-    HTML already contains every earlier round nested inside it. Quoting the thread ROOT instead
-    (which is what "only genuine originals qualify" selects for *recipients*) yields a quote
-    block showing a single message — the complaint that prompted this.
+    HTML already nests every earlier round. Quoting the thread ROOT instead (which is what
+    "only genuine originals qualify" selects for *recipients*) yields a quote block showing a
+    single message.
 
-    Our own prior auto-replies are skipped: quoting one nests our own quote block inside itself
-    and adds nothing the message beneath it does not already carry.
+    Our own messages are deliberately **not** skipped here. An earlier version did, reasoning
+    that quoting our own reply nests our quote block inside itself — but that is exactly what a
+    real thread looks like, and skipping them collapses the history to one message on any
+    thread we participate in (including every thread the bot has already replied to). Choosing
+    the quote source *within an already-identified thread* is a different question from
+    avoiding a bot reply being mistaken for the reply *target*, which
+    :func:`_resolve_live_quote_anchor` still guards on the live path.
     """
     members = _allemail_thread_members(entry)
-    for e in members:
-        if _allemail_from_is_own(e.get("from_raw", "")):
-            continue
-        return e
     return members[0] if members else entry
 
 
