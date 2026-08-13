@@ -6188,6 +6188,55 @@ def normalize_parameter_text(value: str) -> str:
     return (value or "").strip()
 
 
+# Jenkins renders a parameter's text box with one of these classes. Active Choices
+# DynamicReference rows additionally carry a hidden ``input[name=value]`` that submits the value.
+_PARAM_TEXT_INPUT_SELECTOR = (
+    "input.setting-input[type='text'], "
+    "input.jenkins-input[type='text'], "
+    "input[name='value'][type='text']"
+)
+
+
+def _row_visible_control(row):
+    """
+    First **visible** control in a parameter row as ``(kind, locator)`` — ``kind`` is ``"select"``,
+    ``"text"``, or ``None`` when nothing visible has rendered yet.
+
+    Active Choices renders a DynamicReference parameter as the real widget *plus* a hidden
+    ``<input name="value" style="visibility:hidden; position:absolute">`` that carries the value
+    into the POST. Taking ``.first`` blindly grabs that carrier whenever the real widget is a
+    ``<select>`` — which is what **Branch** became on the FPMS / FPMS_NT update jobs ("Please
+    select branch from the dropdown") — and then waits forever for an element hidden by design.
+    """
+    cands = row.locator("select, input[type='text'], textarea")
+    try:
+        n = cands.count()
+    except Exception:
+        return None, None
+    for i in range(n):
+        c = cands.nth(i)
+        try:
+            if not c.is_visible():
+                continue
+            tag = str(c.evaluate("el => el.tagName") or "").lower()
+        except Exception:
+            continue
+        return ("select" if tag == "select" else "text"), c
+    return None, None
+
+
+def _wait_row_visible_control(page, row, *, timeout_ms: int = 15_000):
+    """Poll :func:`_row_visible_control` until a widget renders (Active Choices fills rows async)."""
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+    while True:
+        kind, ctl = _row_visible_control(row)
+        if kind:
+            return kind, ctl
+        if time.monotonic() >= deadline:
+            return None, None
+        _safe_page_wait(page, 250)
+
+
 def fill_text_parameter(page, label: str, value: str) -> None:
     value = normalize_parameter_text(value)
     if (label or "").strip().casefold() == "command":
@@ -6195,12 +6244,18 @@ def fill_text_parameter(page, label: str, value: str) -> None:
         _fpms_prod_script_command_must_start_with_node(value)
     row = _form_row(page, label)
     row.wait_for(state="visible", timeout=30_000)
-    inp = row.locator(
-        "input.setting-input[type='text'], "
-        "input.jenkins-input[type='text'], "
-        "input[name='value'][type='text']"
-    ).first
-    inp.wait_for(state="visible", timeout=15_000)
+    kind, ctl = _wait_row_visible_control(page, row)
+    if kind == "select":
+        # The job renders this parameter as a dropdown, not a text box. Select the option instead
+        # of typing into the hidden carrier — and get "available: …" on a bad value, not a timeout.
+        select_choice_parameter_by_value(page, label, value)
+        return
+    if kind is None:
+        raise RuntimeError(
+            f"{label}: no visible text box or dropdown in this parameter row — Active Choices did "
+            "not render, or the job's parameter type changed."
+        )
+    inp = ctl
     inp.click()
     inp.fill("")
     inp.fill(value)
@@ -6635,12 +6690,19 @@ def _service_line_checked(page, name: str) -> bool:
 
 
 def read_text_parameter_value(page, label: str) -> str:
+    """
+    Current value of a text/dropdown parameter, read from whichever widget the job renders.
+
+    Must agree with :func:`fill_text_parameter` about which element is real — reading the hidden
+    Active Choices carrier here would report a dropdown parameter as empty and fail verification
+    immediately after a successful fill.
+    """
     row = _form_row(page, label)
-    inp = row.locator(
-        "input.setting-input[type='text'], "
-        "input.jenkins-input[type='text'], "
-        "input[name='value'][type='text']"
-    ).first
+    kind, ctl = _wait_row_visible_control(page, row, timeout_ms=15_000)
+    if kind is not None:
+        # ``input_value()`` covers <select> as well as <input>/<textarea>.
+        return normalize_parameter_text(ctl.input_value() or "")
+    inp = row.locator(_PARAM_TEXT_INPUT_SELECTOR).first
     inp.wait_for(state="attached", timeout=15_000)
     return normalize_parameter_text(inp.input_value() or "")
 
