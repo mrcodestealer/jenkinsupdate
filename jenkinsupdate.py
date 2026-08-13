@@ -9210,6 +9210,146 @@ def _jenkins_update_jobs_hosting_services(
     return out
 
 
+def _jenkins_update_resolve_by_services(
+    body: str, service_tokens: Sequence[str]
+) -> tuple[str, float, str, str] | None:
+    """
+    Pick the job from the named services alone, using the headline only to break a tie *among the
+    jobs that actually host them*.
+
+    One host is the answer outright. Several hosts (``promotion-rollout`` is on both FPMS and
+    FPMS_NT master) is a real ambiguity the headline can settle — and settling it here is far safer
+    than sending the whole message to the fuzzy ranker, which scores ``UPDATE NT UAT MASTER``
+    highest against ``ds update`` and never surfaces the NT job at all.
+    """
+    hosts = _jenkins_update_jobs_hosting_services(service_tokens)
+    if not hosts:
+        return None
+    if len(hosts) == 1:
+        return hosts[0]
+    head = _jenkins_update_first_non_empty_line(body)
+    narrowed = _jenkins_update_dedupe_ties(
+        _jenkins_update_prefer_nt(
+            _jenkins_update_prefer_master_or_branch(hosts, head), head
+        )
+    )
+    return narrowed[0] if len(narrowed) == 1 else None
+
+
+def _updatemore_segment_job_url(segment: dict) -> str:
+    """
+    Jenkins job URL a ``/updatemore`` segment will target — resolved exactly like routing, but
+    pure: no messages, no sessions, no Jenkins. ``""`` when it cannot be determined.
+    """
+    try:
+        import updatemore as um
+
+        body = um.segment_to_update_body(segment)
+    except Exception:
+        return ""
+    try:
+        toks = _peek_service_tokens_from_update_body(body)
+        row = _jenkins_update_resolve_by_services(body, toks)
+        if row is not None:
+            return _jenkins_update_primary_url(row[3]).casefold()
+        head = _jenkins_update_first_non_empty_line(body)
+        ties = _jenkins_update_disambiguation_ties(
+            _rank_jenkins_update_job_matches(body), band=0.05
+        )
+        ties = _jenkins_update_prefer_master_or_branch(ties, head)
+        ties = _jenkins_update_prefer_nt(ties, head)
+        ties = _jenkins_update_dedupe_ties(ties)
+        if toks:
+            ties = _jenkins_update_filter_ties_by_services(ties, toks)
+        if ties:
+            return _jenkins_update_primary_url(ties[0][3]).casefold()
+    except Exception:
+        pass
+    return ""
+
+
+def _updatemore_next_segment_same_link(q: dict) -> bool:
+    """
+    True when the next segment targets the **same Jenkins job link** as the one just built.
+
+    Comparing headlines is not enough. Two segments of one job routinely carry different headline
+    text (``NT Auth/Player UAT MASTER`` vs ``NT UAT MASTER``), and the build-with-parameters page
+    holds one Environment at a time, so anything sharing a link has to run one after another.
+    """
+    segs = q.get("segments") or []
+    idx = int(q.get("index") or 0)
+    if idx + 1 >= len(segs):
+        return False
+    cur = _updatemore_segment_job_url(segs[idx])
+    return bool(cur) and cur == _updatemore_segment_job_url(segs[idx + 1])
+
+
+def _updatemore_split_segments_by_environment(segments: list[dict]) -> list[dict]:
+    """
+    Split any segment whose services span more than one Environment of its own job.
+
+    A Jenkins build selects exactly one Environment, so naming both public and private services of
+    FPMS_NT_UAT_MASTER_UPDATE is two builds, not one. Each piece is emitted with an explicit
+    ``environment:`` line and marked ``same_as_prev`` so it waits for the previous build — the same
+    shape the CPMS/IGO flow already uses.
+
+    Conservative by design: it only splits when every named service maps to exactly one known
+    environment. Typos are resolved later by the pick card, so a segment containing one is left
+    whole rather than split on a guess.
+    """
+    out: list[dict] = []
+    for seg in segments or []:
+        pieces: list[dict] | None = None
+        try:
+            url = _updatemore_segment_job_url(seg)
+            envs = job_env_services_for_url(url) if url else {}
+            if len(envs) >= 2:
+                import updatemore as um
+
+                body = um.segment_to_update_body(seg)
+                toks = _peek_service_tokens_from_update_body(body)
+                owner: dict[str, list[str]] = {}
+                unmapped = False
+                for tok in toks:
+                    key = _normalize_service_query_key(tok)
+                    hits = [
+                        e
+                        for e, names in envs.items()
+                        if any(_normalize_service_query_key(n) == key for n in names)
+                    ]
+                    if len(hits) != 1:
+                        unmapped = True
+                        break
+                    owner.setdefault(hits[0], []).append(tok)
+                if toks and not unmapped and len(owner) >= 2:
+                    lines = list(seg.get("lines") or [])
+                    keep = [
+                        ln
+                        for ln in lines
+                        if re.match(r"(?i)^\s*(branch|version|source[_\s]*branch)\s*[:=]", ln.strip())
+                    ]
+                    pieces = []
+                    for i, (env, svcs) in enumerate(owner.items()):
+                        pieces.append(
+                            {
+                                "env_line": seg.get("env_line"),
+                                "lines": [f"environment: {env}", *keep, "services:", *svcs],
+                                "email_subject": seg.get("email_subject") if i == 0 else None,
+                                "same_as_prev": True if i > 0 else bool(seg.get("same_as_prev")),
+                            }
+                        )
+                    print(
+                        f"→ /updatemore: split one segment across {len(owner)} environments "
+                        f"({', '.join(owner)}) — they share a job link, so they run in order.",
+                        flush=True,
+                    )
+        except Exception as ex:
+            print(f"[updatemore] env split skipped: {ex!r}", flush=True)
+            pieces = None
+        out.extend(pieces if pieces else [seg])
+    return out
+
+
 def _jenkins_update_filter_ties_by_services(
     ties: list[tuple[str, float, str, str]], service_tokens: Sequence[str]
 ) -> list[tuple[str, float, str, str]]:
@@ -14151,7 +14291,8 @@ def _fpms_lark_notify_jenkins_after_build_click(
         # the session-stored subject (set by _dispatch_lark_update_command_body) wins.
         email = _fpms_lark_session_email_subject(session_key)
     seg_idx = int(q.get("index") or 0)
-    next_same = um.next_segment_same_env(q)
+    # Same headline OR same job link — a shared link must run one build at a time.
+    next_same = um.next_segment_same_env(q) or _updatemore_next_segment_same_link(q)
     has_next = um.has_next_segment(q)
     print(
         f"[jenkinsupdate] notify after build (updatemore): segs="
@@ -14192,7 +14333,7 @@ def _fpms_lark_notify_jenkins_after_build_click(
                     um.persist_queue(q2)
         send(
             chat_id,
-            "⏳ Same environment — waiting for Jenkins to finish before the next segment…",
+            "⏳ Same Jenkins job — waiting for this build to finish before the next segment…",
         )
         return
 
@@ -14975,15 +15116,15 @@ def _dispatch_lark_update_command_body(
     # decides only when the services cannot: absent, unrecognised, or hosted by several jobs (e.g.
     # ``livechat-rollout`` exists on both FPMS and FPMS_NT master). Requiring a *unique* hit is what
     # keeps a stale catalog from routing confidently to the wrong job — it falls through instead.
-    svc_hosts = _jenkins_update_jobs_hosting_services(svc_tokens)
-    if len(svc_hosts) == 1:
+    svc_row = _jenkins_update_resolve_by_services(body, svc_tokens)
+    if svc_row is not None:
         print(
-            f"→ Service-first routing: **{svc_hosts[0][2]}** is the only job hosting "
+            f"→ Service-first routing: **{svc_row[2]}** hosts "
             f"{', '.join(svc_tokens[:8])} — skipping headline ranking.",
             flush=True,
         )
         return _fpms_lark_dispatch_job_row(
-            chat_id, key, body, svc_hosts[0], send, lark_message_id=lark_message_id
+            chat_id, key, body, svc_row, send, lark_message_id=lark_message_id
         )
 
     ties_h: list[tuple[str, float, str, str]] = []
@@ -15617,6 +15758,8 @@ def handle_lark_jenkins_update_message(
         except ValueError as ex:
             send(chat_id, f"❌ `/updatemore` parse error: {ex}")
             return True
+        # A segment naming services from two Environments of one job is two builds, not one.
+        segments = _updatemore_split_segments_by_environment(segments)
         with _fpms_lark_sessions_lock:
             prev = _fpms_lark_sessions.get(key)
             if isinstance(prev, dict):
