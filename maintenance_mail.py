@@ -5477,6 +5477,52 @@ def _allemail_match_view() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return entries, idf_table
 
 
+def _allemail_thread_members(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every indexed message belonging to the same conversation as ``entry``, newest first.
+
+    Matched on the *conversation* rather than the subject: the ``References`` chain first, then
+    the root ``Message-ID`` that later replies point back at, then the normalised subject body.
+    A ``Re:``-prefixed reply and its original therefore land in one list.
+    """
+    root_mid = _normalize_message_id(entry.get("message_id") or "")
+    root_body = subject_match.match_normalize(
+        subject_match.strip_reply_prefixes(entry.get("subject") or "")[0]
+    )
+    entries, _idf = _allemail_match_view()
+    out: list[dict[str, Any]] = []
+    for e in entries:
+        refs = {_normalize_message_id(x) for x in (e.get("references") or "").split() if x.strip()}
+        mid = _normalize_message_id(e.get("message_id") or "")
+        same = False
+        if root_mid and (mid == root_mid or root_mid in refs):
+            same = True
+        elif root_body and e.get("_t", {}).get("body") == root_body:
+            same = True
+        if same:
+            out.append(e)
+    out.sort(key=lambda e: float(e.get("date_ts") or 0.0), reverse=True)
+    return out
+
+
+def _allemail_thread_quote_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """The message whose body should be quoted — the NEWEST in the thread, not the root.
+
+    A manual **Reply All** is performed on the latest mail in a conversation, and that mail's
+    HTML already contains every earlier round nested inside it. Quoting the thread ROOT instead
+    (which is what "only genuine originals qualify" selects for *recipients*) yields a quote
+    block showing a single message — the complaint that prompted this.
+
+    Our own prior auto-replies are skipped: quoting one nests our own quote block inside itself
+    and adds nothing the message beneath it does not already carry.
+    """
+    members = _allemail_thread_members(entry)
+    for e in members:
+        if _allemail_from_is_own(e.get("from_raw", "")):
+            continue
+        return e
+    return members[0] if members else entry
+
+
 def resolve_reply_target(title: str) -> subject_match.Res:
     """Which email does ``title`` mean? Returns a :class:`subject_match.Res`.
 
@@ -5750,12 +5796,31 @@ def _reply_jenkins_update_done_email_via_cache(
     cached_uid = (cached.get("uid") or "").strip()
     cached_refs = cached.get("references") or ""
 
+    # Recipients and the Re: subject come from the thread ROOT (the genuine original), but the
+    # QUOTE must come from the newest message in that thread — that mail's body already nests
+    # every earlier round, which is what makes Lark's Show/Hide show the whole conversation
+    # instead of a single message. This is what a manual Reply All quotes.
+    quote_entry = cached
+    try:
+        quote_entry = _allemail_thread_quote_entry(cached)
+    except Exception as _tq_err:  # noqa: BLE001 — falling back to the root is always valid
+        print(f"[allemail] thread-latest lookup failed: {_tq_err!r}", flush=True)
+    q_mid_raw = (quote_entry.get("message_id") or "").strip()
+    q_mid = q_mid_raw if _normalize_message_id(q_mid_raw) else ""
+    if quote_entry is not cached:
+        print(
+            f"[allemail] quoting the newest message in the thread "
+            f"({(quote_entry.get('date') or '?')[:10]} {quote_entry.get('folder')!r}/"
+            f"{quote_entry.get('uid')!r}) instead of the root "
+            f"({(cached.get('date') or '?')[:10]}) so the full history is included",
+            flush=True,
+        )
     quote_src, quote_route = _resolve_cache_quote_source(
         title=title,
-        cached_mid=cached_mid,
-        cached_folder=cached_folder,
-        cached_uid=cached_uid,
-        cached_subject=cached.get("subject") or "",
+        cached_mid=q_mid,
+        cached_folder=(quote_entry.get("folder") or "").strip(),
+        cached_uid=(quote_entry.get("uid") or "").strip(),
+        cached_subject=quote_entry.get("subject") or "",
     )
     # The cache screens HEADERS only. Now that the original body is in hand at zero extra IMAP
     # cost, run the body-level screen too — a "Failed to send" notice that kept the original
@@ -5768,14 +5833,15 @@ def _reply_jenkins_update_done_email_via_cache(
         )
         return None
 
-    # A UID-only hit carries the headers the cache lacked — prefer the real ones for threading.
-    orig_mid = cached_mid
-    orig_refs = cached_refs
-    if quote_src is not None and not orig_mid:
+    # Thread on the message we are actually quoting — that is what a manual reply does, and it
+    # keeps In-Reply-To consistent with the quote block's meta rows. Falls back to the root.
+    orig_mid = q_mid or cached_mid
+    orig_refs = (quote_entry.get("references") or "") or cached_refs
+    if quote_src is not None:
         fetched_mid = (quote_src.get("Message-ID") or "").strip()
         if _normalize_message_id(fetched_mid):
             orig_mid = fetched_mid
-            orig_refs = (quote_src.get("References") or "").strip() or cached_refs
+            orig_refs = (quote_src.get("References") or "").strip() or orig_refs
 
     target_ts = float(cached.get("date_ts") or 0.0)
     age_days = (time.time() - target_ts) / 86400.0 if target_ts > 0 else -1.0
