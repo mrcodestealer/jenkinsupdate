@@ -3470,7 +3470,10 @@ def _body_mentions_bi_script_job(body: str) -> bool:
     api_repos = {str(v).casefold() for _t, v in BI_API_UPDATE_REPOSITORY_OPTIONS}
     for tok in tokens:
         key = _normalize_service_query_key(tok)
-        if key and key not in api_repos:
+        # Every BI-SCRIPT DEPLOYMENT_FILE_NAME is ``bi-…``. Requiring that prefix is what keeps an
+        # FPMS/PMS request that merely contains the word "script" — prose like "run the migration
+        # script", or a real service id such as ``pms-script`` — from being hijacked to the BI job.
+        if key.startswith("bi-") and key not in api_repos:
             return True
     return False
 
