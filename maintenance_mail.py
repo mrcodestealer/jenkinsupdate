@@ -434,8 +434,15 @@ def _order_jenkins_reply_folders(folders: list[str]) -> list[str]:
 
 
 def _parse_jenkins_reply_imap_folders() -> list[str]:
+    """Folders searched for a reply target.
+
+    ``CLOSED EMAILS`` is deliberately NOT in the default: it is an archive of finished threads
+    (31k messages on this mailbox), so a "Done" notice landing there is almost always the wrong
+    thread — and scanning it cost ~25s per live lookup for no useful hit. Add it back explicitly
+    via ``JENKINS_REPLY_IMAP_FOLDERS`` if a thread really does need to be reachable there.
+    """
     raw = os.getenv("JENKINS_REPLY_IMAP_FOLDERS", "").strip()
-    default = "OSE Pending,INBOX,Sent,CLOSED EMAILS"
+    default = "OSE Pending,INBOX,Sent"
     return _order_jenkins_reply_folders(
         [f.strip() for f in (raw or default).split(",") if f.strip()]
     )
@@ -509,6 +516,9 @@ _ALLEMAIL_HEADER_FETCH_SPEC = (
 )
 _allemail_lock = threading.Lock()
 _allemail_scanner_started = False
+# Last reason the live picker skipped a subject match, so the "matched but unusable" error can
+# name the real cause. Best-effort diagnostics only — never drives a decision.
+_last_skip_reason = ""
 # ((mtime, size), tokenised entries, idf table) — see _allemail_match_view.
 _allemail_view_cache: tuple[tuple[float, int], list[dict[str, Any]], dict[str, Any]] | None = None
 
@@ -2579,35 +2589,30 @@ def _uid_as_bytes(uid: bytes | str) -> bytes:
 
 
 def _reply_peek_from_header_text(text: str) -> dict[str, Any]:
-    subj = ""
-    date_raw = ""
-    from_raw = ""
-    to_raw = ""
-    cc_raw = ""
-    auto_submitted = ""
-    for line in (text or "").splitlines():
-        low = line.lower()
-        if low.startswith("subject:"):
-            subj = line.split(":", 1)[1].strip()
-        elif low.startswith("date:"):
-            date_raw = line.split(":", 1)[1].strip()
-        elif low.startswith("from:"):
-            from_raw = line.split(":", 1)[1].strip()
-        elif low.startswith("to:"):
-            to_raw = line.split(":", 1)[1].strip()
-        elif low.startswith("cc:"):
-            cc_raw = line.split(":", 1)[1].strip()
-        elif low.startswith("auto-submitted:"):
-            auto_submitted = line.split(":", 1)[1].strip()
-    if subj:
-        subj = _decode_msg_subject(email.message_from_string(f"Subject: {subj}\n\n"))
-    if from_raw:
-        from_raw = _decode_mime_header(from_raw) or from_raw
-    if to_raw:
-        to_raw = _decode_mime_header(to_raw) or to_raw
-    if cc_raw:
-        cc_raw = _decode_mime_header(cc_raw) or cc_raw
+    """Parse a header block into the fields the reply picker screens on.
+
+    Uses the stdlib parser rather than a line loop. The old hand-rolled version matched only
+    lines *starting* with ``to:``/``cc:`` and so silently dropped RFC 5322 **folded**
+    continuations — a perfectly normal
+
+        To: "Jun Chen (JC)"
+         <junchen@snsoft.my>
+
+    became the address-less fragment ``"Jun Chen (JC)"``, and the message was rejected as
+    "no To/Cc recipients" despite having both. That produced real, repeated false negatives.
+
+    ``Auto-Submitted`` is also carried as its own field instead of being faked into ``From`` as
+    a synthetic ``mailer-daemon`` string, which used to make every auto-generated vendor notice
+    look like a bounce to the caller.
+    """
+    msg = email.message_from_string(text or "")
+    subj = _decode_msg_subject(msg)
+    from_raw = _decode_mime_header(msg.get("From")) or ""
+    to_raw = _decode_mime_header(msg.get("To")) or ""
+    cc_raw = _decode_mime_header(msg.get("Cc")) or ""
+    auto_submitted = (_decode_mime_header(msg.get("Auto-Submitted")) or "").strip()
     ts = datetime.min.replace(tzinfo=timezone.utc)
+    date_raw = (msg.get("Date") or "").strip()
     if date_raw:
         try:
             dt = parsedate_to_datetime(date_raw)
@@ -2616,16 +2621,13 @@ def _reply_peek_from_header_text(text: str) -> dict[str, Any]:
             ts = dt
         except Exception:
             pass
-    if auto_submitted and auto_submitted.strip().casefold() not in ("", "no"):
-        from_raw = from_raw or ""
-        if "mailer-daemon" not in from_raw.casefold():
-            from_raw = (from_raw + " mailer-daemon").strip()
     return {
         "ts": ts,
         "subj": subj,
         "from_hdr": from_raw,
         "to_raw": to_raw,
         "cc_raw": cc_raw,
+        "auto_submitted": auto_submitted,
     }
 
 
@@ -2919,6 +2921,10 @@ def _pick_reply_uid_among_candidates(
                 )
                 return uid
         skipped += 1
+        # Remember WHY, so a "matched but unusable" outcome can report the real cause instead
+        # of the caller guessing "bounces".
+        global _last_skip_reason
+        _last_skip_reason = reason
         print(
             f"[maint-mail] jenkins reply: skip uid={uid!r} folder={folder_label!r} "
             f"reason={reason!r} from={from_hdr!r} subj={subj!r}",
@@ -4781,9 +4787,14 @@ def find_message_by_subject_title(
         if best_uid is None:
             if saw_subject_hits_only_bounces:
                 where = ", ".join(folders_checked) or ", ".join(scan)
+                # The flag only records "matched the subject but was unusable" — it does NOT
+                # mean bounce. Report the real reason the picker logged, because blaming
+                # bounces for a self-sent or recipient-less mail sends people hunting the
+                # wrong problem (it did exactly that here).
+                why = _last_skip_reason or "no usable reply target"
                 raise JenkinsReplyOnlyBouncesError(
-                    f"Only delivery-failure / bounce messages match {title!r} in "
-                    f"folder(s): {where} — no normal mail with Reply-All recipients."
+                    f"Subject matches for {title!r} exist in folder(s): {where}, but none can "
+                    f"be replied to — {why}."
                 )
             print(
                 f"[maint-mail] jenkins reply: no match for {needle!r} in folders "
