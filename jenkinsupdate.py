@@ -17094,6 +17094,14 @@ def run(
         # Every other job type drives an Active Choices cascade and needs the full settle waits.
         _restore_fpms_fill_timings()
 
+    # Resolved before the config block is parsed: the parser needs this job's own service catalog,
+    # and the Environment override below needs the same URL.
+    ju_for_env = (jenkins_build_url or "").strip()
+    if not ju_for_env and bot_lark_gate:
+        ju_for_env = str(bot_lark_gate.get("build_url") or "").strip()
+    if not ju_for_env:
+        ju_for_env = BUILD_URL
+
     parsed_update_all = False
     command = ""
     repository = ""
@@ -17310,11 +17318,6 @@ def run(
 
     update_all_services = bool(update_all_services) or parsed_update_all
 
-    ju_for_env = (jenkins_build_url or "").strip()
-    if not ju_for_env and bot_lark_gate:
-        ju_for_env = str(bot_lark_gate.get("build_url") or "").strip()
-    if not ju_for_env:
-        ju_for_env = BUILD_URL
     if jp == "fpms" and not is_bi_api_update and not is_qrqm_update and not is_prod_script and not skip_env:
         forced_env = _environment_for_fpms_jenkins_job_url(ju_for_env, services)
         if forced_env is not None:
