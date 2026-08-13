@@ -5832,6 +5832,99 @@ def _message_is_own_reply(msg: email.message.Message) -> bool:
     )
 
 
+def _message_date_ts(msg: email.message.Message) -> float:
+    """Epoch seconds from ``Date``, 0.0 when unparseable."""
+    try:
+        dt = parsedate_to_datetime((msg.get("Date") or "").strip())
+        if dt is None:
+            return 0.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _quote_source_is_bounce(msg: email.message.Message) -> bool:
+    """Bounce / auto-responder screen for a message chosen as the QUOTE SOURCE.
+
+    Deliberately WITHOUT :func:`_should_skip_jenkins_reply_message`'s own-From + ``Re:``
+    clause. That function answers "is this a bad reply TARGET" — but the newest message in a
+    thread we participate in is, by definition, our own ``Re:``, and it is exactly the message
+    carrying the nested history. Screening by what a message *is* (a bounce) rather than by how
+    it was selected is what cannot regress.
+    """
+    from_hdr = _decode_mime_header(msg.get("From")) or ""
+    subj = _decode_msg_subject(msg)
+    if _should_skip_jenkins_reply_thread(from_hdr=from_hdr, subject=subj):
+        return True
+    if _auto_submitted_blocks_reply(_decode_mime_header(msg.get("Auto-Submitted")) or ""):
+        return True
+    try:
+        body = _message_plain_text_snippet(msg, limit=_JENKINS_REPLY_BODY_PEEK).casefold()
+    except Exception:
+        body = ""
+    return _body_is_failed_send_notification(body)
+
+
+def _thread_newest_quote(
+    *,
+    title: str,
+    message_id: str,
+    subject: str,
+    references: str = "",
+    not_older_than: float = 0.0,
+) -> tuple[email.message.Message | None, dict[str, Any] | None]:
+    """The NEWEST message in this conversation, re-read from IMAP. ``(message, entry)``.
+
+    This is the whole of "quote like a manual Reply All": a manual reply is composed on the
+    LATEST mail in a thread, and that mail's HTML already nests every earlier round — so
+    quoting it is what makes Lark's Show/Hide unfold the full conversation. Quoting the thread
+    ROOT, which is what BOTH reply paths did, can only ever render one message.
+
+    ``not_older_than`` is the anchor's own timestamp: never swap in something OLDER than the
+    message the caller already holds. Returns ``(None, None)`` on any failure so the caller
+    keeps its existing fallback — quoting is best-effort and must never cost the reply.
+
+    Shared by both paths on purpose. They drifted apart once already, which is precisely why
+    fixing only the cache path changed nothing observable.
+    """
+    if not _JENKINS_REPLY_QUOTE_THREAD:
+        return None, None
+    try:
+        members = _allemail_thread_members(
+            {"message_id": message_id, "subject": subject, "references": references}
+        )
+    except Exception as ex:  # noqa: BLE001 — falling back to the anchor is always valid
+        print(f"[allemail] thread-latest lookup failed: {ex!r}", flush=True)
+        return None, None
+    skip = _normalize_message_id(message_id)
+    for m in members:
+        mid_n = _normalize_message_id(m.get("message_id") or "")
+        if mid_n and mid_n == skip:
+            continue
+        if float(m.get("date_ts") or 0.0) < not_older_than:
+            break  # newest-first: everything below here is older than what we already have
+        q_raw = (m.get("message_id") or "").strip()
+        msg, route = _resolve_cache_quote_source(
+            title=title,
+            cached_mid=q_raw if _normalize_message_id(q_raw) else "",
+            cached_folder=(m.get("folder") or "").strip(),
+            cached_uid=(m.get("uid") or "").strip(),
+            cached_subject=m.get("subject") or "",
+        )
+        if msg is None or _quote_source_is_bounce(msg):
+            continue
+        print(
+            f"[allemail] quoting the newest message in the thread "
+            f"({(m.get('date') or '?')[:10]} {m.get('folder')!r}/{m.get('uid')!r} "
+            f"route={route}) instead of the root so the full history is included",
+            flush=True,
+        )
+        return msg, m
+    return None, None
+
+
 def _resolve_live_quote_anchor(
     orig: email.message.Message, orig_folder: str
 ) -> tuple[email.message.Message, email.message.Message | None, str]:
@@ -5927,7 +6020,11 @@ def _reply_jenkins_update_done_email_via_cache(
     # The cache screens HEADERS only. Now that the original body is in hand at zero extra IMAP
     # cost, run the body-level screen too — a "Failed to send" notice that kept the original
     # subject, from a sender that is not a literal mailer-daemon, passes every header filter.
-    if quote_src is not None and _should_skip_jenkins_reply_message(quote_src):
+    # Screen the quote source for being a BOUNCE, not for being our own Re:. The full
+    # target-screen rejects any own-From "Re:", which is exactly the newest message in any
+    # thread we have already replied to — using it here would throw away the whole cached
+    # reply and degrade every such thread to the slow live search.
+    if quote_src is not None and _quote_source_is_bounce(quote_src):
         print(
             f"[allemail] cache hit for {title!r} is a bounce / auto-reply by BODY — "
             "falling back to the live search",
@@ -6201,7 +6298,26 @@ def reply_jenkins_update_done_email(
     except Exception:
         pass
 
-    anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
+    # Quote the NEWEST message in this conversation, not the one the picker chose. The picker
+    # deliberately selects the thread ROOT as a reply TARGET (its first pass runs
+    # allow_bot=False), and _resolve_live_quote_anchor then hands that same root straight back —
+    # so the quote block could only ever show ONE message however deep the real thread was.
+    # Recipients, the Re: subject and every screen above are untouched: this changes only WHAT
+    # IS QUOTED, and what we thread on.
+    newest_src, _newest_entry = _thread_newest_quote(
+        title=title,
+        message_id=(orig.get("Message-ID") or "").strip(),
+        subject=_decode_msg_subject(orig),
+        references=(orig.get("References") or "").strip(),
+        not_older_than=_message_date_ts(orig),
+    )
+    if newest_src is not None:
+        # Thread on what we quote, exactly as the cache path does.
+        anchor, quote_src, quote_note = newest_src, newest_src, "thread-newest"
+    else:
+        # Nothing newer indexed (first reply into this thread, or the re-read failed) — keep
+        # the original behaviour, including walking off our own auto-reply to its parent.
+        anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
     anchor_mid_raw = (anchor.get("Message-ID") or "").strip()
     # `<>` is degenerate — it would emit an unmatchable `In-Reply-To: <>`. Same guard the
     # cache path applies to its cached id.
