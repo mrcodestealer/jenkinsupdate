@@ -2251,6 +2251,22 @@ def _run_main_entry() -> int:
         _resolve_bot_open_id_on_startup()
         _start_scheduler()
 
+        # Keep the reply index current. Without this nothing refreshes allemail.json, so a mail
+        # that arrived after the last manual scan is invisible to the reply lookup and every
+        # reply falls through to the 25-150s live IMAP search. Started on a background thread
+        # because importing maintenance_mail is not free and must not delay the Lark socket.
+        def _start_allemail_scanners() -> None:
+            try:
+                import maintenance_mail as _boot_mm
+
+                _boot_mm.start_allemail_cache_scanner()
+            except Exception as _boot_mm_err:
+                print(f"[allemail] scanner startup skipped: {_boot_mm_err!r}", flush=True)
+
+        threading.Thread(
+            target=_start_allemail_scanners, daemon=True, name="allemail-boot"
+        ).start()
+
         # Pre-warm the Jenkins /update browser pool so the first form fill is instant.
         try:
             import jenkinsupdate as _boot_ju

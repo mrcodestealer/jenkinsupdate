@@ -492,8 +492,18 @@ ALLEMAIL_WINDOW_DAYS = min(
     400,
     max(1, int(os.getenv("ALLEMAIL_WINDOW_DAYS", "").strip() or str(_JENKINS_REPLY_SINCE_DAYS))),
 )
+# FULL 92-day rescan: minutes of IMAP work. Its job is pruning and backfill, NOT freshness, so
+# it runs rarely. Daily by default.
 ALLEMAIL_SCAN_INTERVAL_SEC = max(
-    60, int(os.getenv("ALLEMAIL_SCAN_INTERVAL_SEC", "").strip() or "3600")
+    60, int(os.getenv("ALLEMAIL_SCAN_INTERVAL_SEC", "").strip() or "86400")
+)
+# TOP-UP: just the newest slice, a few seconds. This is what keeps the index current, so it runs
+# often. Every 60s by default — new mail is indexed within a minute of arriving.
+ALLEMAIL_TOPUP_INTERVAL_SEC = max(
+    15, int(os.getenv("ALLEMAIL_TOPUP_INTERVAL_SEC", "").strip() or "60")
+)
+ALLEMAIL_TOPUP_DAYS = max(
+    1, int(os.getenv("ALLEMAIL_TOPUP_DAYS", "").strip() or "2")
 )
 # Binds BEFORE the window does: _allemail_scan_folder keeps only the newest ``uids[-CAP:]``, so a
 # cap below the window's UID count silently drops the OLDEST part of the window.
@@ -510,6 +520,11 @@ ALLEMAIL_MAX_ENTRIES = min(
 ALLEMAIL_REPLY_MAX_AGE_DAYS = min(
     365, max(1, int(os.getenv("ALLEMAIL_REPLY_MAX_AGE_DAYS", "").strip() or "14"))
 )
+# On a cache miss, scan the last couple of days and retry before falling back to the slow live
+# search. This is what makes a just-arrived email findable without waiting for a scheduled scan.
+_JENKINS_REPLY_TOPUP_ON_MISS = (
+    os.getenv("JENKINS_REPLY_TOPUP_ON_MISS", "").strip() or "1"
+) not in ("0", "false", "no", "off")
 _ALLEMAIL_HEADER_FETCH_SPEC = (
     "(BODY.PEEK[HEADER.FIELDS "
     "(DATE SUBJECT FROM TO CC MESSAGE-ID REFERENCES IN-REPLY-TO AUTO-SUBMITTED)])"
@@ -5290,6 +5305,86 @@ def scan_allemail_cache() -> int:
     return len(scanned)
 
 
+def allemail_topup_scan(*, days: int = 2) -> int:
+    """Index just the last ``days`` of mail and merge it in. Seconds, not minutes.
+
+    The full window scan re-fetches ~13.5k headers and takes minutes, so it cannot run often
+    enough to keep up with arriving mail. This scans a tiny trailing slice instead — roughly a
+    hundred messages — which is cheap enough to run on demand, immediately before a reply would
+    otherwise fall through to the 25-150s live search.
+
+    Deliberately NOT a watermark/UIDVALIDITY design: the ``SINCE`` date is derived from the
+    clock, so there is no per-folder state to persist or invalidate. It only ever ADDS to the
+    index; pruning stays with the full scan.
+
+    Returns the number of headers scanned (0 when disabled or on any failure — a top-up that
+    fails must never be worse than not running it).
+    """
+    if not _allemail_enabled():
+        return 0
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).strftime("%d-%b-%Y")
+    t0 = time.monotonic()
+    try:
+        mail = _connect_imap_simple(timeout=_JENKINS_REPLY_QUOTE_CONNECT_TIMEOUT)
+    except Exception as ex:  # noqa: BLE001 — best effort
+        print(f"[allemail] top-up connect failed: {ex!r}", flush=True)
+        return 0
+    scanned: list[dict[str, Any]] = []
+    try:
+        for folder in _allemail_folders():
+            try:
+                if not _select_mail_folder(mail, folder, readonly=True):
+                    continue
+                uids = _uid_search(mail, f"(SINCE {since})")
+                if not uids:
+                    continue
+                for off in range(0, len(uids), 50):
+                    part = [_uid_as_bytes(u) for u in uids[off : off + 50]]
+                    typ, data = mail.uid(
+                        "fetch", ",".join(u.decode() for u in part), _ALLEMAIL_HEADER_FETCH_SPEC
+                    )
+                    if typ != "OK" or not data:
+                        continue
+                    for uid_b, hdr in _parse_uid_header_fetch_data(data).items():
+                        try:
+                            scanned.append(
+                                _allemail_parse_header_bytes(
+                                    hdr, folder=folder, uid=uid_b.decode(errors="replace")
+                                )
+                            )
+                        except Exception:
+                            continue
+            except Exception as ex:  # noqa: BLE001 — one bad folder must not lose the rest
+                print(f"[allemail] top-up folder {folder!r} failed: {ex!r}", flush=True)
+                continue
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    if not scanned:
+        return 0
+    with _allemail_lock:
+        merged: dict[str, dict[str, Any]] = {}
+        for e in _allemail_load().get("emails", []):
+            merged[_allemail_entry_key(e)] = e
+        added = 0
+        for e in scanned:
+            key = _allemail_entry_key(e)
+            if key not in merged:
+                added += 1
+            merged[key] = e
+        _allemail_save(list(merged.values()))
+    global _allemail_view_cache
+    _allemail_view_cache = None  # force the tokenised view to rebuild
+    print(
+        f"[allemail] top-up: {len(scanned)} header(s) since {since}, {added} new "
+        f"({time.monotonic() - t0:.1f}s)",
+        flush=True,
+    )
+    return len(scanned)
+
+
 def allemail_store_message(
     orig: email.message.Message, *, folder: str = "", uid: str = ""
 ) -> None:
@@ -5783,7 +5878,13 @@ def _reply_jenkins_update_done_email_via_cache(
         return None
     cached = _allemail_reply_lookup(title)
     if not cached:
-        return None
+        # A miss is usually just "arrived since the last full scan". Top up the newest couple of
+        # days (seconds) and retry before conceding to the 25-150s live search — that is what
+        # makes a mail that landed minutes ago findable without waiting for a scheduled scan.
+        if _JENKINS_REPLY_TOPUP_ON_MISS and allemail_topup_scan():
+            cached = _allemail_reply_lookup(title)
+        if not cached:
+            return None
     recips = _allemail_entry_reply_recipients(cached, for_send=True)
     if recips is None:
         return None
@@ -5883,7 +5984,19 @@ def _reply_jenkins_update_done_email_via_cache(
 
 
 def start_allemail_cache_scanner() -> bool:
-    """Background daemon: scan on startup then refresh allemail.json every interval."""
+    """Background daemons that keep ``allemail.json`` current.
+
+    TWO loops with very different jobs, which is the point:
+
+    * **top-up**, every ``ALLEMAIL_TOPUP_INTERVAL_SEC`` (60s): scans only the last couple of
+      days — a few seconds of IMAP — so a mail is indexed within a minute of arriving. This is
+      what makes replies find new threads without waiting.
+    * **full**, every ``ALLEMAIL_SCAN_INTERVAL_SEC`` (daily): the whole 92-day window. Minutes
+      of work, and its job is pruning and backfill, not freshness — so it must not run often.
+      Deliberately delayed after startup so it never competes with boot.
+
+    Both are daemon threads; neither blocks the Lark event loop. Safe to call more than once.
+    """
     global _allemail_scanner_started
     if _allemail_scanner_started:
         return True
@@ -5894,24 +6007,36 @@ def start_allemail_cache_scanner() -> bool:
         )
         return False
 
-    def _loop() -> None:
+    def _topup_loop() -> None:
+        while True:
+            try:
+                allemail_topup_scan(days=ALLEMAIL_TOPUP_DAYS)
+            except Exception as ex:
+                print(f"[allemail] top-up failed: {ex!r}", flush=True)
+            time.sleep(ALLEMAIL_TOPUP_INTERVAL_SEC)
+
+    def _full_loop() -> None:
+        # Let the bot finish booting (warm pools, Lark socket) before a multi-minute scan.
+        time.sleep(float(os.getenv("ALLEMAIL_FULL_SCAN_DELAY_SEC", "").strip() or "300"))
         while True:
             try:
                 n = scan_allemail_cache()
                 print(
-                    f"[allemail] cache refreshed: {n} email(s) scanned "
+                    f"[allemail] FULL scan: {n} email(s) "
                     f"({_allemail_retention_label()}, folders={', '.join(_allemail_folders())}).",
                     flush=True,
                 )
             except Exception as ex:
-                print(f"[allemail] scan failed: {ex!r}", flush=True)
+                print(f"[allemail] full scan failed: {ex!r}", flush=True)
             time.sleep(ALLEMAIL_SCAN_INTERVAL_SEC)
 
-    threading.Thread(target=_loop, name="allemail-cache-scan", daemon=True).start()
+    threading.Thread(target=_topup_loop, name="allemail-topup", daemon=True).start()
+    threading.Thread(target=_full_loop, name="allemail-full-scan", daemon=True).start()
     _allemail_scanner_started = True
     print(
-        f"[allemail] cache scanner started (every {ALLEMAIL_SCAN_INTERVAL_SEC}s, "
-        f"{_allemail_retention_label()}).",
+        f"[allemail] scanners started — top-up every {ALLEMAIL_TOPUP_INTERVAL_SEC}s "
+        f"(last {ALLEMAIL_TOPUP_DAYS}d), full scan every {ALLEMAIL_SCAN_INTERVAL_SEC}s "
+        f"({_allemail_retention_label()}).",
         flush=True,
     )
     return True
