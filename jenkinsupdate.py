@@ -946,6 +946,35 @@ def _ensure_fast_fill_mode(*, announce: bool = True) -> None:
 if not _truthy_stable_fill_env():
     _ensure_fast_fill_mode(announce=False)
 
+_FPMS_FILL_TIMING_BASELINE: dict[str, int] = {}
+
+
+def _restore_fpms_fill_timings() -> None:
+    """
+    Undo any VPN fast-fill shrinkage before a non-VPN fill.
+
+    VPN_CREATION has two plain text fields and no Active Choices cascade, so
+    :func:`_ensure_vpn_fast_fill_mode` cuts the settle waits hard — ``_MS_POST_LOGIN_BEFORE_FORM``
+    to 0, ``_MS_FORM_READY`` and ``_MS_ENV_SETTLE`` to 30 ms. Those are module globals and nothing
+    ever put them back, so with ``VPN_WARM_BROWSER=1`` + ``VPN_WARM_PREWARM_ON_STARTUP=1`` every
+    Jenkins Services fill in the process ran with VPN timings from startup onward: the UnoChoice
+    cascade had no time to render, the list read empty, and the run failed as
+    "Services still not found".
+    """
+    changed = {
+        name: value
+        for name, value in _FPMS_FILL_TIMING_BASELINE.items()
+        if globals().get(name) != value
+    }
+    if not changed:
+        return
+    globals().update(changed)
+    print(
+        "→ Restored FPMS fill timings after VPN fast-fill mode: "
+        + ", ".join(f"{n.lstrip('_')}={v}ms" for n, v in sorted(changed.items())),
+        flush=True,
+    )
+
 
 def _vpn_fast_fill_enabled() -> bool:
     """VPN_CREATION has only VPN_USERS + VPN_LOCATION — skip UnoChoice-oriented delays."""
@@ -1132,7 +1161,10 @@ class _VpnWarmBrowser:
 
     def _launch(self) -> None:
         self._teardown()
-        _ensure_vpn_fast_fill_mode()
+        # Deliberately NOT calling _ensure_vpn_fast_fill_mode() here: launching a browser must not
+        # retune the whole process's fill timings. With prewarm-on-startup that ran before any
+        # Jenkins fill and left every Services cascade with 0/30/30 ms to render. The VPN run
+        # itself still applies it (see run()), and non-VPN runs restore the baseline.
         self._p = sync_playwright().start()
         profile = Path(_vpn_warm_profile_dir()).expanduser()
         profile.mkdir(parents=True, exist_ok=True)
@@ -2442,6 +2474,13 @@ def _resolve_environment_token(raw: str) -> str:
     for e in ENVIRONMENTS:
         if e.casefold() == low:
             return e
+    # Environments learned off the Jenkins forms, before the substring rule below gets a chance to
+    # mangle them: ``fpms-nt-uat-master`` is a substring of ``fpms-nt-uat-master-private``, so the
+    # private environment used to collapse to the public one and its services then weren't on the
+    # page. ENVIRONMENTS is hand-maintained and has neither the ``-private`` nor ``-branch`` ids.
+    for env in _learned_environment_ids():
+        if env.casefold() == low:
+            return env
     hits = [e for e in ENVIRONMENTS if low in e.casefold() or e.casefold() in low]
     if len(hits) == 1:
         return hits[0]
@@ -4431,6 +4470,21 @@ def prompt_text(label: str) -> str:
 
 _MS_LOGIN_PROBE = int(os.environ.get("FPMS_MS_LOGIN_PROBE", "8000"))
 
+# Captured once the FPMS profile has settled and every timing above exists, but before anything
+# VPN-related can run. ``_ensure_vpn_fast_fill_mode`` mutates these same module globals for the
+# whole process, so without a baseline a Jenkins fill following a VPN browser launch silently
+# inherits VPN timings. See :func:`_restore_fpms_fill_timings`.
+_FPMS_FILL_TIMING_BASELINE.update(
+    {
+        "_MS_POST_LOGIN_BEFORE_FORM": _MS_POST_LOGIN_BEFORE_FORM,
+        "_MS_AFTER_LOGIN": _MS_AFTER_LOGIN,
+        "_MS_FORM_READY": _MS_FORM_READY,
+        "_MS_POST_FILL_VERIFY": _MS_POST_FILL_VERIFY,
+        "_MS_ENV_SETTLE": _MS_ENV_SETTLE,
+        "_MS_LOGIN_PROBE": _MS_LOGIN_PROBE,
+    }
+)
+
 
 def jenkins_login_if_needed(page, username: str, password: str, timeout_ms: int = 60_000) -> None:
     user_loc = page.locator("input#j_username, input[name='j_username']").first
@@ -6189,8 +6243,21 @@ def _jenkins_job_api_base(build_url: str) -> str:
     return re.sub(r"/build(?:With(?:Parameters)?)?(?:\?.*)?$", "", (build_url or "").strip().rstrip("/"))
 
 
+_JENKINS_API_VERIFY_TLS = (
+    os.environ.get("JENKINS_API_VERIFY_TLS", "0") or ""
+).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _jenkins_last_build_state(job_base: str) -> tuple[int, bool] | None:
-    """``(number, building)`` for the job's latest build, or ``None`` when it cannot be read."""
+    """
+    ``(number, building)`` for the job's latest build, or ``None`` when it cannot be read.
+
+    TLS verification is off by default to match the browser side, which sets
+    ``ignore_https_errors=True`` everywhere — a self-signed Jenkins cert would otherwise make this
+    probe fail while the fill itself works. Failures are logged rather than swallowed: a silent
+    ``None`` here degrades the recovery to its fixed 10 s wait, which is exactly the timing bug
+    this probe exists to avoid, and the user would only see "Services still not found".
+    """
     try:
         user, pw = _credentials()
         r = requests.get(
@@ -6198,12 +6265,19 @@ def _jenkins_last_build_state(job_base: str) -> tuple[int, bool] | None:
             params={"tree": "lastBuild[number,building]"},
             auth=(user, pw),
             timeout=20,
+            verify=_JENKINS_API_VERIFY_TLS,
         )
         if r.status_code != 200:
+            print(
+                f"⚠️ Jenkins API probe {job_base}/api/json → HTTP {r.status_code}; "
+                "cannot tell when the refresh build finishes.",
+                flush=True,
+            )
             return None
         lb = (r.json() or {}).get("lastBuild") or {}
         return int(lb.get("number") or 0), bool(lb.get("building"))
-    except Exception:
+    except Exception as ex:
+        print(f"⚠️ Jenkins API probe failed ({type(ex).__name__}: {ex}).", flush=True)
         return None
 
 
@@ -6223,7 +6297,11 @@ def _wait_for_refresh_build_to_finish(build_url: str, *, since_number: int) -> b
     job_base = _jenkins_job_api_base(build_url)
     if not job_base:
         return False
-    deadline = time.monotonic() + max(0, _MS_POST_BUILD_RECOVER_MAX_WAIT_MS) / 1000.0
+    start = time.monotonic()
+    deadline = start + max(0, _MS_POST_BUILD_RECOVER_MAX_WAIT_MS) / 1000.0
+    # If the Build click never registered (stale crumb, a 403 page, a button that wasn't there),
+    # no new build will ever appear — give up quickly instead of stalling for the full cap.
+    appear_deadline = start + 60.0
     seen_new = False
     while time.monotonic() < deadline:
         state = _jenkins_last_build_state(job_base)
@@ -6235,8 +6313,13 @@ def _wait_for_refresh_build_to_finish(build_url: str, *, since_number: int) -> b
             if not building:
                 print(f"→ Refresh build #{number} finished — parameters are republished.", flush=True)
                 return True
-        elif seen_new:
-            return True
+        elif not seen_new and time.monotonic() > appear_deadline:
+            print(
+                f"⚠️ No build newer than #{since_number} appeared within 60s — the Build click "
+                "did not register. Not waiting further.",
+                flush=True,
+            )
+            return False
         time.sleep(3.0)
     print(
         f"⚠️ Refresh build did not finish within "
@@ -8246,6 +8329,14 @@ _JOB_ENV_SERVICES_CACHE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "jenkins_job_env_services.json"
 )
 _job_env_services_lock = threading.Lock()
+
+
+def _learned_environment_ids() -> set[str]:
+    """Every Environment value discovered off a Jenkins form, across all scanned jobs."""
+    out: set[str] = set()
+    for rec in _load_job_env_services().values():
+        out.update(str(e).strip() for e in rec if str(e).strip())
+    return out
 
 
 def _job_env_services_key(raw_url: str) -> str:
@@ -16999,6 +17090,9 @@ def run(
     is_frontend = jp == "frontend"
     if is_vpn:
         _ensure_vpn_fast_fill_mode()
+    else:
+        # Every other job type drives an Active Choices cascade and needs the full settle waits.
+        _restore_fpms_fill_timings()
 
     parsed_update_all = False
     command = ""
@@ -17139,10 +17233,16 @@ def run(
             )
         else:
             _pms = jp == "pms_uat"
+            # The config block already holds ids the chat layer resolved against THIS job's real
+            # catalog, so re-resolve them against the same one. Falling back to the shared FPMS
+            # branch catalog rewrote them into pre-split names that no longer exist on the form
+            # (``player-public-rollout`` → ``player-rollout``), and select_services then hunted for
+            # a checkbox that isn't there — surfacing as "Services still not found".
+            _job_catalog = None if _pms else (_fpms_pick_catalog_for_job(ju_for_env, jp) or None)
             environment, services, branch, version, parsed_update_all = parse_fpms_config_block(
                 config_block,
                 preserve_branch_case=_pms,
-                service_catalog=PMS_UAT_UPDATE_SERVICES if _pms else None,
+                service_catalog=PMS_UAT_UPDATE_SERVICES if _pms else _job_catalog,
                 port_to_id={} if _pms else None,
             )
             svc_note = (
