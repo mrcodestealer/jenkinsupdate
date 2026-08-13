@@ -9121,6 +9121,39 @@ def _peek_service_tokens_from_update_body(body: str) -> list[str]:
     return list(dict.fromkeys(tokens))
 
 
+def _jenkins_update_jobs_hosting_services(
+    service_tokens: Sequence[str],
+) -> list[tuple[str, float, str, str]]:
+    """
+    Every registry job whose Services catalog can host **all** the named services.
+
+    Service ids are unique across jobs, so a single hit identifies the job outright. That is much
+    stronger evidence than the headline, which only ever fuzzy-matches: ``sms`` scores 0.667
+    against the alias ``pms``, which is how "please help update SMS to UAT" reached
+    PMS-UAT-UPDATE and then had its (correct) SMS service names rejected.
+
+    Rows are shaped like the ranker's ``(alias, score, label, url)`` so callers can use them
+    interchangeably. Score is 2.0 — the "alias literally present" level — because a unique
+    catalog hit is not a fuzzy guess about which job was meant.
+    """
+    if not service_tokens:
+        return []
+    out: list[tuple[str, float, str, str]] = []
+    seen: set[str] = set()
+    for alias, (label, raw_url) in JENKINS_UPDATE_JOB_REGISTRY.items():
+        for line in (raw_url or "").splitlines():
+            u = line.strip()
+            if not u:
+                continue
+            key = _jenkins_update_primary_url(u).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if _jenkins_job_matches_service_tokens(u, service_tokens):
+                out.append((alias, 2.0, label, u))
+    return out
+
+
 def _jenkins_update_filter_ties_by_services(
     ties: list[tuple[str, float, str, str]], service_tokens: Sequence[str]
 ) -> list[tuple[str, float, str, str]]:
@@ -14883,6 +14916,23 @@ def _dispatch_lark_update_command_body(
     head_line = _jenkins_update_first_non_empty_line(body)
     svc_tokens = _peek_service_tokens_from_update_body(body)
     env_hint = _peek_environment_from_update_body(body)
+
+    # Service-first routing. A service id belongs to exactly one job, so when every named service
+    # fits a single catalog that *is* the answer — no ranking, no fuzzy alias match. Headline text
+    # decides only when the services cannot: absent, unrecognised, or hosted by several jobs (e.g.
+    # ``livechat-rollout`` exists on both FPMS and FPMS_NT master). Requiring a *unique* hit is what
+    # keeps a stale catalog from routing confidently to the wrong job — it falls through instead.
+    svc_hosts = _jenkins_update_jobs_hosting_services(svc_tokens)
+    if len(svc_hosts) == 1:
+        print(
+            f"→ Service-first routing: **{svc_hosts[0][2]}** is the only job hosting "
+            f"{', '.join(svc_tokens[:8])} — skipping headline ranking.",
+            flush=True,
+        )
+        return _fpms_lark_dispatch_job_row(
+            chat_id, key, body, svc_hosts[0], send, lark_message_id=lark_message_id
+        )
+
     ties_h: list[tuple[str, float, str, str]] = []
     if not _jenkins_update_headline_is_config_like(head_line):
         hint_q = _jenkins_update_job_hint_query_for_ranking(body).strip()
