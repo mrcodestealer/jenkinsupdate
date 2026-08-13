@@ -1,0 +1,44 @@
+{
+  "fpms_nt/fpms_nt_uat_master_update": {
+    "envs": {
+      "fpms-nt-uat-master": [
+        "admin-rollout",
+        "auth-rollout",
+        "ccms-rollout",
+        "ccms-rust-rollout",
+        "ccms-scheduler",
+        "fpms-internal-rollout",
+        "journey",
+        "live-draw-event-scheduler",
+        "livechat-rest-rollout",
+        "livechat-rollout",
+        "livechat-scheduler",
+        "packet-consumer",
+        "packet-main-probability-rollout",
+        "packet-rollout",
+        "payment-public-rollout",
+        "player-public-rollout",
+        "player-scheduler",
+        "promotion-event-scheduler",
+        "promotion-rollout",
+        "promotion-scheduler",
+        "proposal-rollout",
+        "provider-public-rollout",
+        "push-rollout",
+        "recommend-rollout",
+        "recommend-scheduler",
+        "risk-control-rollout",
+        "rulex-rollout",
+        "scraper-scheduler",
+        "social-engagement-rollout",
+        "user-engagement-rollout"
+      ],
+      "fpms-nt-uat-master-private": [
+        "payment-private-rollout",
+        "player-private-rollout",
+        "provider-private-rollout"
+      ]
+    },
+    "scanned_at": 1786609909.623702
+  }
+}

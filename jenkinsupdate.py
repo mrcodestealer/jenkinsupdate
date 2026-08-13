@@ -8104,6 +8104,181 @@ def discover_bi_script_deployment_files(*, headless: bool = True) -> list[str]:
                 pass
 
 
+# ===================== Per-job, per-environment Services discovery =====================
+# FPMS master jobs used to expose exactly one Environment, so the env was derived from the URL and
+# Services came from a hardcoded catalog. FPMS_NT_UAT_MASTER_UPDATE now has two
+# (``fpms-nt-uat-master`` and ``…-master-private``) whose Services lists are *disjoint*, which left
+# the private services unreachable. Read every environment off the form and persist the mapping,
+# same idea as the CPMS/IGO cache above.
+
+_JOB_ENV_SERVICES_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "jenkins_job_env_services.json"
+)
+_job_env_services_lock = threading.Lock()
+
+
+def _job_env_services_key(raw_url: str) -> str:
+    """Canonical ``folder/job`` key for a build URL, ignoring ``/view/<name>/`` segments."""
+    u = re.sub(r"/build\?.*$", "", _jenkins_update_primary_url(raw_url).strip().rstrip("/"))
+    return "/".join(v for k, v in re.findall(r"/(job|view)/([^/]+)", u) if k == "job").casefold()
+
+
+def _load_job_env_services() -> dict:
+    """Read the persisted ``{job_key: {env: [services]}}`` map (``{}`` when missing/corrupt)."""
+    with _job_env_services_lock:
+        try:
+            with open(_JOB_ENV_SERVICES_CACHE_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for key, rec in data.items():
+        envs = rec.get("envs") if isinstance(rec, dict) else None
+        if not isinstance(envs, dict):
+            continue
+        clean = {
+            str(e): [str(s).strip() for s in svcs if str(s).strip()]
+            for e, svcs in envs.items()
+            if isinstance(svcs, list)
+        }
+        if clean:
+            out[str(key)] = clean
+    return out
+
+
+def _save_job_env_services(key: str, envs: dict) -> None:
+    """Merge ``{env: [services]}`` for one job; other jobs and unscanned envs are left alone."""
+    with _job_env_services_lock:
+        try:
+            with open(_JOB_ENV_SERVICES_CACHE_PATH, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if not isinstance(raw, dict):
+                raw = {}
+        except (OSError, ValueError):
+            raw = {}
+        rec = dict(raw.get(key)) if isinstance(raw.get(key), dict) else {}
+        merged = dict(rec.get("envs")) if isinstance(rec.get("envs"), dict) else {}
+        for env, svcs in (envs or {}).items():
+            cleaned = [str(s).strip() for s in (svcs or []) if str(s).strip()]
+            if cleaned:
+                merged[str(env)] = cleaned
+        rec["envs"] = merged
+        rec["scanned_at"] = time.time()
+        raw[key] = rec
+        try:
+            with open(_JOB_ENV_SERVICES_CACHE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh, ensure_ascii=False, indent=2)
+        except OSError as ex:
+            print(f"[job_envs] cache save failed: {ex!r}", flush=True)
+
+
+def job_env_services_for_url(raw_url: str) -> dict:
+    """``{environment: [service ids]}`` learned for this job (``{}`` when never scanned)."""
+    return _load_job_env_services().get(_job_env_services_key(raw_url), {})
+
+
+def _env_owning_services(raw_url: str, services) -> str | None:
+    """
+    Environment whose learned Services list covers every requested id.
+
+    Decides only when unambiguous: exactly one environment contains *all* of them. No data, a
+    request split across environments, or no match at all returns ``None``, so the caller keeps
+    its URL-derived default rather than guessing.
+    """
+    envs = job_env_services_for_url(raw_url)
+    if len(envs) < 2:
+        return None
+    want = {_normalize_service_query_key(s) for s in (services or []) if str(s).strip()}
+    want.discard("")
+    if not want:
+        return None
+    hits = [
+        env
+        for env, svcs in envs.items()
+        if want <= {_normalize_service_query_key(s) for s in svcs}
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def discover_job_env_services(build_url: str, *, headless: bool = True) -> dict:
+    """
+    Select **every** Environment option on a job's build form in turn, read the Services list for
+    each, and persist ``{env: [services]}``. Only reads the form — never clicks Build.
+    """
+    user, pw = _credentials()
+    url = _jenkins_update_primary_url(build_url)
+    tag = url.rsplit("/job/", 1)[-1].split("/")[0]
+
+    def _read_on_page(page) -> dict:
+        open_fpms_build_with_login(
+            page, user, pw, first_visit=False, warmup=False, build_url=url
+        )
+        page.wait_for_selector("div.jenkins-form-item", timeout=60_000)
+        _safe_page_wait(page, _MS_FORM_READY)
+        _safe_page_wait(page, _MS_POST_LOGIN_BEFORE_FORM)
+        env_map: dict[str, list[str]] = {}
+        for env, _text in _read_select_options(page, "Environment"):
+            if not env:
+                continue
+            try:
+                select_environment(page, env)
+                _safe_page_wait(page, max(300, _MS_ENV_SETTLE))
+                svcs = read_all_service_values(page)
+                if svcs:
+                    env_map[env] = svcs
+                print(f"[job_envs] {tag} env={env!r}: {len(svcs)} services", flush=True)
+            except Exception as ex:
+                print(f"[job_envs] {tag} env={env!r} read failed: {ex!r}", flush=True)
+        return env_map
+
+    if _ju_warm_pool_enabled():
+        try:
+            env_map = _ju_warm_pool_get().run_with_page_blocking(_read_on_page, build_url=url) or {}
+            if env_map:
+                _save_job_env_services(_job_env_services_key(url), env_map)
+            return env_map
+        except Exception as ex:
+            print(f"[job_envs] warm-pool discover failed: {ex!r}", flush=True)
+            if not _ju_warm_allow_cold_fallback():
+                return {}
+
+    bname = (os.environ.get("FPMS_PLAYWRIGHT_BROWSER") or "chromium").strip().lower()
+    if bname not in ("chromium", "firefox"):
+        bname = "chromium"
+    with sync_playwright() as p:
+        browser_obj, context, page = _playwright_browser_context_and_page(
+            p, browser_name=bname, headless=headless, slow_mo=0, user_data_dir=None
+        )
+        try:
+            env_map = _read_on_page(page)
+        except Exception as ex:
+            print(f"[job_envs] discover failed: {ex!r}", flush=True)
+            env_map = {}
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser_obj.close()
+            except Exception:
+                pass
+    if env_map:
+        _save_job_env_services(_job_env_services_key(url), env_map)
+    return env_map
+
+
+def _fpms_master_learned_ids(raw_url: str) -> set[str]:
+    """Every service learned for an FPMS master job, across all of its environments."""
+    learned: set[str] = set()
+    for svcs in job_env_services_for_url(raw_url).values():
+        learned.update(_normalize_service_query_key(s) for s in svcs if str(s).strip())
+    learned.discard("")
+    return learned
+
+
 def _cpms_igo_all_entries(cache: dict) -> list[tuple[str, str, str]]:
     """Flatten cache to ``(kind, env, service_id)`` rows."""
     rows: list[tuple[str, str, str]] = []
@@ -8495,21 +8670,36 @@ def parse_venue_uat_run_config_block(
     return env, out, branch, version, False
 
 
-def _environment_for_fpms_jenkins_job_url(raw_url: str) -> str | None:
+def _environment_for_fpms_jenkins_job_url(raw_url: str, services=None) -> str | None:
     """
-    When the opened job is an FPMS **master** update pipeline, Jenkins only exposes one Environment
-    value — derive it from the URL so we do not fall back to ``FPMS_DEFAULT_ENVIRONMENT`` / branch
-    defaults after picking this job from Lark (first line may still say only “FPMS UAT”).
+    Environment to force for an FPMS **master** update pipeline, so we do not fall back to
+    ``FPMS_DEFAULT_ENVIRONMENT`` / branch defaults after picking the job from Lark (the first line
+    may say only “FPMS UAT”).
+
+    The URL gives the default. A master job may now expose **more than one** Environment with
+    *disjoint* Services — FPMS_NT_UAT_MASTER_UPDATE has ``fpms-nt-uat-master`` (30 services) and
+    ``fpms-nt-uat-master-private`` (3) — so when ``services`` unambiguously belong to one of the
+    learned environments, that wins. Without learned data the old URL default is unchanged.
     """
     u = _jenkins_update_primary_url(raw_url).replace("\\", "/")
     ul = u.casefold()
     if "/job/fpms/view/fpms-uat/job/fpms_uat_master_update/" in ul:
-        return "fpms-uat-master"
-    if "/job/fpms_nt/view/all/job/fpms_nt_uat_master_update/" in ul:
-        return "fpms-nt-uat-master"
-    if "fpms_nt_uat_bo_update" in ul:
-        return "fpms-nt-uat-bo"
-    return None
+        base = "fpms-uat-master"
+    elif "/job/fpms_nt/view/all/job/fpms_nt_uat_master_update/" in ul:
+        base = "fpms-nt-uat-master"
+    elif "fpms_nt_uat_bo_update" in ul:
+        base = "fpms-nt-uat-bo"
+    else:
+        return None
+    owner = _env_owning_services(raw_url, services)
+    if owner and owner.casefold() != base.casefold():
+        print(
+            f"→ Environment {base!r} → {owner!r}: the requested service(s) live in that "
+            "Environment on this job.",
+            flush=True,
+        )
+        return owner
+    return owner or base
 
 
 def _jenkins_update_first_non_empty_line(body: str) -> str:
@@ -8721,10 +8911,15 @@ def _jenkins_job_service_catalog_for_url(raw_url: str) -> frozenset[str] | None:
     if prof == "fpms":
         if "/fpms_uat_branch_update/" in ul or "/fpms_nt_uat_branch_update/" in ul:
             return _FPMS_UAT_BRANCH_ONLY_IDS_CASEFOLD
-        if "/fpms_uat_master_update/" in ul:
-            return _FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD
-        if "/fpms_nt_uat_master_update/" in ul:
-            return _FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD
+        if "/fpms_uat_master_update/" in ul or "/fpms_nt_uat_master_update/" in ul:
+            # Static catalog plus anything learned per environment — the hardcoded list goes stale
+            # whenever a master job gains services or splits an env (public / private).
+            learned = _fpms_master_learned_ids(raw_url)
+            return (
+                (_FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD | learned)
+                if learned
+                else _FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD
+            )
         if "fpms_nt_uat_bo_update" in ul:
             return _FPMS_NT_UAT_BO_IDS_CASEFOLD
         return _FPMS_SERVICE_IDS_CASEFOLD
@@ -8760,7 +8955,14 @@ def _jenkins_job_service_catalog_list_for_url(raw_url: str) -> list[str] | None:
         if "/fpms_uat_branch_update/" in u or "/fpms_nt_uat_branch_update/" in u:
             return list(FPMS_UAT_BRANCH_ONLY_SERVICES)
         if "/fpms_uat_master_update/" in u or "/fpms_nt_uat_master_update/" in u:
-            return list(FPMS_UAT_MASTER_ROLLOUT_SERVICES)
+            out = list(FPMS_UAT_MASTER_ROLLOUT_SERVICES)
+            seen = {s.casefold() for s in out}
+            for _env, svcs in job_env_services_for_url(raw_url).items():
+                for s in svcs:
+                    if s.casefold() not in seen:
+                        seen.add(s.casefold())
+                        out.append(s)
+            return out
         if "fpms_nt_uat_bo_update" in u:
             return list(FPMS_NT_UAT_BO_SERVICES)
     if prof == "fnt_rc" and "/rc-uat-update/" in u:
@@ -13135,7 +13337,9 @@ def _fpms_lark_dispatch_fpms_parameter_flow(
         # PMS-UAT-UPDATE page uses fixed Environment option.
         data["environment"] = "pms-uat"
     elif jp == "fpms":
-        url_env = _environment_for_fpms_jenkins_job_url(jenkins_build_url)
+        url_env = _environment_for_fpms_jenkins_job_url(
+            jenkins_build_url, data.get("service_tokens")
+        )
         if url_env is not None:
             data["environment"] = url_env
     # Extra safety for chat variants like "All Services"/"allservices":
@@ -16516,7 +16720,7 @@ def run(
     if not ju_for_env:
         ju_for_env = BUILD_URL
     if jp == "fpms" and not is_bi_api_update and not is_qrqm_update and not is_prod_script and not skip_env:
-        forced_env = _environment_for_fpms_jenkins_job_url(ju_for_env)
+        forced_env = _environment_for_fpms_jenkins_job_url(ju_for_env, services)
         if forced_env is not None:
             if normalize_parameter_text(environment).casefold() != forced_env.casefold():
                 print(
