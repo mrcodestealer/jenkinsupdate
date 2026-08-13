@@ -6180,6 +6180,72 @@ def _click_jenkins_build_button(page) -> None:
     _safe_page_wait(page, 800)
 
 
+_MS_POST_BUILD_RECOVER_MAX_WAIT_MS = int(
+    os.environ.get("FPMS_POST_BUILD_RECOVER_MAX_WAIT_MS", "240000")
+)
+
+
+def _jenkins_job_api_base(build_url: str) -> str:
+    return re.sub(r"/build(?:With(?:Parameters)?)?(?:\?.*)?$", "", (build_url or "").strip().rstrip("/"))
+
+
+def _jenkins_last_build_state(job_base: str) -> tuple[int, bool] | None:
+    """``(number, building)`` for the job's latest build, or ``None`` when it cannot be read."""
+    try:
+        user, pw = _credentials()
+        r = requests.get(
+            job_base + "/api/json",
+            params={"tree": "lastBuild[number,building]"},
+            auth=(user, pw),
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None
+        lb = (r.json() or {}).get("lastBuild") or {}
+        return int(lb.get("number") or 0), bool(lb.get("building"))
+    except Exception:
+        return None
+
+
+def _wait_for_refresh_build_to_finish(build_url: str, *, since_number: int) -> bool:
+    """
+    Block until the Refresh-pipeline build we just started has **finished**.
+
+    Jenkins only republishes a job's parameter definitions once that build completes, so the
+    refreshed Services list does not exist before then. A fixed sleep cannot express this: refresh
+    builds on FPMS_NT_UAT_MASTER_UPDATE run 24–31 s against a 10 s wait, so the form was always
+    reloaded too early and the retry saw an empty list — reported to the user as
+    "Services still not found after recovery and refill".
+
+    Returns True when a newer build finished, False on timeout or when Jenkins could not be read
+    (the caller then falls back to its fixed wait, i.e. old behaviour).
+    """
+    job_base = _jenkins_job_api_base(build_url)
+    if not job_base:
+        return False
+    deadline = time.monotonic() + max(0, _MS_POST_BUILD_RECOVER_MAX_WAIT_MS) / 1000.0
+    seen_new = False
+    while time.monotonic() < deadline:
+        state = _jenkins_last_build_state(job_base)
+        if state is None:
+            return False
+        number, building = state
+        if number > since_number:
+            seen_new = True
+            if not building:
+                print(f"→ Refresh build #{number} finished — parameters are republished.", flush=True)
+                return True
+        elif seen_new:
+            return True
+        time.sleep(3.0)
+    print(
+        f"⚠️ Refresh build did not finish within "
+        f"{_MS_POST_BUILD_RECOVER_MAX_WAIT_MS / 1000:g}s — retrying the form anyway.",
+        flush=True,
+    )
+    return False
+
+
 def _recover_services_not_found_sequence(
     page, username: str, password: str, *, build_url: str | None = None
 ) -> None:
@@ -6219,10 +6285,21 @@ def _recover_services_not_found_sequence(
             "⚠️ Refresh pipeline checkbox not ticked; continuing to Build anyway.",
             file=sys.stderr,
         )
+    before = _jenkins_last_build_state(_jenkins_job_api_base(bu))
+    before_n = before[0] if before else 0
     _click_jenkins_build_button(page)
 
-    print(f"→ Post-Build wait: {w_ms} ms ({w_sec:g} s) before re-opening parameters…")
-    time.sleep(w_sec)
+    # Wait for the refresh build to FINISH, not a fixed interval — Jenkins republishes the
+    # parameter definitions only on completion, so reloading early guarantees an empty Services
+    # list and a bogus "Services still not found" failure.
+    print(
+        f"→ Waiting for the Refresh-pipeline build to finish "
+        f"(up to {_MS_POST_BUILD_RECOVER_MAX_WAIT_MS / 1000:g}s)…",
+        flush=True,
+    )
+    if not _wait_for_refresh_build_to_finish(bu, since_number=before_n):
+        print(f"→ Falling back to the fixed post-Build wait: {w_ms} ms ({w_sec:g} s)…", flush=True)
+        time.sleep(w_sec)
 
     print(f"→ Recovery (2/2): opening {bu} again + re-login")
     page.goto(bu, wait_until="domcontentloaded", timeout=90_000)
