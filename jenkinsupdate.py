@@ -2163,7 +2163,18 @@ def _fpms_lark_is_sms_uat_only_service_token(tok: str) -> bool:
 
 
 def _service_search_score(query: str, service: str) -> float:
-    """Higher = more similar (substring boost + difflib on full name and hyphen tokens)."""
+    """Higher = more similar (substring boost + token-set overlap + difflib fallback).
+
+    The token-set term is what makes word ORDER irrelevant: service names are hyphen-joined
+    words, and people reorder them freely — ``player-public-rollout`` for
+    ``player-rollout-public``. Character similarity alone ranks those badly (measured 0.698,
+    losing to the shorter, genuinely-different ``player-rollout`` at 0.778), so a reordered
+    name could never be suggested. Comparing the token SETS makes the two spellings identical.
+
+    Containment is weighted alongside Jaccard so that a query naming a subset of the
+    candidate's words still scores well, while a candidate carrying extra unrelated words is
+    penalised.
+    """
     q = query.strip().casefold()
     if not q:
         return 0.0
@@ -2176,6 +2187,15 @@ def _service_search_score(query: str, service: str) -> float:
         if not t:
             continue
         best = max(best, difflib.SequenceMatcher(None, q, t).ratio())
+
+    q_toks = {t for t in re.split(r"[-_\s]+", q) if t}
+    n_toks = {t for t in re.split(r"[-_\s]+", n) if t}
+    if q_toks and n_toks:
+        inter = q_toks & n_toks
+        if inter:
+            jaccard = len(inter) / len(q_toks | n_toks)
+            containment = len(inter) / min(len(q_toks), len(n_toks))
+            best = max(best, (jaccard + containment) / 2.0)
     return best
 
 
