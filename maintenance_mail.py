@@ -6234,12 +6234,14 @@ def reply_jenkins_update_done_email(
             # The index HAS this subject; it just could not pick one thread. A live search
             # cannot do better — it sees less than the index (per-folder UID caps, INBOX not
             # tail-scannable) and costs ~150s. Only run it when the index knew nothing at all.
+            #
+            # RE-RAISE unchanged. Converting this to EmailThreadNotFoundError discarded the
+            # candidate list one frame before the caller could offer it as a pick-list, so the
+            # user saw a dead-end "Email not found" instead of a choice.
             if _JENKINS_REPLY_LIVE_FALLBACK == "0" or (
                 _JENKINS_REPLY_LIVE_FALLBACK == "auto" and need.res.kind != "none"
             ):
-                raise EmailThreadNotFoundError(
-                    f"No reply target for {title!r} — {explain_resolution(need.res, title)}."
-                ) from need
+                raise
             print(
                 f"[allemail] {title!r} unknown to the index ({need.res.kind}) — "
                 "trying the live IMAP search.",

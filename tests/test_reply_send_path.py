@@ -519,6 +519,47 @@ def test_auto_generated_is_a_valid_reply_target() -> None:
     check(hit is not None, "an auto-generated vendor mail is a usable cache target")
 
 
+def test_ambiguous_reaches_the_caller_as_a_choice() -> None:
+    """An ambiguous title must surface as JenkinsReplyNeedsChoiceError, carrying the candidates.
+
+    Regression pin: reply_jenkins_update_done_email used to CONVERT this into
+    EmailThreadNotFoundError, discarding the candidate list one frame before updatemore could
+    render it — so the user got a dead-end "Email not found" instead of a pick-list."""
+    print("test_ambiguous_reaches_the_caller_as_a_choice")
+    import subject_match
+
+    reset()
+    a, b = dict(CACHE_ENTRY, uid="1"), dict(CACHE_ENTRY, uid="2")
+    amb = subject_match.Res("ambiguous", groups=[[a], [b]])
+    ran_live = {"n": 0}
+
+    def tattling_live(_t):
+        ran_live["n"] += 1
+        return None
+
+    patches, _ = base_patches(
+        resolve_reply_target_with_topup=lambda _t: amb,
+        find_jenkins_reply_message_by_subject_title=tattling_live,
+    )
+    raised = None
+    with patches:
+        try:
+            mm.reply_jenkins_update_done_email(
+                email_title=CACHE_ENTRY["subject"], completions=[("e", "6:10AM")]
+            )
+        except Exception as ex:  # noqa: BLE001
+            raised = ex
+
+    check(
+        isinstance(raised, mm.JenkinsReplyNeedsChoiceError),
+        f"raises JenkinsReplyNeedsChoiceError, got {type(raised).__name__}",
+    )
+    check(getattr(raised, "res", None) is amb, "the resolver result is carried to the caller")
+    check(len(raised.res.groups) == 2, "both candidate threads are available to offer")
+    check(len(FakeSMTP.calls) == 0, "nothing is sent while we are still asking")
+    check(ran_live["n"] == 0, "the ~150s live search is NOT run for an ambiguous title")
+
+
 def test_retention_window_is_three_months() -> None:
     print("test_retention_window_is_three_months")
     check(mm.ALLEMAIL_RESET_MODE == "rolling", f"rolling, got {mm.ALLEMAIL_RESET_MODE!r}")
