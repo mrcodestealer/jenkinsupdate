@@ -9732,6 +9732,65 @@ def _fpms_lark_v2_callback_button(
     return btn
 
 
+def build_email_thread_pick_card_json(title: str, rows: list[dict[str, str]]) -> str:
+    """Interactive card: choose WHICH email thread to reply into (``eml`` callbacks).
+
+    Same shape as the service picker so behaviour and styling stay consistent: numbered
+    callback buttons, a Cancel, and the detail rendered above so the choice is informed —
+    date, folder and sender are what actually distinguish two same-subject threads.
+    """
+    lines_md: list[str] = [
+        f"**Which email is `{_fpms_lark_short_line(title, 70)}`?**",
+        "",
+        f"{len(rows)} threads share that subject — tap the one to reply into.",
+        "",
+    ]
+    for i, r in enumerate(rows, start=1):
+        lines_md.append(
+            f"**{i}.** {r.get('date', '?')} · **{r.get('folder', '?')}**\n"
+            f"{_fpms_lark_short_line(r.get('from', ''), 46)}\n"
+            f"`{_fpms_lark_short_line(r.get('subject', ''), 80)}`"
+        )
+    buttons: list[dict[str, object]] = []
+    for i in range(1, len(rows) + 1):
+        buttons.append(
+            _fpms_lark_v2_callback_button(
+                str(i),
+                "primary" if i == 1 else "default",
+                {"k": "eml", "i": i},
+                element_id=f"eml_{i}"[:20],
+            )
+        )
+    body_elements: list[dict[str, object]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": "\n\n".join(lines_md)}},
+    ]
+    for off in range(0, len(buttons), 5):
+        body_elements.append(_fpms_lark_v2_column_set_button_row(buttons[off : off + 5]))
+    body_elements.append({"tag": "hr"})
+    body_elements.append(
+        _fpms_lark_v2_column_set_button_row(
+            [
+                _fpms_lark_v2_callback_button(
+                    "Cancel", "default", {"k": "eml", "i": 0}, element_id="eml_can"
+                )
+            ]
+        )
+    )
+    card: dict[str, object] = {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {
+            "template": "orange",
+            "title": {
+                "tag": "plain_text",
+                "content": f"Pick the email thread ({len(rows)})",
+            },
+        },
+        "body": {"elements": body_elements},
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
 def _fpms_lark_v2_column_set_button_row(
     buttons: list[dict[str, object]],
 ) -> dict[str, object]:
@@ -16685,6 +16744,26 @@ def _fpms_lark_handle_service_pick_callbacks(
             send,
             allow_start=True,
         )
+    if k == "eml":
+        # Email-thread picker: 0 = Cancel, N = reply into candidate N.
+        try:
+            idx = int(str(parsed.get("i")).strip())
+        except (TypeError, ValueError):
+            return False
+        try:
+            import updatemore as _um_eml
+
+            if idx <= 0:
+                _um_eml.cancel_email_thread_choice(chat_id, send)
+            else:
+                _um_eml.handle_pick_email_index(chat_id, idx, send)
+        except Exception as ex:  # noqa: BLE001 — a card tap must never crash the dispatcher
+            print(f"[testreplyemail] pick callback failed: {ex!r}", flush=True)
+            try:
+                send(chat_id, f"❌ Could not use that choice: {ex}")
+            except Exception:
+                pass
+        return True
     if k == "svc":
         try:
             idx = int(str(parsed.get("i")).strip())

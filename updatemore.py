@@ -774,6 +774,29 @@ def offer_email_thread_choice(
         _PENDING_EMAIL_PICK[chat_id] = {
             "title": title, "body": body, "label": label, "cands": cands,
         }
+    # Interactive card first — tapping a number is the point. Text is the fallback for any
+    # client/transport that cannot render an interactive card.
+    try:
+        import jenkinsupdate as _ju
+
+        rows = [
+            {
+                "date": (e.get("date") or "?")[:10],
+                "folder": e.get("folder") or "?",
+                "from": (e.get("from_raw") or "").strip(),
+                "subject": e.get("subject") or "",
+            }
+            for e in cands
+        ]
+        card = _ju.build_email_thread_pick_card_json(title, rows)
+        try:
+            send(chat_id, card, msg_type="interactive")
+        except TypeError:
+            send(chat_id, card)
+        return
+    except Exception as ex:  # noqa: BLE001 — never lose the choice because a card failed
+        print(f"[testreplyemail] pick card failed ({ex!r}) — falling back to text", flush=True)
+
     lines = [
         f"🤔 `{title}` matches **{len(cands)}** threads — I won't guess which one.",
         "Reply **`/pickemail N`** to use one:",
@@ -786,10 +809,21 @@ def offer_email_thread_choice(
     send(chat_id, "\n".join(lines))
 
 
-def handle_pick_email(chat_id: str, text: str, send: Callable[..., Any]) -> bool:
-    """``/pickemail N`` — send the reply to the thread the user chose."""
-    m = _PICK_EMAIL_RE.search(text or "")
-    n = int(m.group(1)) if (m and m.group(1)) else 0
+def cancel_email_thread_choice(chat_id: str, send: Callable[..., Any]) -> bool:
+    """Cancel button on the picker card."""
+    with _PENDING_EMAIL_PICK_LOCK:
+        had = _PENDING_EMAIL_PICK.pop(chat_id, None)
+    send(
+        chat_id,
+        "⏹️ Cancelled — no email sent."
+        if had
+        else "⏹️ Nothing pending.",
+    )
+    return True
+
+
+def handle_pick_email_index(chat_id: str, n: int, send: Callable[..., Any]) -> bool:
+    """Reply into candidate ``n`` (1-based). Shared by the card callback and ``/pickemail N``."""
     with _PENDING_EMAIL_PICK_LOCK:
         pend = _PENDING_EMAIL_PICK.get(chat_id)
     if not pend:
@@ -797,15 +831,15 @@ def handle_pick_email(chat_id: str, text: str, send: Callable[..., Any]) -> bool
         return True
     cands = pend["cands"]
     if not 1 <= n <= len(cands):
-        send(chat_id, f"⚠️ Pick a number **1–{len(cands)}** (`/pickemail 1`).")
+        send(chat_id, f"⚠️ Pick a number **1–{len(cands)}**.")
         return True
     chosen = cands[n - 1]
+    # Pop BEFORE sending: a double-tap on the card must not send the email twice.
     with _PENDING_EMAIL_PICK_LOCK:
-        _PENDING_EMAIL_PICK.pop(chat_id, None)
-    send(
-        chat_id,
-        f"📨 Using **{n}**: {_describe_candidate(chosen)}\n_Sending…_",
-    )
+        if _PENDING_EMAIL_PICK.pop(chat_id, None) is None:
+            send(chat_id, "⚠️ That choice was already used.")
+            return True
+    send(chat_id, f"📨 Using **{n}**: {_describe_candidate(chosen)}\n_Sending…_")
     _send_jenkins_email_reply(
         send,
         chat_id,
@@ -816,6 +850,23 @@ def handle_pick_email(chat_id: str, text: str, send: Callable[..., Any]) -> bool
         target_entry=chosen,
     )
     return True
+
+
+def handle_pick_email(chat_id: str, text: str, send: Callable[..., Any]) -> bool:
+    """``/pickemail N`` — the typed equivalent of tapping the card."""
+    m = _PICK_EMAIL_RE.search(text or "")
+    n = int(m.group(1)) if (m and m.group(1)) else 0
+    if n <= 0:
+        with _PENDING_EMAIL_PICK_LOCK:
+            pend = _PENDING_EMAIL_PICK.get(chat_id)
+        send(
+            chat_id,
+            f"⚠️ Pick a number **1–{len(pend['cands'])}** (`/pickemail 1`)."
+            if pend
+            else "⚠️ Nothing to pick — run `/testreplyemail {subject}` first.",
+        )
+        return True
+    return handle_pick_email_index(chat_id, n, send)
 
 
 def handle_test_reply_email(
