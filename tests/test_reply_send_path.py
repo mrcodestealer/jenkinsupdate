@@ -15,6 +15,7 @@ import os
 import smtplib
 import sys
 import traceback
+import tempfile
 import types
 from email.mime.text import MIMEText
 
@@ -122,6 +123,13 @@ class Patched:
         return False
 
 
+def _ok_res(entry, kind="ok"):
+    """A resolver result the cache path will act on."""
+    import subject_match
+
+    return subject_match.Res(kind, target=entry, groups=[[entry]])
+
+
 def no_network(*_a, **_kw):
     """Backstop: any code path that tries to open IMAP during a test is a test bug.
 
@@ -147,7 +155,15 @@ def base_patches(**extra):
     kw = {
         "smtplib": shim,
         "MAIL_PASSWORD": "x",
+        # Never let a test read or write the real index — a stray allemail.json in the repo
+        # root silently changed what the thread lookup returned and broke an assertion.
+        "ALLEMAIL_STORE_PATH": os.path.join(tempfile.gettempdir(), "test_allemail_absent.json"),
+        "_allemail_view_cache": None,
         "_allemail_reply_lookup": lambda _t: dict(CACHE_ENTRY),
+        # The cache path resolves through this now; _allemail_reply_lookup is only the legacy
+        # wrapper. Stub both so a test can override either.
+        "resolve_reply_target_with_topup": lambda _t: _ok_res(dict(CACHE_ENTRY)),
+        "resolve_reply_target": lambda _t: _ok_res(dict(CACHE_ENTRY)),
         "_allemail_enabled": lambda: True,
         "find_message_by_message_id": fake_mid_lookup,
         # Every IMAP entry point gets a stub. Tests that want a specific route override these.

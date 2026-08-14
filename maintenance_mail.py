@@ -525,6 +525,15 @@ ALLEMAIL_REPLY_MAX_AGE_DAYS = min(
 _JENKINS_REPLY_TOPUP_ON_MISS = (
     os.getenv("JENKINS_REPLY_TOPUP_ON_MISS", "").strip() or "1"
 ) not in ("0", "false", "no", "off")
+# The live IMAP search is not slow-but-thorough on this mailbox — it is slower AND blinder than
+# the index (per-folder UID caps, a 191k-message INBOX that cannot be tail-scanned, ~150s
+# measured). Run it only when the index has never heard of the subject at all.
+#   "auto" (default) — only when the resolver returned `none`
+#   "0"              — never
+#   "1"              — always, with the old retry loop (debugging)
+_JENKINS_REPLY_LIVE_FALLBACK = (
+    os.getenv("JENKINS_REPLY_LIVE_FALLBACK", "").strip() or "auto"
+).lower()
 _ALLEMAIL_HEADER_FETCH_SPEC = (
     "(BODY.PEEK[HEADER.FIELDS "
     "(DATE SUBJECT FROM TO CC MESSAGE-ID REFERENCES IN-REPLY-TO AUTO-SUBMITTED)])"
@@ -2166,6 +2175,20 @@ _SMTP_PRE_DELIVERY_ERRORS: tuple[type[BaseException], ...] = (
     smtplib.SMTPConnectError,
     UnicodeEncodeError,             # smtplib's encode("ascii"), before any socket I/O
 )
+
+
+class JenkinsReplyNeedsChoiceError(LookupError):
+    """The index knows this subject but could not commit to ONE thread.
+
+    Carries the resolver result so the caller can report the real outcome and offer the
+    candidates, instead of silently paying ~150s for a live search that is blinder than the
+    index it just consulted.
+    """
+
+    def __init__(self, title: str, res: Any) -> None:
+        super().__init__(title)
+        self.title = title
+        self.res = res
 
 
 class JenkinsReplyMaybeSentError(RuntimeError):
@@ -5970,15 +5993,15 @@ def _reply_jenkins_update_done_email_via_cache(
     """Cache-first reply: use the allemail.json original (Message-ID + To/Cc). None on miss."""
     if not _allemail_enabled():
         return None
-    cached = _allemail_reply_lookup(title)
+    # One resolve, with a top-up + retry on any miss. The Res is kept so the caller can report
+    # the REAL outcome (ambiguous / too_broad / all_ineligible) and decide whether the live
+    # search is even worth running — rather than always paying ~150s for it.
+    res = resolve_reply_target_with_topup(title)
+    if res.kind not in ("ok", "ok_stale"):
+        raise JenkinsReplyNeedsChoiceError(title, res)
+    cached = res.target
     if not cached:
-        # A miss is usually just "arrived since the last full scan". Top up the newest couple of
-        # days (seconds) and retry before conceding to the 25-150s live search — that is what
-        # makes a mail that landed minutes ago findable without waiting for a scheduled scan.
-        if _JENKINS_REPLY_TOPUP_ON_MISS and allemail_topup_scan():
-            cached = _allemail_reply_lookup(title)
-        if not cached:
-            return None
+        raise JenkinsReplyNeedsChoiceError(title, res)
     recips = _allemail_entry_reply_recipients(cached, for_send=True)
     if recips is None:
         return None
@@ -6195,6 +6218,21 @@ def reply_jenkins_update_done_email(
             # The cache path already handed the message to SMTP. Falling through to the live
             # search here is how the same Reply-All used to reach the whole thread twice.
             raise
+        except JenkinsReplyNeedsChoiceError as need:
+            # The index HAS this subject; it just could not pick one thread. A live search
+            # cannot do better — it sees less than the index (per-folder UID caps, INBOX not
+            # tail-scannable) and costs ~150s. Only run it when the index knew nothing at all.
+            if _JENKINS_REPLY_LIVE_FALLBACK == "0" or (
+                _JENKINS_REPLY_LIVE_FALLBACK == "auto" and need.res.kind != "none"
+            ):
+                raise EmailThreadNotFoundError(
+                    f"No reply target for {title!r} — {explain_resolution(need.res, title)}."
+                ) from need
+            print(
+                f"[allemail] {title!r} unknown to the index ({need.res.kind}) — "
+                "trying the live IMAP search.",
+                flush=True,
+            )
         except Exception as ex:
             print(
                 f"[allemail] cache reply for {title!r} failed "
@@ -8092,13 +8130,34 @@ def start_maintenance_mail_watcher(
     return True
 
 
-def explain_reply_target_miss(title: str) -> str:
-    """Why did the cache not yield a reply target for ``title``? One short human sentence.
+def explain_resolution(res: "subject_match.Res", title: str) -> str:
+    """Human sentence for a resolver outcome. Reports what ACTUALLY happened.
 
-    ``_allemail_reply_lookup`` returns ``None`` both when nothing is indexed and when entries are
-    indexed but screened out — reporting those as the same thing ("not in allemail.json") sends
-    people looking for a scanning problem when the real answer is "you sent that mail yourself".
+    The previous version re-derived a guess with its own substring heuristic and tested
+    own-From first, so it printed "you sent it yourself" for **every** miss — including a
+    ``too_broad`` where eligibility was never even consulted. That misreported cause sent real
+    debugging down the wrong path for hours. Take the kind from the resolver; never re-derive.
     """
+    n = len(res.groups)
+    if res.kind == "too_broad":
+        return (
+            f"the title matches {n} different threads — too many to choose between. "
+            "Add something that identifies one: a ticket id, a version, or the date"
+        )
+    if res.kind == "ambiguous":
+        return (
+            f"the title matches {n} different threads and none is a clear best. "
+            "Add a ticket id, version or date to single one out"
+        )
+    if res.kind == "all_ineligible":
+        return f"the matching thread cannot be replied to — {res.reason or 'no usable target'}"
+    if res.kind == "none":
+        return res.reason or "nothing in the index matches that title"
+    return res.reason or res.kind
+
+
+def explain_reply_target_miss(title: str) -> str:
+    """Why did the cache not yield a reply target for ``title``? One short human sentence."""
     t = (title or "").strip()
     if not t:
         return "no subject was given"
@@ -8106,35 +8165,27 @@ def explain_reply_target_miss(title: str) -> str:
         return "the index is disabled (`ALLEMAIL_CACHE=0` or no mail password)"
     if not os.path.exists(ALLEMAIL_STORE_PATH):
         return "`allemail.json` does not exist yet — run `allemail-scan`"
-    entries = _allemail_load().get("emails") or []
-    if not entries:
+    if not (_allemail_load().get("emails") or []):
         return "`allemail.json` is empty — run `allemail-scan`"
-    matched = [e for e in entries if _jenkins_reply_subject_score(e.get("subject") or "", t) > 0]
-    if not matched:
-        return (
-            f"no subject in the {len(entries)}-entry index contains that text — check the exact "
-            "wording with `allemail-list`, or the mail is outside the retention window"
-        )
-    reasons: list[str] = []
-    for e in matched:
-        subj = e.get("subject") or ""
-        if _allemail_from_is_own(e.get("from_raw", "")):
-            reasons.append("you sent it yourself (From is our own mailbox)")
-        elif _allemail_subject_is_reply_or_forward(subj):
-            reasons.append("the only match is a Re:/Fw: copy")
-        elif _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
-            reasons.append("the only match is a bounce / mailer-daemon notice")
-        elif _auto_submitted_blocks_reply(e.get("auto_submitted") or ""):
-            reasons.append("the only match is an auto-responder")
-        elif _allemail_entry_reply_recipients(e) is None:
-            reasons.append("its To/Cc contain only our own addresses")
-        else:
-            reasons.append("screened out for an unknown reason")
-    uniq = list(dict.fromkeys(reasons))
-    return (
-        f"{len(matched)} subject match(es) in the index, all rejected as reply targets: "
-        + "; ".join(uniq)
-    )
+    try:
+        return explain_resolution(resolve_reply_target(t), t)
+    except Exception as ex:  # noqa: BLE001 — diagnostics must never raise
+        return f"could not resolve a target ({ex!r})"
+
+
+def resolve_reply_target_with_topup(title: str) -> "subject_match.Res":
+    """:func:`resolve_reply_target` plus ONE top-up scan and retry on any miss.
+
+    The top-up runs on every miss kind, not just ``none``: it is the only thing that recovers
+    "the vendor replied two minutes ago and the index still holds only our outbound copies",
+    which presents as ``all_ineligible`` until the scan lands.
+    """
+    res = resolve_reply_target(title)
+    if res.kind in ("ok", "ok_stale"):
+        return res
+    if _JENKINS_REPLY_TOPUP_ON_MISS and allemail_topup_scan():
+        res = resolve_reply_target(title)
+    return res
 
 
 def debug_allemail_list(filter_text: str = "", *, limit: int = 60) -> int:
