@@ -16744,26 +16744,6 @@ def _fpms_lark_handle_service_pick_callbacks(
             send,
             allow_start=True,
         )
-    if k == "eml":
-        # Email-thread picker: 0 = Cancel, N = reply into candidate N.
-        try:
-            idx = int(str(parsed.get("i")).strip())
-        except (TypeError, ValueError):
-            return False
-        try:
-            import updatemore as _um_eml
-
-            if idx <= 0:
-                _um_eml.cancel_email_thread_choice(chat_id, send)
-            else:
-                _um_eml.handle_pick_email_index(chat_id, idx, send)
-        except Exception as ex:  # noqa: BLE001 — a card tap must never crash the dispatcher
-            print(f"[testreplyemail] pick callback failed: {ex!r}", flush=True)
-            try:
-                send(chat_id, f"❌ Could not use that choice: {ex}")
-            except Exception:
-                pass
-        return True
     if k == "svc":
         try:
             idx = int(str(parsed.get("i")).strip())
@@ -16832,6 +16812,28 @@ def handle_lark_jenkins_card_action(
     sk = _fpms_lark_session_key(chat_id, sender_id)
     send = _fpms_lark_wrap_thread_send(chat_id, sk, send)
     k = str(parsed.get("k") or "").strip().lower()
+    if k == "eml":
+        # Email-thread picker: 0 = Cancel, N = reply into candidate N. Handled HERE rather than
+        # inside _fpms_lark_handle_service_pick_callbacks, because that helper is only reached
+        # for the ``svc*`` keys — putting it there meant the button was wired to nothing.
+        try:
+            idx_eml = int(str(parsed.get("i")).strip())
+        except (TypeError, ValueError):
+            return False
+        try:
+            import updatemore as _um_eml
+
+            if idx_eml <= 0:
+                _um_eml.cancel_email_thread_choice(chat_id, send)
+            else:
+                _um_eml.handle_pick_email_index(chat_id, idx_eml, send)
+        except Exception as ex:  # noqa: BLE001 — a card tap must never crash the dispatcher
+            print(f"[testreplyemail] pick callback failed: {ex!r}", flush=True)
+            try:
+                send(chat_id, f"❌ Could not use that choice: {ex}")
+            except Exception:
+                pass
+        return True
     if k in ("svc", "svc_go", "svc_clr", "svc_can"):
         if _fpms_lark_handle_service_pick_callbacks(chat_id, sender_id, parsed, send):
             return True

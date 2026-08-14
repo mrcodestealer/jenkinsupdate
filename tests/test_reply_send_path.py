@@ -560,6 +560,52 @@ def test_ambiguous_reaches_the_caller_as_a_choice() -> None:
     check(ran_live["n"] == 0, "the ~150s live search is NOT run for an ambiguous title")
 
 
+def test_card_button_payload_reaches_the_handler() -> None:
+    """A tap on the picker card must reach handle_pick_email_index.
+
+    Regression pin for a bug that shipped twice: the handler was placed inside
+    _fpms_lark_handle_service_pick_callbacks, which the dispatcher only calls for the ``svc*``
+    keys — so the button was wired to nothing and tapping it did literally nothing. Building
+    the card and asserting its buttons is NOT enough; this drives the real dispatcher with the
+    card's own payload."""
+    print("test_card_button_payload_reaches_the_handler")
+    import json as _j
+
+    import jenkinsupdate as ju
+    import updatemore as um
+
+    rows = [{"date": "2026-05-25", "folder": "Sent", "from": "om@x", "subject": "TESTING BOT"}]
+    card = _j.loads(ju.build_email_thread_pick_card_json("TESTING BOT", rows))
+
+    payloads = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("tag") == "button":
+                payloads.append(o["behaviors"][0]["value"])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(card)
+    check(len(payloads) == 2, f"one pick button + Cancel, got {len(payloads)}")
+
+    seen = {"idx": None, "cancelled": False}
+    real_pick, real_cancel = um.handle_pick_email_index, um.cancel_email_thread_choice
+    um.handle_pick_email_index = lambda _c, n, _s: seen.__setitem__("idx", n)
+    um.cancel_email_thread_choice = lambda _c, _s: seen.__setitem__("cancelled", True)
+    try:
+        for pl in payloads:
+            ju.handle_lark_jenkins_card_action("chat1", "user1", pl, lambda *_a, **_k: None)
+    finally:
+        um.handle_pick_email_index, um.cancel_email_thread_choice = real_pick, real_cancel
+
+    check(seen["idx"] == 1, f"tapping '1' routes index 1, got {seen['idx']!r}")
+    check(seen["cancelled"] is True, "tapping Cancel routes to the cancel handler")
+
+
 def test_retention_window_is_three_months() -> None:
     print("test_retention_window_is_three_months")
     check(mm.ALLEMAIL_RESET_MODE == "rolling", f"rolling, got {mm.ALLEMAIL_RESET_MODE!r}")
