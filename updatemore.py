@@ -751,7 +751,8 @@ def offer_email_thread_choice(
     res: Any,
     send: Callable[..., Any],
     *,
-    body: str,
+    completions: list[tuple[str, str]],
+    body_override: str | None,
     label: str,
 ) -> None:
     """Ask which thread was meant, instead of guessing or giving up.
@@ -771,8 +772,15 @@ def offer_email_thread_choice(
         )
         return
     with _PENDING_EMAIL_PICK_LOCK:
+        # Store the ORIGINAL request verbatim. Storing a flattened "body" lost the real
+        # Done/Remarks blocks on the production path (body_override is None there), so a
+        # picked thread would have been sent an empty email.
         _PENDING_EMAIL_PICK[chat_id] = {
-            "title": title, "body": body, "label": label, "cands": cands,
+            "title": title,
+            "completions": list(completions),
+            "body_override": body_override,
+            "label": label,
+            "cands": cands,
         }
     # Interactive card first — tapping a number is the point. Text is the fallback for any
     # client/transport that cannot render an interactive card.
@@ -844,8 +852,8 @@ def handle_pick_email_index(chat_id: str, n: int, send: Callable[..., Any]) -> b
         send,
         chat_id,
         email_title=pend["title"],
-        completions=[("TEST", pend["body"])],
-        body_override=pend["body"],
+        completions=pend["completions"],
+        body_override=pend["body_override"],
         label=pend["label"],
         target_entry=chosen,
     )
@@ -1220,7 +1228,7 @@ def _send_jenkins_email_reply(
         # rather than reporting a dead end.
         offer_email_thread_choice(
             chat_id, email_title, need.res, send,
-            body=body_override or "", label=label,
+            completions=completions, body_override=body_override, label=label,
         )
         return
     except mm.JenkinsReplyOnlyBouncesError as ex:

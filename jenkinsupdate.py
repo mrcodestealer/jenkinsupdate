@@ -8492,6 +8492,45 @@ def discover_job_env_services(build_url: str, *, headless: bool = True) -> dict:
     return env_map
 
 
+def _fpms_job_services_static(url_cf: str) -> list[str]:
+    """Hardcoded Services list for an FPMS-family job shape (no scan available)."""
+    if "/fpms_uat_branch_update/" in url_cf or "/fpms_nt_uat_branch_update/" in url_cf:
+        return list(FPMS_UAT_BRANCH_ONLY_SERVICES)
+    if "/fpms_uat_master_update/" in url_cf or "/fpms_nt_uat_master_update/" in url_cf:
+        return list(FPMS_UAT_MASTER_ROLLOUT_SERVICES)
+    if "fpms_nt_uat_bo_update" in url_cf:
+        return list(FPMS_NT_UAT_BO_SERVICES)
+    return list(FPMS_UAT_BRANCH_SERVICES)
+
+
+def _fpms_job_services(raw_url: str) -> list[str]:
+    """
+    Services for one FPMS-family job: a completed per-environment scan wins outright, otherwise the
+    hardcoded list for that job shape.
+
+    Unioning the two is wrong once a job has been scanned. One constant serves both branch jobs and
+    it describes the wrong one — its overlap with FPMS_NT_UAT_BRANCH_UPDATE's real services is
+    **zero** — while the static master list still names five services Jenkins no longer has. Either
+    direction breaks routing: a real service is rejected, or a dead one is accepted and then cannot
+    be ticked.
+    """
+    for names in (job_env_services_for_url(raw_url),):
+        if names:
+            out: list[str] = []
+            seen: set[str] = set()
+            for svcs in names.values():
+                for s in svcs:
+                    k = s.casefold()
+                    if k and k not in seen:
+                        seen.add(k)
+                        out.append(s)
+            if out:
+                return out
+    return _fpms_job_services_static(
+        _jenkins_update_primary_url(raw_url).replace("\\", "/").casefold()
+    )
+
+
 def _fpms_master_learned_ids(raw_url: str) -> set[str]:
     """Every service learned for an FPMS master job, across all of its environments."""
     learned: set[str] = set()
@@ -9131,20 +9170,10 @@ def _jenkins_job_service_catalog_for_url(raw_url: str) -> frozenset[str] | None:
     prof = _jenkins_update_job_automation_profile(raw_url)
 
     if prof == "fpms":
-        if "/fpms_uat_branch_update/" in ul or "/fpms_nt_uat_branch_update/" in ul:
-            return _FPMS_UAT_BRANCH_ONLY_IDS_CASEFOLD
-        if "/fpms_uat_master_update/" in ul or "/fpms_nt_uat_master_update/" in ul:
-            # Static catalog plus anything learned per environment — the hardcoded list goes stale
-            # whenever a master job gains services or splits an env (public / private).
-            learned = _fpms_master_learned_ids(raw_url)
-            return (
-                (_FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD | learned)
-                if learned
-                else _FPMS_UAT_MASTER_ROLLOUT_IDS_CASEFOLD
-            )
-        if "fpms_nt_uat_bo_update" in ul:
-            return _FPMS_NT_UAT_BO_IDS_CASEFOLD
-        return _FPMS_SERVICE_IDS_CASEFOLD
+        # Scan wins outright where one exists; otherwise the hardcoded list for this job shape.
+        return frozenset(
+            _normalize_service_query_key(s) for s in _fpms_job_services(raw_url) if str(s).strip()
+        )
     if prof == "fnt_rc" and "/rc-uat-update/" in ul:
         return _FNT_RC_SERVICE_IDS_CASEFOLD
     if prof == "sms_uat":
@@ -9174,19 +9203,7 @@ def _jenkins_job_service_catalog_list_for_url(raw_url: str) -> list[str] | None:
     prof = _jenkins_update_job_automation_profile(raw_url)
     u = _jenkins_update_primary_url(raw_url).replace("\\", "/").casefold()
     if prof == "fpms":
-        if "/fpms_uat_branch_update/" in u or "/fpms_nt_uat_branch_update/" in u:
-            return list(FPMS_UAT_BRANCH_ONLY_SERVICES)
-        if "/fpms_uat_master_update/" in u or "/fpms_nt_uat_master_update/" in u:
-            out = list(FPMS_UAT_MASTER_ROLLOUT_SERVICES)
-            seen = {s.casefold() for s in out}
-            for _env, svcs in job_env_services_for_url(raw_url).items():
-                for s in svcs:
-                    if s.casefold() not in seen:
-                        seen.add(s.casefold())
-                        out.append(s)
-            return out
-        if "fpms_nt_uat_bo_update" in u:
-            return list(FPMS_NT_UAT_BO_SERVICES)
+        return _fpms_job_services(raw_url)
     if prof == "fnt_rc" and "/rc-uat-update/" in u:
         return list(FNT_RC_UAT_MASTER_SERVICES)
     if prof == "sms_uat":
