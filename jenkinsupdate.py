@@ -440,6 +440,15 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
         "FPMS FGS",
         "https://jenkins.internal.client8.me/job/FGS_CLIENT/job/FGS-UAT-UPDATE/build?delay=0sec",
     ),
+    # Same problem as SMS: the job was only reachable by a counter-intuitive three-word phrase.
+    "fgs": (
+        "FPMS FGS",
+        "https://jenkins.internal.client8.me/job/FGS_CLIENT/job/FGS-UAT-UPDATE/build?delay=0sec",
+    ),
+    "fgs uat": (
+        "FPMS FGS",
+        "https://jenkins.internal.client8.me/job/FGS_CLIENT/job/FGS-UAT-UPDATE/build?delay=0sec",
+    ),
     "ccms uat fe bo": (
         "FPMS_NT_UAT_BO_UPDATE",
         FPMS_NT_UAT_BO_UPDATE_URL,
@@ -509,6 +518,16 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
         "https://jenkins.internal.client8.me/job/FNT/job/FNT_UAT_SCRIPT_RUN/build?delay=0sec",
     ),
     "sms uat update": (
+        "SMS UAT UPDATE",
+        "https://jenkins.internal.client8.me/job/SMS/job/UAT/job/SMS-UAT-UPDATE/build?delay=0sec",
+    ),
+    # Without these the only way in was the exact three-word phrase, and "update SMS to UAT" lost
+    # to the alias ``pms`` on a 0.667 fuzzy ratio — one character apart.
+    "sms": (
+        "SMS UAT UPDATE",
+        "https://jenkins.internal.client8.me/job/SMS/job/UAT/job/SMS-UAT-UPDATE/build?delay=0sec",
+    ),
+    "sms uat": (
         "SMS UAT UPDATE",
         "https://jenkins.internal.client8.me/job/SMS/job/UAT/job/SMS-UAT-UPDATE/build?delay=0sec",
     ),
@@ -9365,8 +9384,14 @@ def _peek_service_tokens_from_update_body(body: str) -> list[str]:
             key = _canonical_config_key(m.group("key"))
             rest = (m.group("rest") or "").strip()
             last_key = key
-            if key == "services" and rest and not _is_junk_service_token(rest):
-                service_lines.append(rest)
+            if key == "services" and rest:
+                # ``service: all`` names no specific service, so there is nothing to route on —
+                # hand the decision to the headline instead of treating "all" as a service id.
+                # Left unhandled it fuzzy-matched five different job catalogs at once.
+                if _service_lines_mean_update_all([rest]):
+                    return []
+                if not _is_junk_service_token(rest):
+                    service_lines.append(rest)
             continue
         nat = _try_parse_natural_service_line(line_n)
         if nat:
