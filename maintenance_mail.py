@@ -5642,6 +5642,54 @@ def _allemail_thread_quote_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return members[0] if members else entry
 
 
+def _allemail_thread_reply_all_recipients(
+    entry: dict[str, Any],
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Reply-All across the WHOLE conversation, not just the one message we resolved to.
+
+    A manual Reply All addresses the message you happen to be reading. That is wrong for a
+    "deployment done" notice: the people who need it are everyone on the request thread, and
+    the message the resolver landed on may be a later reply with a much narrower To/Cc — which
+    is exactly how a reply reached one colleague instead of the three original requesters.
+
+    So: union To + Cc + From over every indexed message in the thread, drop our own sending
+    address and obvious daemons, and keep first-seen order (the original's recipients lead).
+    ``To`` is the union of every To plus every From; ``Cc`` is everyone else.
+    """
+    try:
+        members = _allemail_thread_members(entry)
+    except Exception:  # noqa: BLE001 — fall back to the single entry
+        members = []
+    if not members:
+        members = [entry]
+    exclude = _sending_mailbox_identities()
+
+    def _ok(a: str) -> bool:
+        key = _normalize_email_address(a)
+        if not key or "@" not in key or key in exclude:
+            return False
+        return "mailer-daemon" not in key and not key.startswith("postmaster@")
+
+    to_out: list[str] = []
+    cc_out: list[str] = []
+    seen: set[str] = set()
+    # Oldest first so the original request's recipients lead the list.
+    for e in sorted(members, key=lambda x: float(x.get("date_ts") or 0.0)):
+        for field, bucket in (("to", to_out), ("from", to_out), ("cc", cc_out)):
+            for a in e.get(field) or []:
+                key = _normalize_email_address(a)
+                if not _ok(a) or key in seen:
+                    continue
+                seen.add(key)
+                bucket.append(a)
+    if not to_out and cc_out:
+        to_out = [cc_out.pop(0)]
+    recipients = to_out + [a for a in cc_out if a not in to_out]
+    if not recipients:
+        return None
+    return to_out, cc_out, recipients
+
+
 def resolve_reply_target(title: str) -> subject_match.Res:
     """Which email does ``title`` mean? Returns a :class:`subject_match.Res`.
 
@@ -6013,7 +6061,10 @@ def _reply_jenkins_update_done_email_via_cache(
         cached = res.target
         if not cached:
             raise JenkinsReplyNeedsChoiceError(title, res)
-    recips = _allemail_entry_reply_recipients(cached, for_send=True)
+    # Reply-All means everyone on the CONVERSATION, not only the message we resolved to.
+    recips = _allemail_thread_reply_all_recipients(cached)
+    if recips is None:
+        recips = _allemail_entry_reply_recipients(cached, for_send=True)
     if recips is None:
         return None
     to_addrs, cc_addrs, recipients = recips
