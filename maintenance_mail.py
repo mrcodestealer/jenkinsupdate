@@ -5988,20 +5988,31 @@ def _resolve_live_quote_anchor(
 
 
 def _reply_jenkins_update_done_email_via_cache(
-    *, title: str, body: str, completions: list[tuple[str, str]]
+    *,
+    title: str,
+    body: str,
+    completions: list[tuple[str, str]],
+    target_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Cache-first reply: use the allemail.json original (Message-ID + To/Cc). None on miss."""
+    """Cache-first reply: use the allemail.json original (Message-ID + To/Cc). None on miss.
+
+    ``target_entry`` short-circuits resolution — the user already chose this thread from a
+    pick-list, so re-resolving would just reproduce the ambiguity that made us ask.
+    """
     if not _allemail_enabled():
         return None
     # One resolve, with a top-up + retry on any miss. The Res is kept so the caller can report
     # the REAL outcome (ambiguous / too_broad / all_ineligible) and decide whether the live
     # search is even worth running — rather than always paying ~150s for it.
-    res = resolve_reply_target_with_topup(title)
-    if res.kind not in ("ok", "ok_stale"):
-        raise JenkinsReplyNeedsChoiceError(title, res)
-    cached = res.target
-    if not cached:
-        raise JenkinsReplyNeedsChoiceError(title, res)
+    if target_entry is not None:
+        cached = target_entry
+    else:
+        res = resolve_reply_target_with_topup(title)
+        if res.kind not in ("ok", "ok_stale"):
+            raise JenkinsReplyNeedsChoiceError(title, res)
+        cached = res.target
+        if not cached:
+            raise JenkinsReplyNeedsChoiceError(title, res)
     recips = _allemail_entry_reply_recipients(cached, for_send=True)
     if recips is None:
         return None
@@ -6169,6 +6180,7 @@ def reply_jenkins_update_done_email(
     completions: list[tuple[str, str]],
     use_cache: bool = True,
     body_override: str | None = None,
+    target_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Auto-reply after Jenkins success (``/SuccessInformMeTime`` flow).
@@ -6210,7 +6222,7 @@ def reply_jenkins_update_done_email(
     if use_cache:
         try:
             cached_result = _reply_jenkins_update_done_email_via_cache(
-                title=title, body=body, completions=completions
+                title=title, body=body, completions=completions, target_entry=target_entry
             )
             if cached_result is not None:
                 return cached_result

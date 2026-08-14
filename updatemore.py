@@ -721,6 +721,103 @@ def parse_test_reply_email(text: str) -> str | None:
     return rest or None
 
 
+# chat_id -> {"title","body","label","cands":[entry,...]} awaiting a /pickemail N.
+def _mm():
+    import maintenance_mail as _m
+
+    return _m
+
+
+_PENDING_EMAIL_PICK: dict[str, dict[str, Any]] = {}
+_PENDING_EMAIL_PICK_LOCK = threading.Lock()
+_PICK_EMAIL_RE = re.compile(r"/?pickemail\b\s*(\d+)?", re.I)
+
+
+def is_pick_email_text(text: str) -> bool:
+    return bool(_PICK_EMAIL_RE.search(text or ""))
+
+
+def _describe_candidate(e: dict[str, Any]) -> str:
+    frm = (e.get("from_raw") or "").strip()
+    return (
+        f"{(e.get('date') or '?')[:10]} · **{e.get('folder') or '?'}** · "
+        f"`{frm[:38]}`\n     {(e.get('subject') or '')[:88]}"
+    )
+
+
+def offer_email_thread_choice(
+    chat_id: str,
+    title: str,
+    res: Any,
+    send: Callable[..., Any],
+    *,
+    body: str,
+    label: str,
+) -> None:
+    """Ask which thread was meant, instead of guessing or giving up.
+
+    The resolver refuses to pick between rival threads — correctly, since a wrong pick emails a
+    vendor about a deployment on the wrong conversation. But refusing without offering the
+    candidates leaves no way forward at all, which is what a ``too_broad`` used to do.
+    """
+    cands: list[dict[str, Any]] = []
+    for g in (res.groups or [])[:8]:
+        if g:
+            cands.append(g[0])
+    if not cands:
+        send(
+            chat_id,
+            f"❌ No reply target for `{title}` — {_mm().explain_resolution(res, title)}.",
+        )
+        return
+    with _PENDING_EMAIL_PICK_LOCK:
+        _PENDING_EMAIL_PICK[chat_id] = {
+            "title": title, "body": body, "label": label, "cands": cands,
+        }
+    lines = [
+        f"🤔 `{title}` matches **{len(cands)}** threads — I won't guess which one.",
+        "Reply **`/pickemail N`** to use one:",
+        "",
+    ]
+    for i, e in enumerate(cands, 1):
+        lines.append(f"**{i}.** {_describe_candidate(e)}")
+    lines.append("")
+    lines.append("_Or re-run with a more specific title (add the date, a version, or a ticket id)._")
+    send(chat_id, "\n".join(lines))
+
+
+def handle_pick_email(chat_id: str, text: str, send: Callable[..., Any]) -> bool:
+    """``/pickemail N`` — send the reply to the thread the user chose."""
+    m = _PICK_EMAIL_RE.search(text or "")
+    n = int(m.group(1)) if (m and m.group(1)) else 0
+    with _PENDING_EMAIL_PICK_LOCK:
+        pend = _PENDING_EMAIL_PICK.get(chat_id)
+    if not pend:
+        send(chat_id, "⚠️ Nothing to pick — run `/testreplyemail {subject}` first.")
+        return True
+    cands = pend["cands"]
+    if not 1 <= n <= len(cands):
+        send(chat_id, f"⚠️ Pick a number **1–{len(cands)}** (`/pickemail 1`).")
+        return True
+    chosen = cands[n - 1]
+    with _PENDING_EMAIL_PICK_LOCK:
+        _PENDING_EMAIL_PICK.pop(chat_id, None)
+    send(
+        chat_id,
+        f"📨 Using **{n}**: {_describe_candidate(chosen)}\n_Sending…_",
+    )
+    _send_jenkins_email_reply(
+        send,
+        chat_id,
+        email_title=pend["title"],
+        completions=[("TEST", pend["body"])],
+        body_override=pend["body"],
+        label=pend["label"],
+        target_entry=chosen,
+    )
+    return True
+
+
 def handle_test_reply_email(
     chat_id: str,
     text: str,
@@ -754,15 +851,10 @@ def handle_test_reply_email(
         miss_reason = f"index probe failed: {_probe_ex!r}"
     # "Not in allemail.json" was wrong for the commonest case: the mail IS indexed but screened
     # out as a reply target. Say which, so nobody debugs the scanner over a self-sent email.
-    slow_note = (
-        ""
-        if cached
-        else (
-            f"\n⏳ No **cached** reply target — {miss_reason}.\n"
-            "Falling back to the **live IMAP search**, which can take **2–3 minutes** on large "
-            "folders. Waiting…"
-        )
-    )
+    # No "falling back to the live IMAP search, 2-3 minutes" any more: the live search now runs
+    # only when the index has never seen the subject, so promising it here was untrue for every
+    # ambiguous/ineligible case — which is most of them.
+    slow_note = "" if cached else f"\n🔎 {miss_reason}."
     send(
         chat_id,
         f"📨 **Test reply-all** for `{title}` — body `{TEST_REPLY_EMAIL_BODY}`.\n"
@@ -1061,6 +1153,7 @@ def _send_jenkins_email_reply(
     completions: list[tuple[str, str]],
     body_override: str | None = None,
     label: str = "Auto-replied email",
+    target_entry: dict | None = None,
 ) -> None:
     import maintenance_mail as mm
 
@@ -1069,7 +1162,16 @@ def _send_jenkins_email_reply(
             email_title=email_title,
             completions=completions,
             body_override=body_override,
+            target_entry=target_entry,
         )
+    except mm.JenkinsReplyNeedsChoiceError as need:
+        # The index knows this subject but cannot commit to one thread. Offer the candidates
+        # rather than reporting a dead end.
+        offer_email_thread_choice(
+            chat_id, email_title, need.res, send,
+            body=body_override or "", label=label,
+        )
+        return
     except mm.JenkinsReplyOnlyBouncesError as ex:
         folders = ", ".join(mm.JENKINS_REPLY_IMAP_FOLDERS)
         detail = (

@@ -1533,6 +1533,12 @@ def _handle_jenkins_message(
                     _um_tre.handle_test_reply_email, chat_id, _probe, send_message
                 )
                 return
+            # /pickemail N — choose one of the threads offered after an ambiguous title.
+            if _probe and _um_tre.is_pick_email_text(_probe):
+                start_lark_background_thread(
+                    _um_tre.handle_pick_email, chat_id, _probe, send_message
+                )
+                return
     except Exception as _tre_err:
         print(f"[testreplyemail] dispatch failed: {_tre_err!r}", flush=True)
 
