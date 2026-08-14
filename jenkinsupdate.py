@@ -2650,29 +2650,68 @@ def _split_unambiguous_service_tokens(
     return resolved, to_pick
 
 
-def _parse_service_lines_to_tokens(service_lines: list[str]) -> list[str]:
-    """
-    Turn ``services:`` block lines into individual Jenkins service id tokens.
+# Leading list markers Lark and humans produce: "* x", "- x", "• x", "1. x", "> x".
+_SERVICE_BULLET_RE = re.compile(r"^(?:[\s>\-–—*•·●◦▪◆・]+|\(?\d{1,2}[.)]\s*)+")
+# Explicit inline separators once a bullet list has been flattened onto one line.
+_SERVICE_INLINE_SEP_RE = re.compile(r"\s+(?:[*•·●◦▪◆・]|-{1,2}|–|—)\s+")
 
-    Lark often flattens a multi-line service list into one space-separated chunk;
-    split on commas **and** whitespace so ``a b c`` becomes three tokens.
+
+def _all_known_service_ids() -> frozenset[str]:
+    """Every service id across all job catalogs — used to decide when a space is a separator."""
+    out: set[str] = set()
+    seen: set[str] = set()
+    for _alias, (_label, raw) in JENKINS_UPDATE_JOB_REGISTRY.items():
+        for line in (raw or "").splitlines():
+            u = _jenkins_update_primary_url(line.strip())
+            if not u or u.casefold() in seen:
+                continue
+            seen.add(u.casefold())
+            cat = _jenkins_job_service_catalog_for_url(u)
+            if cat:
+                out.update(cat)
+    return frozenset(out)
+
+
+def _split_service_line(line: str) -> list[str]:
     """
+    Split one ``services:`` line into service ids.
+
+    Lark flattens a bullet list onto a single line, so ``* rc-client * backend-apiserver`` reaches
+    the bot as one string and used to become one bogus token — the whole request was then rejected
+    with "No Jenkins job lists the service(s) you named: rc-client - backend-apiserver".
+
+    Bullet markers and separators (``,`` ``，`` ``、`` ``;`` ``；`` and inline ``*`` / ``-``) always
+    split. A bare space only splits when **every** resulting word is a known service id or a port —
+    otherwise a sentence typed under ``services:`` would shatter into junk tokens and the request
+    would be rejected for naming services the user never wrote.
+    """
+    s = (line or "").strip()
+    if not s:
+        return []
+    known = _all_known_service_ids()
+
+    def _is_service_word(w: str) -> bool:
+        return bool(re.fullmatch(r"\d{3,5}", w)) or _normalize_service_query_key(w) in known
+
+    out: list[str] = []
+    for part in re.split(r"[,，、;；]+", s):
+        for seg in _SERVICE_INLINE_SEP_RE.split(_SERVICE_BULLET_RE.sub("", part)):
+            seg = _SERVICE_BULLET_RE.sub("", seg).strip()
+            if not seg:
+                continue
+            words = seg.split()
+            if len(words) > 1 and all(_is_service_word(w) for w in words):
+                out.extend(words)
+            else:
+                out.append(seg)
+    return [t for t in out if t and not _is_junk_service_token(t)]
+
+
+def _parse_service_lines_to_tokens(service_lines: list[str]) -> list[str]:
+    """Turn ``services:`` block lines into individual Jenkins service id tokens."""
     tokens: list[str] = []
     for raw in service_lines:
-        line = (raw or "").strip()
-        if not line:
-            continue
-        for part in re.split(r"[,，;]+", line):
-            part = part.strip()
-            if not part:
-                continue
-            if re.search(r"\s", part):
-                for chunk in re.split(r"\s+", part):
-                    t = chunk.strip()
-                    if t and not _is_junk_service_token(t):
-                        tokens.append(t)
-            elif not _is_junk_service_token(part):
-                tokens.append(part)
+        tokens.extend(_split_service_line(raw))
     return tokens
 
 
@@ -9350,10 +9389,8 @@ def _peek_service_tokens_from_update_body(body: str) -> list[str]:
         return list(excl)
 
     for sl in service_lines:
-        for part in re.split(r"[,，;]+", sl):
-            t = part.strip()
-            if t and not _is_junk_service_token(t):
-                tokens.append(t)
+        # Same splitter the fill parser uses, so routing and filling agree on the token list.
+        tokens.extend(_split_service_line(sl))
     return list(dict.fromkeys(tokens))
 
 
