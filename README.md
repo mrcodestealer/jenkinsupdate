@@ -71,7 +71,39 @@ On startup you should see:
 
 - Click **Confirm** to trigger the build (or **Cancel**).
 - `rebuild` / `rebuild again` — re-run the last update.
-- `/warmstatus` — show the warm browser pool status.
+- `/warmstatus` — warm browser pool status: how many browsers are live, which are hot vs
+  on-demand, and the idle-release window. See [Warm browser pool](#warm-browser-pool).
+<a id="warm-browser-pool"></a>
+### Warm browser pool
+
+A warm browser is a logged-in headless Chromium parked on a job's *build with parameters* page, so
+an update only has to fill the form instead of launching + logging in (~20s). It is not free:
+roughly **6 `chrome-headless-shell` processes and a Node driver, ~385 MB, each**.
+
+The pool knows 29 Jenkins job URLs. It used to pre-warm **all** of them at startup and re-warm them
+every 4 minutes forever — ~30 browsers, ~180 processes, ~11 GB, most of them for jobs nobody had
+asked for. Now:
+
+- only the jobs in `JU_WARM_HOT_URLS` are pre-warmed and held (empty = the 5-job default in
+  `_JU_WARM_HOT_DEFAULT`, chosen from alias counts, bespoke service lists and test fixtures);
+- any other known job launches on **first use** — one ~20s wait, which an `/update` run
+  announces in chat (internal parameter-discovery calls just wait) — and is released again
+  after `JU_WARM_IDLE_TTL_SEC` (default 1800s) of idleness;
+- `/warmstatus` shows which are hot, which are lazy-and-live, and which are idle.
+
+Steady state is ~6 browsers / ~36 processes instead of ~30 / ~180.
+
+To go back to warming everything, no code change needed:
+
+```
+JU_WARM_HOT_URLS=*
+JU_WARM_IDLE_TTL_SEC=0
+JU_WARM_KEEPALIVE_SEC=240
+```
+
+See the `Playwright / warm browser pool` section of `.env.example` for every knob, including
+`JU_WARM_CHROME_ARGS` and the switches that must never be passed.
+
 - **Reply to the update email** — `replyupdateemail | {email title} | {pipeline/env} | {time}`
   makes the bot search the mailbox (`JENKINS_REPLY_IMAP_FOLDERS`) for the original request thread
   and **reply-all** that the build is done. Works in a group **without** an @mention (any sender),

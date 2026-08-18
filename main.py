@@ -71,6 +71,14 @@ def _apply_warm_pool_env_from_dotenv() -> None:
         "JU_WARM_PREWARM_ON_STARTUP",
         "JENKINS_WARM_STARTUP_WAIT_SEC",
         "JENKINS_WARM_STARTUP_BLOCK",
+        # Which jobs stay warm, and when an idle one is released. Absent from the systemd unit
+        # today, so they already reach us via EnvironmentFile — listed here so that stays true if
+        # anyone later adds an Environment= line for them (which is exactly why VPN_WARM_BROWSER=0
+        # is inert in prod: it is in the unit but not in this tuple).
+        "JU_WARM_HOT_URLS",
+        "JU_WARM_IDLE_TTL_SEC",
+        "JU_WARM_KEEPALIVE_SEC",
+        "JU_WARM_CHROME_ARGS",
     )
     try:
         from dotenv import dotenv_values

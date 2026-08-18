@@ -1187,6 +1187,7 @@ class _VpnWarmBrowser:
         self._p = sync_playwright().start()
         profile = Path(_vpn_warm_profile_dir()).expanduser()
         profile.mkdir(parents=True, exist_ok=True)
+        _sweep_stale_chromium_locks(profile)
         pc_kw: dict = {
             "user_data_dir": str(profile),
             "headless": self._headless(),
@@ -1415,7 +1416,10 @@ def prewarm_all_jenkins_browsers_on_startup() -> None:
         remaining = max(0.0, deadline - time.monotonic())
         ju_ok = _ju_warm_pool_get().wait_all_ready(remaining)
         if ju_ok:
-            print(f"[ju-pool] startup ready ({len(_ju_warm_urls())} browser(s)).", flush=True)
+            print(
+                f"[ju-pool] startup ready ({len(_ju_warm_hot_url_keys())} hot browser(s)).",
+                flush=True,
+            )
         else:
             print("[ju-pool] startup wait timed out (will warm on first request).", flush=True)
     if vpn_ok and ju_ok:
@@ -1442,9 +1446,22 @@ def prewarm_vpn_browser_on_startup() -> None:
 
 
 # ===================== Warm browser POOL for (non-VPN) Jenkins updates =====================
-# One pre-launched, logged-in Chromium **per Jenkins job URL** (``jenkins.internal.client8.me`` automation
-# jobs). Each browser stays on its job's build-with-parameters page between runs. Disable with
-# ``JU_WARM_POOL=0``. Override the URL list with ``JU_WARM_URLS`` (comma-separated) on dev PCs.
+# A pre-launched, logged-in Chromium for the **hot** Jenkins jobs (``jenkins.internal.client8.me``
+# automation jobs); every other known job launches on first use and is released again once idle.
+# Each browser stays on its job's build-with-parameters page between runs.
+#
+# One warm browser is not cheap: ~6 ``chrome-headless-shell`` processes plus a Node driver, ~385 MB.
+# Warming every known URL — which is what this pool used to do — is ~30 browsers and ~180 processes.
+#
+#   ``JU_WARM_POOL=0``          disable the pool entirely (needs JU_WARM_ALLOW_COLD_FALLBACK=1).
+#   ``JU_WARM_URLS``            override the **known** URL list (comma-separated) on dev PCs.
+#   ``JU_WARM_HOT_URLS``        which known URLs stay warm; ``*`` = all. See _ju_warm_hot_url_keys.
+#   ``JU_WARM_IDLE_TTL_SEC``    release a non-hot browser after this many idle seconds (0 = never).
+#   ``JU_WARM_KEEPALIVE_SEC``   keepalive / idle-sweep cadence.
+#   ``JU_WARM_CHROME_ARGS``     extra Chromium switches; read the _chrome_lean_args docstring first.
+#
+# Revert to the old warm-everything behaviour with no code change:
+#   ``JU_WARM_HOT_URLS=*`` + ``JU_WARM_IDLE_TTL_SEC=0`` (and ``JU_WARM_KEEPALIVE_SEC=240``).
 
 
 def _ju_warm_allow_cold_fallback() -> bool:
@@ -1503,6 +1520,14 @@ def _ju_warm_url_key(raw: str) -> str:
 def _ju_warm_url_slug(raw: str) -> str:
     folder = _jenkins_job_folder_url(raw).rstrip("/")
     tail = folder.split("/")[-1] if folder else "jenkins"
+    # The 8 FRONTEND jobs collide on the tail alone: uat-1..uat-4 x h5-uat/web-uat all yield
+    # "h5-uat" / "web-uat". Slugs name the worker in logs and in /warmstatus, so a duplicate makes
+    # per-job traffic impossible to read back out of the journal — which is how the hot set below
+    # gets re-tuned from real usage. Keep the uat-N parent for those, leave every other slug as-is.
+    parts = [p for p in folder.split("/") if p and p.lower() != "job"]
+    parent = parts[-2] if len(parts) >= 2 else ""
+    if re.fullmatch(r"uat-\d+", parent, re.I):
+        tail = f"{parent}-{tail}"
     slug = re.sub(r"[^\w.-]+", "-", tail).strip("-")[:48] or "jenkins"
     return slug
 
@@ -1513,8 +1538,60 @@ def _ju_warm_profile_dir(warm_url: str) -> Path:
     return Path(tempfile.gettempdir()) / f"ju_warm_{safe}"
 
 
+def _sweep_stale_chromium_locks(profile: Path) -> None:
+    """Drop a dead generation's singleton files before relaunching into a reused profile.
+
+    Warm profile dirs are deterministic and reused forever, deliberately — they carry the Jenkins
+    session cookie, which is why a released job re-warms fast instead of re-logging in. But if the
+    previous generation was SIGKILLed or orphaned, a stale ``SingletonLock`` makes
+    ``launch_persistent_context`` fail with "Failed to create a ProcessSingleton for your profile
+    directory", which then feeds the teardown/relaunch loop. Called only from ``_launch``, straight
+    after its own ``_teardown``, so no live browser of ours owns the profile at this point.
+
+    Never deletes the profile itself — that would force a full re-login on every re-warm.
+    """
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie", "DevToolsActivePort"):
+        try:
+            (profile / name).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
+def _chrome_lean_args() -> list[str]:
+    """Extra Chromium switches for the warm browsers (``JU_WARM_CHROME_ARGS``, default **none**).
+
+    Opt-in on purpose. Cutting the *number* of browsers is worth ~6 processes each; switch-level
+    tuning is worth 1-2. Recommended value, disk-only and safe — it caps growth of the persistent
+    profile dirs under :func:`tempfile.gettempdir`, which nothing ever prunes::
+
+        JU_WARM_CHROME_ARGS=--disk-cache-size=33554432 --media-cache-size=1048576
+
+    Verdicts on the tempting ones:
+
+    * ``--single-process`` — **never**. Collapses browser+renderer onto one thread, which is where
+      CDP screenshot capture blanks or deadlocks, and drops crash isolation. The Lark evidence PNGs
+      depend on both the element and ``full_page`` capture paths.
+    * ``--disable-features=`` / ``--enable-features=`` / ``--blink-settings=`` — **never**. Playwright
+      appends our args *after* its own and these are last-wins single-value switches, so passing one
+      silently deletes Playwright's curated value, including ``CDPScreenshotNewSurface``.
+    * ``--no-sandbox``, ``--disable-dev-shm-usage``, ``--disable-extensions``,
+      ``--disable-background-timer-throttling``, ``--mute-audio`` — no-ops; Playwright already passes
+      them. Adding them only creates the illusion of a fix.
+    * ``--disable-gpu`` — the one genuinely useful addition (-1 process, ~40-80 MB), but A/B a real
+      job's form screenshot before adopting it: Playwright launches headless shell with
+      ``--enable-unsafe-swiftshader`` and a newer capture path than that recipe was validated against.
+    """
+    raw = (os.environ.get("JU_WARM_CHROME_ARGS") or "").strip()
+    return [a for a in raw.split() if a.startswith("-")]
+
+
 def _ju_warm_urls() -> list[str]:
-    """Unique client8 Jenkins build URLs — one warm browser each."""
+    """Every client8 Jenkins build URL the bot knows how to drive.
+
+    This is the pool's **known** set, not its pre-warmed set — see :func:`_ju_warm_hot_url_keys`.
+    """
     override = (os.environ.get("JU_WARM_URLS") or "").strip()
     if override:
         out: list[str] = []
@@ -1569,6 +1646,75 @@ def _ju_warm_urls() -> list[str]:
     return sorted(out, key=_ju_warm_url_key)
 
 
+# Jobs that keep a browser warm at all times. Chosen from real signal in this repo, not taste:
+#   fpms_uat_branch_update  — is ``BUILD_URL``, so every request that arrives without a resolved
+#                             build URL lands here (see _ju_warm_url_from_run_kwargs below).
+#   fpms_nt_uat_master      — 3 aliases added specifically to beat fuzzy matching; its production
+#                             email subject carries ~25 fixtures in tests/.
+#   pms-uat-update          — 4 distinct aliases, own services list + automation profile.
+#   fpms_nt_uat_bo_update   — 4 aliases (joint most in the registry), own services list.
+#   rc-uat-update           — the only registry key hardcoded into program logic
+#                             (_fnt_rc_headline_detect), and README's usage example.
+# Everything else is launched on first use and released again once idle. Re-tune from the journal:
+#   journalctl -u updatejenkins | grep -oP '\[ju-pool:\K[^\]]+'
+_JU_WARM_HOT_DEFAULT: tuple[str, ...] = (
+    "/job/fpms/job/fpms_uat_branch_update/",
+    "/job/fpms_nt/view/all/job/fpms_nt_uat_master_update/",
+    "/job/pms/job/uat/job/pms-uat-update/",
+    "/job/fpms_nt/job/fpms_nt_uat_bo_update/",
+    "/job/fnt/job/rc-uat-update/",
+)
+
+
+def _ju_warm_hot_url_keys() -> set[str]:
+    """Canonical job-folder keys whose browser is pre-warmed at startup and never released.
+
+    ``JU_WARM_HOT_URLS`` (comma-separated) overrides :data:`_JU_WARM_HOT_DEFAULT`; each token is
+    matched case-folded against the **folder key**, not the slug (slugs were not unique before
+    :func:`_ju_warm_url_slug` grew its uat-N guard, and a short token like ``pms-uat-update`` is the
+    point). The single token ``*`` keeps all known URLs warm — that plus ``JU_WARM_IDLE_TTL_SEC=0``
+    is a full rollback to the old all-29 behaviour with no code change.
+
+    ``BUILD_URL`` is always hot: it is the fallback target for any request without a build URL.
+    """
+    raw = (os.environ.get("JU_WARM_HOT_URLS") or "").strip()
+    tokens = [t.strip().casefold() for t in raw.split(",") if t.strip()] if raw else []
+    known = _ju_warm_urls()
+    if any(t == "*" for t in tokens):
+        return {_ju_warm_url_key(u) for u in known}
+    match_on = tokens or [t.casefold() for t in _JU_WARM_HOT_DEFAULT]
+    hot = {
+        key
+        for key in (_ju_warm_url_key(u) for u in known)
+        if any(t == key or t in key for t in match_on)
+    }
+    hot.add(_ju_warm_url_key(BUILD_URL))
+    if raw and len(hot) == 1:
+        print(
+            "[ju-pool] JU_WARM_HOT_URLS matched no known job URL — "
+            "pre-warming BUILD_URL only.",
+            flush=True,
+        )
+    return hot
+
+
+def _ju_warm_idle_ttl_sec() -> float:
+    """Idle seconds before a **non-hot** worker's browser is released (0 = never)."""
+    try:
+        return max(0.0, float(os.environ.get("JU_WARM_IDLE_TTL_SEC", "1800")))
+    except ValueError:
+        return 1800.0
+
+
+def _ju_warm_keepalive_sec() -> int:
+    """Keepalive / idle-sweep cadence. Each tick re-navigates + re-logins every live browser, so
+    this is synthetic load on the Jenkins server — hence 600s rather than the old 240s."""
+    try:
+        return max(60, int(os.environ.get("JU_WARM_KEEPALIVE_SEC", "600")))
+    except ValueError:
+        return 600
+
+
 def _ju_warm_url_from_run_kwargs(run_kwargs: dict) -> str:
     gate = run_kwargs.get("bot_lark_gate") or {}
     raw = (
@@ -1586,18 +1732,26 @@ class _JuWarmWorker:
         self.warm_url = _ju_warm_canonical_build_url(warm_url)
         self.slug = _ju_warm_url_slug(self.warm_url)
         self._tasks: "_queue.Queue[dict]" = _queue.Queue()
-        self._thread = threading.Thread(
-            target=self._loop, name=f"ju-warm-{self.slug}", daemon=True
-        )
-        self._thread.start()
         self._p = None
         self._context = None
         self._page = None
         self._ready = threading.Event()
+        self._teardown_failures = 0
+        self._released_cleanly = True
+        # Plain float, read cross-thread by the pool's idle sweeper. Safe without a lock: a single
+        # float read/write is atomic in CPython and it dereferences no Playwright object. Stamped at
+        # construction so a freshly lazy-created worker is never judged idle before its first job.
+        self.last_used = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._loop, name=f"ju-warm-{self.slug}", daemon=True
+        )
+        # Started last: _loop now reads attributes assigned above.
+        self._thread.start()
 
     def execute(self, run_kwargs: dict) -> dict:
         done = threading.Event()
         box: dict = {}
+        self.last_used = time.monotonic()
         self._tasks.put({"run_kwargs": run_kwargs, "done": done, "box": box})
         done.wait()
         return box
@@ -1631,11 +1785,42 @@ class _JuWarmWorker:
                 box = task["box"]
                 box["ready"] = self._ready.is_set()
                 box["healthy"] = self._healthy()
+                box["last_used"] = self.last_used
                 task["done"].set()
+                continue
+            # Release an idle browser. Doing this as a queue task rather than a direct call from the
+            # sweeper is what makes it safe with no new locks: it runs on *this* thread, so it can
+            # only land between tasks and can never touch a thread-bound Playwright object from a
+            # foreign thread, nor interrupt a run in flight.
+            #
+            # This branch MUST stay above the fallthrough below, which does ``box = task["box"]`` —
+            # an unrecognised task kind would raise KeyError and kill this thread permanently.
+            if task.get("kind") == "evict":
+                ttl = float(task.get("ttl") or 0.0)
+                idle = time.monotonic() - self.last_used
+                # Re-check here, not just in the sweeper: the task may have been queued moments
+                # before a job arrived, and a job can park on the approval gate for hours.
+                if ttl > 0 and idle < ttl:
+                    continue
+                if self._context is None and self._p is None:
+                    self._ready.clear()  # nothing to release; don't leave _ready lying
+                    continue
+                # Tear down even when the page is already dead. Gating this on _healthy() would
+                # skip the release for a browser whose renderer crashed silently — leaving the
+                # context and its Node driver alive with nothing left to close them, _ready still
+                # set, and the sweeper re-queueing an evict that never releases anything. The old
+                # keepalive healed that case by re-warming everything; this loop no longer does.
+                print(
+                    f"[ju-pool:{self.slug}] idle {int(idle)}s — releasing browser"
+                    f"{'' if self._healthy() else ' (page already dead)'}.",
+                    flush=True,
+                )
+                self._teardown()
                 continue
             if task.get("page_fn"):
                 fn = task["page_fn"]
                 box = task["box"]
+                self.last_used = time.monotonic()
                 try:
                     self._ensure_ready()
                     box["result"] = fn(self._page)
@@ -1649,8 +1834,23 @@ class _JuWarmWorker:
                         except Exception:
                             self._teardown()
                     task["done"].set()
+                    self.last_used = time.monotonic()
+                continue
+            if "run_kwargs" not in task:
+                # Unrecognised task kind. Without this the fallthrough below raises KeyError and
+                # kills this worker's thread for good — and now that browsers are launched lazily,
+                # a dead thread stays invisible until someone next asks for that job, at which
+                # point execute() blocks on a done event nobody will ever set.
+                print(
+                    f"[ju-pool:{self.slug}] ignoring unknown task {task.get('kind')!r}.",
+                    flush=True,
+                )
+                done = task.get("done")
+                if done is not None:
+                    done.set()
                 continue
             box = task["box"]
+            self.last_used = time.monotonic()
             try:
                 try:
                     # Skip the redundant form reload — run() navigates + logs in authoritatively.
@@ -1671,6 +1871,10 @@ class _JuWarmWorker:
                     except Exception:
                         self._teardown()
                 task["done"].set()
+                # Stamp on exit as well, on THIS thread — run() can sit on the yes/no approval gate
+                # for up to 7200s, and a worker that has only just finished must not read as
+                # hours-idle to the sweeper.
+                self.last_used = time.monotonic()
 
     def _healthy(self) -> bool:
         try:
@@ -1687,15 +1891,39 @@ class _JuWarmWorker:
 
     def _launch(self) -> None:
         self._teardown()
+        # ``_teardown`` retains a handle whose close() threw so it can be retried — and this is the
+        # only place that retry can happen, because the assignments below overwrite both handles. So
+        # anything still set here is being abandoned right now; say so rather than leaving the
+        # earlier "will retry on the next launch" as the last word.
+        clean = self._released_cleanly
+        if self._context is not None or self._p is not None:
+            print(
+                f"[ju-pool:{self.slug}] abandoning a browser that would not close — orphaned "
+                f"processes may remain on this profile.",
+                flush=True,
+            )
+            self._context = None
+            self._p = None
         self._p = sync_playwright().start()
         profile = _ju_warm_profile_dir(self.warm_url)
         profile.mkdir(parents=True, exist_ok=True)
+        # Only safe when our own teardown was clean: then this process holds no browser on this
+        # profile, so any lock still present belongs to a dead generation. If a close threw — handle
+        # retained OR dropped — an orphan may still hold that lock, and clearing it would let a
+        # second Chromium into the same profile, destroying the saved Jenkins session the profile
+        # exists to preserve. A fresh worker with nothing to close counts as clean, so the very
+        # first launch after a SIGKILLed generation still recovers.
+        if clean:
+            _sweep_stale_chromium_locks(profile)
         pc_kw: dict = {
             "user_data_dir": str(profile),
             "headless": self._headless(),
             "viewport": {"width": 1400, "height": 900},
             "ignore_https_errors": True,
         }
+        lean = _chrome_lean_args()
+        if lean:
+            pc_kw["args"] = lean
         proxy = _playwright_proxy_from_env()
         if proxy:
             pc_kw["proxy"] = proxy
@@ -1706,17 +1934,51 @@ class _JuWarmWorker:
         print(f"[ju-pool:{self.slug}] browser launched.", flush=True)
 
     def _teardown(self) -> None:
-        for closer in (
-            lambda: self._context.close() if self._context else None,
-            lambda: self._p.stop() if self._p else None,
+        """Release the browser.
+
+        Only nulls a handle whose close actually returned. Swallowing the exception *and* dropping
+        the reference — what this used to do — is how a hung ``close()`` leaks a Chromium tree plus
+        its Node driver with nothing left in Python that could ever close them, and it compounds with
+        the deterministic profile dir: the orphan keeps holding that profile's ``SingletonLock``, so
+        the next launch fails too. A retained handle gets exactly one more attempt from the next
+        ``_launch`` (which begins with a ``_teardown``), then is dropped loudly so a permanently
+        wedged driver cannot block relaunch forever.
+
+        Sets :attr:`_released_cleanly` — false whenever a close threw, whether the handle was
+        retained for a retry or dropped. ``_launch`` uses it to decide whether sweeping this
+        profile's lock files is safe; it is not, if a browser we could not close may still hold them.
+
+        Always runs on the worker's own thread — Playwright objects are thread-bound.
+        """
+        failed = False
+        threw = False
+        for name, closer in (
+            ("_context", lambda: self._context.close() if self._context else None),
+            ("_p", lambda: self._p.stop() if self._p else None),
         ):
             try:
                 closer()
-            except Exception:
-                pass
-        self._context = None
+            except Exception as ex:
+                threw = True
+                if self._teardown_failures:
+                    print(
+                        f"[ju-pool:{self.slug}] teardown failed again on {name} — dropping the "
+                        f"handle; an orphaned browser may remain: {ex!r}",
+                        flush=True,
+                    )
+                    setattr(self, name, None)
+                else:
+                    failed = True
+                    print(
+                        f"[ju-pool:{self.slug}] teardown incomplete on {name} — retrying on the "
+                        f"next launch: {ex!r}",
+                        flush=True,
+                    )
+                continue
+            setattr(self, name, None)
+        self._teardown_failures = self._teardown_failures + 1 if failed else 0
+        self._released_cleanly = not threw
         self._page = None
-        self._p = None
         self._ready.clear()
 
     def _goto_job_page(self) -> None:
@@ -1765,6 +2027,7 @@ class _JuWarmWorker:
     def run_with_page(self, fn):
         done = threading.Event()
         box: dict = {}
+        self.last_used = time.monotonic()
         self._tasks.put({"page_fn": fn, "done": done, "box": box})
         done.wait()
         if "error" in box:
@@ -1773,7 +2036,14 @@ class _JuWarmWorker:
 
 
 class _JuWarmPool:
-    """One ``_JuWarmWorker`` per Jenkins job URL."""
+    """One ``_JuWarmWorker`` per *known* Jenkins job URL — but only the hot allowlist holds a live
+    browser.
+
+    Worker objects are cheap (a thread parked on an empty queue; ``__init__`` launches nothing), so
+    all of them are constructed up front and the dict is never mutated afterwards. What costs ~6
+    ``chrome-headless-shell`` processes plus a Node driver is a *launched* browser, and that only
+    happens for :func:`_ju_warm_hot_url_keys` at startup, or on first use for anything else.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1804,27 +2074,72 @@ class _JuWarmPool:
             return list(self._workers.values())
 
     def _keepalive_loop(self) -> None:
-        try:
-            interval = max(60, int(os.environ.get("JU_WARM_KEEPALIVE_SEC", "240")))
-        except ValueError:
-            interval = 240
+        """Keep hot browsers logged in, and release non-hot ones once they go idle.
+
+        This loop used to call ``submit_prewarm()`` on *every* worker unconditionally, and prewarm
+        goes through ``_ensure_ready`` -> ``_launch``. That made it a resurrection engine: anything
+        torn down — by a failure, by hand, by the evictor — was relaunched within one interval, so
+        the pool always converged back to one browser per known URL. The ``_ready.is_set()`` guard
+        below is what makes releasing a browser actually stick.
+
+        Reads ``_ready`` rather than ``_healthy()`` on purpose: ``_ready`` is a ``threading.Event``
+        meaning exactly "launched and logged in", and reading it dereferences no Playwright object
+        from this foreign thread.
+        """
+        interval = _ju_warm_keepalive_sec()
         while True:
             time.sleep(interval)
+            try:
+                hot = _ju_warm_hot_url_keys()
+                ttl = _ju_warm_idle_ttl_sec()
+            except Exception as ex:
+                # Skip the whole tick rather than falling back to an empty hot set: that would make
+                # every always-warm browser look evictable and tear down all of them at once.
+                print(
+                    f"[ju-pool] keepalive config unavailable, skipping this tick: {ex!r}",
+                    flush=True,
+                )
+                continue
+            now = time.monotonic()
             for w in self._all_workers():
                 try:
-                    if w._tasks.qsize() == 0:
+                    if w._tasks.qsize() != 0:
+                        continue
+                    if _ju_warm_url_key(w.warm_url) in hot:
+                        w.submit_prewarm()
+                        continue
+                    if not w._ready.is_set():
+                        continue  # already released — leave it released
+                    if ttl > 0 and (now - w.last_used) >= ttl:
+                        w._tasks.put({"kind": "evict", "ttl": ttl})
+                    else:
+                        # Still live and inside its window: keep the session fresh so back-to-back
+                        # runs on the same job do not each pay a re-login.
                         w.submit_prewarm()
                 except Exception as ex:
                     print(f"[ju-pool] keepalive skipped: {ex!r}", flush=True)
 
     def prewarm_all(self) -> None:
+        """Launch + log in the hot browsers only.
+
+        Every other known URL is launched on first use by :meth:`_worker_for_url` and released again
+        by the idle sweeper. This one narrowing is what takes the steady state from one browser per
+        known job URL down to the size of the hot set.
+        """
+        hot = _ju_warm_hot_url_keys()
         for w in self._all_workers():
-            w.submit_prewarm()
+            if _ju_warm_url_key(w.warm_url) in hot:
+                w.submit_prewarm()
 
     def wait_all_ready(self, timeout: float) -> bool:
+        """Wait for the hot browsers. Non-hot workers are skipped — they are never pre-warmed, so
+        waiting on them could only ever burn the whole startup budget and return False."""
+        hot = _ju_warm_hot_url_keys()
         deadline = time.monotonic() + max(0.0, timeout)
         ok = True
         for w in self._all_workers():
+            if _ju_warm_url_key(w.warm_url) not in hot:
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not w.wait_ready(remaining):
                 ok = False
@@ -1838,6 +2153,16 @@ class _JuWarmPool:
         gate = run_kwargs.get("bot_lark_gate") or {}
         notify = gate.get("send")
         chat_id = gate.get("chat_id")
+        # execute() blocks on a bare done.wait(), so a first run against a released job spends its
+        # launch+login in silence. Say so rather than looking hung; the notice below at 'lost its
+        # session' only fires on an actual pre_error.
+        if (not worker._ready.is_set()) and callable(notify) and chat_id:
+            _notify_chat_resilient(
+                notify,
+                chat_id,
+                f"⏳ Starting a Jenkins browser for **{worker.slug}** "
+                f"(first run since idle, ~20s)…",
+            )
         for attempt in range(1, attempts + 1):
             box = worker.execute(run_kwargs)
             if "pre_error" not in box:
@@ -1891,7 +2216,8 @@ def _ju_warm_pool_get() -> "_JuWarmPool":
         if _ju_warm_pool_singleton is None:
             urls = _ju_warm_urls()
             print(
-                f"[ju-pool] one browser per URL ({len(urls)} job URL(s)).",
+                f"[ju-pool] {len(urls)} known job URL(s); "
+                f"{len(_ju_warm_hot_url_keys())} pre-warmed, rest lazy.",
                 flush=True,
             )
             _ju_warm_pool_singleton = _JuWarmPool()
@@ -1923,7 +2249,10 @@ def prewarm_ju_pool_on_startup() -> None:
     pool_on = _ju_warm_pool_enabled()
     print(
         f"[ju-pool] JU_WARM_POOL={raw_pool!r} enabled={pool_on} "
-        f"cold_fallback={_ju_warm_allow_cold_fallback()}",
+        f"cold_fallback={_ju_warm_allow_cold_fallback()} "
+        f"hot={len(_ju_warm_hot_url_keys())}/{len(_ju_warm_urls())} "
+        f"idle_ttl={int(_ju_warm_idle_ttl_sec())}s "
+        f"keepalive={_ju_warm_keepalive_sec()}s",
         flush=True,
     )
     if not pool_on:
@@ -1938,7 +2267,12 @@ def prewarm_ju_pool_on_startup() -> None:
         return
     try:
         n = len(_ju_warm_urls())
-        print(f"[ju-pool] startup pre-warm ({n} URL(s), one browser each).", flush=True)
+        hot = _ju_warm_hot_url_keys()
+        print(
+            f"[ju-pool] startup pre-warm: {len(hot)} hot browser(s) of {n} known URL(s), "
+            f"idle_ttl={int(_ju_warm_idle_ttl_sec())}s.",
+            flush=True,
+        )
         _ju_warm_pool_get().prewarm_all()
     except Exception as ex:
         print(f"[ju-pool] startup pre-warm failed: {ex!r}", flush=True)
@@ -1967,7 +2301,8 @@ def jenkins_warm_pool_status_report(timeout: float = 6.0) -> str:
         lines.append("  ⚠️ pool not started yet — no browsers launched.")
     else:
         workers = pool._all_workers()
-        results: list[tuple[str, dict]] = []
+        hot = _ju_warm_hot_url_keys()
+        results: list[tuple[str, bool, dict]] = []
         submitted = []
         for w in workers:
             done = threading.Event()
@@ -1978,16 +2313,46 @@ def jenkins_warm_pool_status_report(timeout: float = 6.0) -> str:
         for w, done, box in submitted:
             done.wait(max(0.0, deadline - time.monotonic()))
             box["responded"] = done.is_set()
-            results.append((w.slug, box))
-        ready_n = sum(1 for _slug, box in results if box.get("ready") and box.get("healthy"))
-        lines.append(f"  {ready_n}/{len(results)} job browsers warm & ready")
-        for slug, box in sorted(results, key=lambda row: row[0]):
+            results.append((w.slug, _ju_warm_url_key(w.warm_url) in hot, box))
+        live = [row for row in results if row[2].get("ready") and row[2].get("healthy")]
+        hot_n = sum(1 for _slug, is_hot, _box in live if is_hot)
+        lazy_idle_n = sum(
+            1
+            for _slug, is_hot, box in results
+            if not is_hot
+            and box.get("responded")
+            and not (box.get("ready") and box.get("healthy"))
+        )
+        hot_total = sum(1 for _slug, is_hot, _box in results if is_hot)
+        busy_n = sum(1 for _slug, _is_hot, box in results if not box.get("responded"))
+        # Every worker must land in exactly one bucket, or a downed hot browser reads as "fewer
+        # live" instead of as a problem.
+        parts = [
+            f"{hot_n}/{hot_total} hot warm & ready",
+            f"{len(live) - hot_n} lazy (live)",
+            f"{lazy_idle_n} lazy (idle, launch on first use ~20s)",
+        ]
+        down_n = hot_total - hot_n - sum(
+            1 for _slug, is_hot, box in results if is_hot and not box.get("responded")
+        )
+        if down_n:
+            parts.append(f"⚠️ {down_n} hot but DOWN")
+        if busy_n:
+            parts.append(f"{busy_n} busy/no response")
+        lines.append(
+            f"  {len(live)}/{len(results)} live browser(s) — " + ", ".join(parts) +
+            f"; idle release after {int(_ju_warm_idle_ttl_sec())}s"
+        )
+        # Hot first, then by slug: a hot job that is down is a real problem, an idle lazy one is not.
+        for slug, is_hot, box in sorted(results, key=lambda row: (not row[1], row[0])):
             if box.get("ready") and box.get("healthy"):
-                mark = "✅"
+                mark = "✅ hot" if is_hot else "✅ lazy (live)"
             elif not box.get("responded"):
                 mark = "⏳ busy/no response"
+            elif is_hot:
+                mark = "❌ hot but down"
             else:
-                mark = "❌"
+                mark = "💤 lazy (idle — launches on first use)"
             lines.append(f"  {mark} {slug}")
 
     vpn_on = _vpn_warm_enabled()
