@@ -2797,12 +2797,19 @@ def _rank_catalog_services_by_query(
 
 
 def _rank_fnt_rc_services_by_query(
-    query: str, limit: int = 12, *, for_menu: bool = False
+    query: str, limit: int = 12, *, for_menu: bool = False, job_url: str = ""
 ) -> list[str]:
-    """Like ``_rank_services_by_query`` but against ``FNT_RC_UAT_MASTER_SERVICES``."""
-    return _rank_catalog_services_by_query(
-        FNT_RC_UAT_MASTER_SERVICES, query, limit, for_menu=for_menu
+    """
+    Rank against the FNT-family catalog for ``job_url``, falling back to the RC list.
+
+    RC-UAT-UPDATE and TELESALES-UAT-UPDATE share the ``fnt_rc`` profile but have entirely
+    different services, so ranking every fnt_rc job against the RC list offered
+    ``risk-analysis-rollout`` for a telesales request.
+    """
+    catalog = (job_url and _jenkins_job_service_catalog_list_for_url(job_url)) or list(
+        FNT_RC_UAT_MASTER_SERVICES
     )
+    return _rank_catalog_services_by_query(catalog, query, limit, for_menu=for_menu)
 
 
 def _rank_sms_uat_services_by_query(
@@ -9652,6 +9659,18 @@ def _jenkins_job_service_catalog_for_url(raw_url: str) -> frozenset[str] | None:
     ul = u.casefold()
     prof = _jenkins_update_job_automation_profile(raw_url)
 
+    # A scan of THIS job wins for every profile, not just FPMS. Sibling jobs share a profile but
+    # not their services — TELESALES-UAT-UPDATE and RC-UAT-UPDATE are both ``fnt_rc`` yet have
+    # completely different lists, so the RC catalog was being offered for telesales requests.
+    _learned = job_env_services_for_url(raw_url)
+    if _learned:
+        return frozenset(
+            _normalize_service_query_key(sv)
+            for names in _learned.values()
+            for sv in names
+            if str(sv).strip()
+        )
+
     if prof == "fpms":
         # Scan wins outright where one exists; otherwise the hardcoded list for this job shape.
         return frozenset(
@@ -9685,6 +9704,18 @@ def _jenkins_job_service_catalog_list_for_url(raw_url: str) -> list[str] | None:
         return None
     prof = _jenkins_update_job_automation_profile(raw_url)
     u = _jenkins_update_primary_url(raw_url).replace("\\", "/").casefold()
+    learned = job_env_services_for_url(raw_url)
+    if learned:
+        out: list[str] = []
+        seen: set[str] = set()
+        for names in learned.values():
+            for sv in names:
+                k = sv.casefold()
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append(sv)
+        if out:
+            return out
     if prof == "fpms":
         return _fpms_job_services(raw_url)
     if prof == "fnt_rc" and "/rc-uat-update/" in u:
@@ -13180,9 +13211,11 @@ def _fpms_lark_dispatch_fnt_rc_parameter_flow(
         return True
     first = tokens_to_pick[0]
     q0 = first.replace("_", "-")
-    ranked0 = _rank_fnt_rc_services_by_query(q0, limit=12, for_menu=True)
+    ranked0 = _rank_fnt_rc_services_by_query(
+        q0, limit=12, for_menu=True, job_url=jenkins_build_url
+    )
     if not ranked0:
-        send(chat_id, f"❌ No RC service matches first text token `{first}`.")
+        send(chat_id, f"❌ No service on this job matches first text token `{first}`.")
         return True
     sess_new = {
         "state": "pick",
@@ -17057,7 +17090,10 @@ def handle_lark_jenkins_update_message(
 
                 q = next_tok.replace("_", "-")
                 if jp_sess == "fnt_rc":
-                    nranked = _rank_fnt_rc_services_by_query(q, limit=12, for_menu=True)
+                    nranked = _rank_fnt_rc_services_by_query(
+                        q, limit=12, for_menu=True,
+                        job_url=str(sess.get("jenkins_job_url") or ""),
+                    )
                 elif jp_sess == "sms_uat":
                     nranked = _rank_sms_uat_services_by_query(q, limit=12, for_menu=True)
                 elif jp_sess == "pms_uat":
