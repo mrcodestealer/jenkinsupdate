@@ -11854,26 +11854,10 @@ def _fpms_lark_verification_card_json(
             f"**Env:** `{env}`\n"
             f"**Branch:** `{branch}`"
         )
-    if jp == "vpn_creation":
-        title_text = "VPN CREATION"
-    elif jp == "fnt_rc":
-        title_text = "FNT RC UAT"
-    elif jp == "sms_uat":
-        title_text = "SMS UAT UPDATE"
-    elif jp == "fpms_prod_script":
-        title_text = "FPMS PROD SCRIPT RUN"
-    elif jp == "bi_api_update":
-        title_text = "BI API UPDATE"
-    elif jp == "qrqm_update":
-        title_text = "QRQM UPDATE"
-    elif jp == "bi_script_update":
-        title_text = "BI SCRIPT UPDATE"
-    elif jp == "venue_uat":
-        title_text = "VENUE UAT"
-    elif jp == "cpms_igo_uat":
-        title_text = "CPMS / IGO UAT"
-    else:
-        title_text = "FPMS UAT"
+    # One mapping for every profile — these chains had no ``pms_uat``/``frontend`` case, so a PMS
+    # run was titled "FPMS UAT" while its link and Environment were correctly PMS. The card is how
+    # people check the bot picked the right job, so a wrong title reads as a wrong job.
+    title_text = _jenkins_job_profile_display(jp)
     if isinstance(next_build_number, int) and next_build_number > 0:
         title_text = f"{title_text} #{next_build_number}"
 
@@ -11939,26 +11923,10 @@ def _fpms_lark_verification_plain_fallback(
     next_build_number: int | None = None,
 ) -> str:
     jp = (job_profile or "fpms").strip()
-    if jp == "vpn_creation":
-        head = "VPN CREATION"
-    elif jp == "fnt_rc":
-        head = "FNT RC UAT"
-    elif jp == "sms_uat":
-        head = "SMS UAT UPDATE"
-    elif jp == "fpms_prod_script":
-        head = "FPMS PROD SCRIPT RUN"
-    elif jp == "bi_api_update":
-        head = "BI API UPDATE"
-    elif jp == "qrqm_update":
-        head = "QRQM UPDATE"
-    elif jp == "bi_script_update":
-        head = "BI SCRIPT UPDATE"
-    elif jp == "venue_uat":
-        head = "VENUE UAT"
-    elif jp == "cpms_igo_uat":
-        head = "CPMS / IGO UAT"
-    else:
-        head = "FPMS UAT"
+    # One mapping for every profile — these chains had no ``pms_uat``/``frontend`` case, so a PMS
+    # run was titled "FPMS UAT" while its link and Environment were correctly PMS. The card is how
+    # people check the bot picked the right job, so a wrong title reads as a wrong job.
+    head = _jenkins_job_profile_display(jp)
     if isinstance(next_build_number, int) and next_build_number > 0:
         head = f"{head} #{next_build_number}"
     link = (build_url or "").strip()
