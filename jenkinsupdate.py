@@ -505,6 +505,20 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
         "CRS UAT Master(telesales)",
         "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
     ),
+    # The team calls this job CRS (see its own label); ``telesales`` was the only way in,
+    # so "UPDATE CRS UAT MASTER" fuzzy-matched ``rc uat master`` and ``fpms uat master`` instead.
+    "crs": (
+        "CRS UAT Master(telesales)",
+        "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
+    ),
+    "crs uat": (
+        "CRS UAT Master(telesales)",
+        "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
+    ),
+    "crs uat master": (
+        "CRS UAT Master(telesales)",
+        "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
+    ),
     "rc uat master": (
         "FPMS FNT(RC)",
         "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
@@ -815,9 +829,16 @@ def _service_lines_mean_update_all(service_lines: list[str]) -> bool:
         "__all__",
     ):
         return True
+    # A real service id always wins over the keyword reading (e.g. ``scheduler-sms-all``).
+    if _normalize_service_query_key(toks[0]) in _all_known_service_ids():
+        return False
     # Accept loose variants users often paste in chat blocks.
     t0_simple = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", t0)
-    return t0_simple in ("allservice", "allservices", "allsvc", "allsvcs", "全部服务")
+    if t0_simple in ("allservice", "allservices", "allsvc", "allsvcs", "全部服务"):
+        return True
+    # ``PMS All service`` / ``FPMS all services`` — people name the system before the keyword.
+    # Anchored on the keyword ending so ``scheduler-sms-all`` is not swallowed.
+    return bool(re.fullmatch(r"[a-z0-9]*(?:allservices?|allsvcs?|全部服务)", t0_simple))
 
 
 _SERVICE_EXCLUDE_INTENT_RE = re.compile(
@@ -10100,9 +10121,24 @@ def _fpms_maybe_split_run_by_environment(
 def _jenkins_update_filter_ties_by_services(
     ties: list[tuple[str, float, str, str]], service_tokens: Sequence[str]
 ) -> list[tuple[str, float, str, str]]:
+    """
+    Drop candidate jobs that demonstrably cannot host the named services.
+
+    A job whose Services catalog is **unknown** is kept, not eliminated. Several real jobs have no
+    catalog — TELESALES-UAT-UPDATE, FGS, BRAZIL/NEWPORT — and dropping them meant a correct request
+    like ``Service: telesales-crs`` was rejected outright even though the headline named the job.
+    Unknown means "cannot tell", not "definitely not this one"; only a catalog that exists and
+    lacks the service is proof.
+    """
     if not service_tokens:
         return ties
-    return [t for t in ties if _jenkins_job_matches_service_tokens(t[3], service_tokens)]
+    kept = [
+        t
+        for t in ties
+        if _jenkins_job_service_catalog_for_url(t[3]) is None
+        or _jenkins_job_matches_service_tokens(t[3], service_tokens)
+    ]
+    return kept
 
 
 def _jenkins_update_filter_ties_by_environment(
@@ -15968,21 +16004,38 @@ def _dispatch_lark_update_command_body(
     if svc_tokens:
         ties = _jenkins_update_filter_ties_by_services(ties, svc_tokens)
         if not ties:
-            sample_jobs = ", ".join(
-                lbl for _a, _s, lbl, _u in _jenkins_update_disambiguation_ties(
-                    _rank_jenkins_update_job_matches(body), band=0.05
-                )[:4]
-            )
-            send(
-                chat_id,
-                "❌ **No Jenkins job** lists the service(s) you named: "
-                f"**{', '.join(svc_tokens[:8])}**"
-                + (" …" if len(svc_tokens) > 8 else "")
-                + ".\n"
-                "Check the service id / port (e.g. `9000` → **mgnt-apiserver** on **FPMS UAT Branch**; "
-                "`auth-rollout` → **FPMS UAT Master**). "
-                + (f"Headline matches included: {sample_jobs}." if sample_jobs else ""),
-            )
+            # Name the token that could not be placed and offer the closest real ids on the jobs
+            # the headline actually pointed at. Never cite an unrelated job as an example — every
+            # job is its own link and none of them is a default.
+            cand = _jenkins_update_disambiguation_ties(
+                _rank_jenkins_update_job_matches(body), band=0.05
+            )[:4]
+            unplaced = [
+                t
+                for t in svc_tokens
+                if not any(_jenkins_job_matches_service_tokens(u, [t]) for *_x, u in cand)
+            ] or list(svc_tokens)
+            lines = [
+                "❌ I could not place "
+                + ("this service: " if len(unplaced) == 1 else "these services: ")
+                + ", ".join(f"**{t}**" for t in unplaced[:8])
+                + (" …" if len(unplaced) > 8 else "")
+                + "."
+            ]
+            for _a, _s, lbl, u in cand:
+                near: list[str] = []
+                for t in unplaced[:3]:
+                    near += _rank_catalog_services_by_query(
+                        _jenkins_job_service_catalog_list_for_url(u) or [], t, 2
+                    )
+                near = list(dict.fromkeys(near))[:4]
+                lines.append(
+                    f"• **{lbl}**"
+                    + (f" — did you mean `{'`, `'.join(near)}`?" if near else " — no close match")
+                )
+            if len(cand) > 1:
+                lines.append("Name the job in your first line so I know which one you mean.")
+            send(chat_id, "\n".join(lines))
             return True
         if env_hint:
             ties = _jenkins_update_filter_ties_by_environment(ties, env_hint)
