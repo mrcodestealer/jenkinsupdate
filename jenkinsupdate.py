@@ -519,6 +519,37 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
         "CRS UAT Master(telesales)",
         "https://jenkins.internal.client8.me/job/FNT/job/TELESALES-UAT-UPDATE/build?delay=0sec",
     ),
+    # Teams write the product name, not the folder name: "RCS UAT MASTER", "NT UAT MASTER".
+    # Without these the headline matched nothing literally and fell back to a fuzzy guess
+    # ("RCS UAT MASTER" scored 0.889 against ccmsfe uat master).
+    "rcs": (
+        "FPMS FNT(RC)",
+        "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
+    ),
+    "rcs uat": (
+        "FPMS FNT(RC)",
+        "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
+    ),
+    "rcs uat master": (
+        "FPMS FNT(RC)",
+        "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
+    ),
+    "nt uat master": (
+        "FPMS NT UAT MASTER UPDATE",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
+    ),
+    "nt master": (
+        "FPMS NT UAT MASTER UPDATE",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_MASTER_UPDATE/build?delay=0sec",
+    ),
+    "nt uat branch": (
+        "FPMS NT UAT BRANCH UPDATE",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_BRANCH_UPDATE/build?delay=0sec",
+    ),
+    "nt branch": (
+        "FPMS NT UAT BRANCH UPDATE",
+        "https://jenkins.internal.client8.me/job/FPMS_NT/view/all/job/FPMS_NT_UAT_BRANCH_UPDATE/build?delay=0sec",
+    ),
     "rc uat master": (
         "FPMS FNT(RC)",
         "https://jenkins.internal.client8.me/job/FNT/job/RC-UAT-UPDATE/build?delay=0sec",
@@ -5175,7 +5206,10 @@ def _services_apply_batch_js(page, names: list[str]) -> list[str]:
                 el.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
                 el.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
                 try {
-                    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+                    // Plain Event, never MouseEvent: a dispatched click MouseEvent runs the
+                    // checkbox's activation behaviour and flips `checked` straight back off,
+                    // undoing the line above and re-firing `change` with checked === false.
+                    el.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
                 } catch (e2) {}
                 try {
                     el.dispatchEvent(
@@ -5441,7 +5475,10 @@ def select_environment(page, env_value: str) -> None:
         raise ServicesListGoneError(
             "Services row not visible when starting Environment — will retry in a new browser session (same answers)."
         ) from None
-    sel = row.locator("select.jenkins-select__input").first
+    # Same fallback as every other select helper: Active Choices renders its own
+    # <select class="setting-input"> without the core class, and a locator miss here is caught as
+    # "Services not found" and escalated into a Refresh-pipeline Build nobody asked for.
+    sel = row.locator("select.jenkins-select__input, select").first
     sel.wait_for(state="visible", timeout=15_000)
 
     printed = False
@@ -5923,7 +5960,9 @@ def _force_check_service_in_dom(page, value: str) -> None:
             el.checked = true;
             el.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
-            el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+            // Plain Event — a MouseEvent("click") would un-tick the box we just ticked, which
+            // made this last-resort rung incapable of ever succeeding.
+            el.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
             return true;
         }""",
         value,
@@ -16058,6 +16097,11 @@ def _dispatch_lark_update_command_body(
     need_menu = len(ties) > 1
     if not need_menu and len(ties) == 1 and prof0 in ("fnt_rc", "sms_uat"):
         need_menu = ties[0][1] < 2.0
+    # Nothing corroborated the headline — no services named — and no alias appeared in it
+    # literally, so this is a fuzzy guess. Every real headline scores well above this floor;
+    # below it the ranker was picking an unrelated job rather than admitting it did not know.
+    if not need_menu and not svc_tokens and ties and ties[0][1] < 2.0:
+        need_menu = True
     if need_menu:
         picker_sid = secrets.token_hex(16)
         with _fpms_lark_sessions_lock:
@@ -17075,20 +17119,16 @@ def handle_lark_jenkins_update_message(
                     lark_thread_root_id=lark_thread_root_id,
                 )
 
+        # A leftover session with no recognised state is our bookkeeping problem, not the user's.
+        # Clear it and let this message be handled normally — returning here swallowed it, so after
+        # any rejection the *next* request silently disappeared and had to be sent a third time.
         _fpms_lark_clear_session(chat_id, sender_id)
-        had_um = bool(sess.get("updatemore_queue"))
-        if had_um:
+        if sess.get("updatemore_queue"):
             send(
                 chat_id,
-                "⚠️ Stale **`/updatemore`** session was cleared (no active Jenkins step). "
-                "Send your **`/updatemore`** message again.",
+                "⚠️ Stale **`/updatemore`** session was cleared (no active Jenkins step) — "
+                "handling this message as a fresh request.",
             )
-        else:
-            send(
-                chat_id,
-                "⚠️ Internal session state was reset. Start again with `/update` or `/jenkinsupdate`.",
-            )
-        return True
 
     if not JENKINS_UPDATE_CMD_RE.search(clean_text or ""):
         if not (allow_start and looks_like_natural_jenkins_update(original_text or clean_text or "")):
