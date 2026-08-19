@@ -9857,6 +9857,12 @@ def _peek_service_tokens_from_update_body(body: str) -> list[str]:
         if last_key == "services":
             if _looks_like_chat_trailing_line_under_services(line_n):
                 continue
+            # Also honour the update-all keyword when it sits on its own line under ``Services:``.
+            # The agent normalizer rewrites "Update Service: PMS All service" into a ``Services:``
+            # header with the value on the next line, which skipped the key-line check and turned
+            # "PMS All service" into a service id no job has.
+            if _service_lines_mean_update_all([line_n]):
+                return []
             if port_head.match(line_n) or (
                 re.search(r"[a-zA-Z_]", line_n) and len(line_n) < 200
             ):
