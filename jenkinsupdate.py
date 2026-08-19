@@ -604,6 +604,15 @@ JENKINS_UPDATE_JOB_REGISTRY: dict[str, tuple[str, str]] = {
         "FPMS PROD SCRIPT RUN",
         "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
     ),
+    # BI-PROD-SCRIPT-RUN — Python scripts on the bi-prod environment.
+    "bi prod script": (
+        "BI PROD SCRIPT RUN",
+        "https://jenkins.internal.client8.me/job/BI-GO/job/BI-PROD-SCRIPT-RUN/build?delay=0sec",
+    ),
+    "bi prod script run": (
+        "BI PROD SCRIPT RUN",
+        "https://jenkins.internal.client8.me/job/BI-GO/job/BI-PROD-SCRIPT-RUN/build?delay=0sec",
+    ),
     "fpms prod script run": (
         "FPMS PROD SCRIPT RUN",
         "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec",
@@ -657,6 +666,27 @@ FPMS_PROD_SCRIPT_FLAG_RE = re.compile(r"--fpmsprodscript\b", re.I)
 FPMS_PROD_SCRIPT_BUILD_URL = (
     "https://jenkins.internal.client8.me/job/FPMS/job/FPMS_PROD_SCRIPT_RUN/build?delay=0sec"
 )
+# BI-PROD-SCRIPT-RUN — same form as FPMS PROD SCRIPT (Environment <select> + Command), but the
+# Environment option is ``bi-prod`` and its scripts are Python, not Node.
+BI_PROD_SCRIPT_RUN_URL = (
+    "https://jenkins.internal.client8.me/job/BI-GO/job/BI-PROD-SCRIPT-RUN/build?delay=0sec"
+)
+# Prod-script job URL fragment → its single Environment option.
+PROD_SCRIPT_ENV_BY_URL: tuple[tuple[str, str], ...] = (
+    ("/job/bi-go/job/bi-prod-script-run/", "bi-prod"),
+    ("/job/fpms/job/fpms_prod_script_run/", "fpms-prod"),
+)
+# Interpreters a prod-script Command may start with. FPMS runs Node; BI runs Python.
+PROD_SCRIPT_INTERPRETERS: tuple[str, ...] = ("node", "python3", "python")
+
+
+def prod_script_environment_for_url(raw_url: str) -> str:
+    """Environment option for a prod-script job URL (defaults to FPMS for backwards compatibility)."""
+    ul = (raw_url or "").casefold()
+    for frag, env in PROD_SCRIPT_ENV_BY_URL:
+        if frag in ul:
+            return env
+    return "fpms-prod"
 
 # FNT ``RC-UAT-UPDATE`` (RC UAT master; alias ``rc uat master``) — checkbox ``value`` / ``json`` from Jenkins
 # (ECP extended-choice parameter; order matches job UI).
@@ -3722,6 +3752,8 @@ def _body_requests_bi_api_update(body: str) -> bool:
     head_cf = head.casefold()
     if head_cf in ("ds", "ds update", "bi", "bi api", "bi api update", "bi-api-update"):
         return True
+    if _body_requests_bi_prod_script(raw):
+        return False  # BI-PROD-SCRIPT-RUN, a different job with a Command field
     if head_cf.startswith("ds ") or head_cf.startswith("bi "):
         return True
     ranked = _rank_jenkins_update_job_matches(raw)
@@ -8326,6 +8358,9 @@ def _jenkins_update_job_automation_profile(raw_urls: str) -> str | None:
         return "pms_uat"
     if "/job/fpms/job/fpms_prod_script_run/" in ul:
         return "fpms_prod_script"
+    if "/job/bi-go/job/bi-prod-script-run/" in ul:
+        # Same fill flow as FPMS PROD SCRIPT: Environment <select> + Command text.
+        return "fpms_prod_script"
     if "/job/bi-go/job/bi-api-update/" in ul:
         return "bi_api_update"
     if "/job/bi-go/job/qrqm-update/" in ul:
@@ -8445,6 +8480,23 @@ def _igo_prod_script_phrase_env(body: str) -> str | None:
                 return env
         return "igo-prod"
     return None
+
+
+_BI_PROD_SCRIPT_PHRASE_RE = re.compile(r"(?i)\bbi\b[\s\-_]*prod(?:uction)?[\s\-_]*script\b")
+
+
+def _body_requests_bi_prod_script(body: str) -> bool:
+    """
+    True when the message names the **BI-PROD-SCRIPT-RUN** job.
+
+    Checked before :func:`_body_requests_bi_api_update`, which claims any headline starting with
+    ``bi `` — that sent "BI prod script run" to BI-API-UPDATE and asked for a REPOSITORY.
+    """
+    for line in _strip_lark_message_mentions(body).splitlines():
+        s = JENKINS_UPDATE_CMD_RE.sub("", line, count=1)
+        if _BI_PROD_SCRIPT_PHRASE_RE.search(re.sub(r"[`*_]", " ", s)):
+            return True
+    return False
 
 
 def _strip_lark_message_mentions(text: str) -> str:
@@ -11113,12 +11165,21 @@ def normalize_fpms_prod_script_command(cmd: str) -> str:
 
 
 def _fpms_prod_script_command_must_start_with_node(cmd: str) -> None:
-    """Raise if canonical command does not begin with ``node`` (Jenkins PROD SCRIPT convention)."""
+    """
+    Raise unless the canonical command starts with a known interpreter.
+
+    FPMS PROD SCRIPT runs Node; BI-PROD-SCRIPT-RUN runs Python, so restricting this to ``node``
+    rejected every valid BI command.
+    """
     c = normalize_fpms_prod_script_command(cmd)
-    if not c.casefold().startswith("node"):
+    low = c.casefold()
+    if not any(re.match(rf"{i}\b", low) for i in PROD_SCRIPT_INTERPRETERS):
         raise ValueError(
-            "Command must start with `node` (no leading/trailing spaces or outer \" quotes). "
-            "Example: node Server/dataPatch/scriptModule.js …"
+            "Command must start with "
+            + " or ".join(f"`{i}`" for i in PROD_SCRIPT_INTERPRETERS)
+            + " (no leading/trailing spaces or outer \" quotes).\n"
+            "Examples: node Server/dataPatch/scriptModule.js …  |  "
+            "python lark-sheet/lark_gameprovider_category.py"
         )
 
 
@@ -11263,7 +11324,8 @@ def parse_fpms_prod_script_run_config_block(text: str) -> tuple[str, str]:
     return env, cmd
 
 
-_FPMS_PROD_SCRIPT_NODE_LINE_RE = re.compile(r"^\s*node\b", re.I)
+# Any supported interpreter starts a new command line (FPMS: node, BI: python).
+_FPMS_PROD_SCRIPT_NODE_LINE_RE = re.compile(r"^\s*(?:node|python3|python)\b", re.I)
 _FPMS_PROD_SCRIPT_CMD_LABEL_RE = re.compile(
     r"^(?:[>\-\*\u2022]\s*)*(?:`+|\*{1,2})?command(?:`+|\*{1,2})?\s*[:\-–—]\s*(?P<rest>.*)$",
     re.I,
@@ -13022,7 +13084,7 @@ def _fpms_lark_dispatch_fpms_prod_script_parameter_flow(
     if len(multi_cmds) == 1:
         data = {
             "_job_kind": "fpms_prod_script",
-            "environment": "fpms-prod",
+            "environment": prod_script_environment_for_url(jenkins_build_url),
             "command": multi_cmds[0],
         }
         _fpms_lark_begin_jenkins_run(
@@ -15940,6 +16002,17 @@ def _dispatch_lark_update_command_body(
             key,
             body,
             FPMS_PROD_SCRIPT_BUILD_URL,
+            send,
+            lark_message_id=lark_message_id,
+        )
+
+    # BI PROD SCRIPT RUN — same form as FPMS PROD SCRIPT, Python commands on ``bi-prod``.
+    if _body_requests_bi_prod_script(body):
+        return _fpms_lark_dispatch_fpms_prod_script_parameter_flow(
+            chat_id,
+            key,
+            body,
+            BI_PROD_SCRIPT_RUN_URL,
             send,
             lark_message_id=lark_message_id,
         )
