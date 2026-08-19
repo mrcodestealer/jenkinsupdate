@@ -13190,8 +13190,13 @@ def _fpms_lark_dispatch_fnt_rc_parameter_flow(
             lark_message_id=lark_message_id,
         )
         return True
+    # This job's own catalog, not the RC list — RC and TELESALES share the ``fnt_rc`` profile but
+    # have entirely different services, so an exact match like ``telesales-crs`` was not recognised
+    # and fell to a pick card for something the user had already spelled correctly.
     resolved_ids, tokens_to_pick = _split_unambiguous_service_tokens(
-        tokens, FNT_RC_UAT_MASTER_SERVICES
+        tokens,
+        _jenkins_job_service_catalog_list_for_url(jenkins_build_url)
+        or FNT_RC_UAT_MASTER_SERVICES,
     )
     if not tokens_to_pick:
         if not resolved_ids:
@@ -13281,7 +13286,8 @@ def _fpms_lark_dispatch_sms_uat_parameter_flow(
         )
         return True
     resolved_ids, tokens_to_pick = _split_unambiguous_service_tokens(
-        tokens, SMS_UAT_UPDATE_SERVICES
+        tokens,
+        _jenkins_job_service_catalog_list_for_url(jenkins_build_url) or SMS_UAT_UPDATE_SERVICES,
     )
     if not tokens_to_pick:
         if not resolved_ids:
