@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from email.utils import parseaddr
 from typing import Any, Callable
 
 UPDATEMORE_CMD_RE = re.compile(r"/updatemore\b", re.I)
@@ -921,7 +922,12 @@ def is_pick_email_text(text: str) -> bool:
 
 
 def _describe_candidate(e: dict[str, Any]) -> str:
-    frm = (e.get("from_raw") or "").strip()
+    # `from_raw` is the RAW WIRE header now (the index stores it undecoded so the pairs parser can
+    # still see encoded-word boundaries). Slicing that to 38 chars showed the operator
+    # `=?utf-8?B?5p2O5ZubIC0g6L+Q57u05Zui6Zif` with the address cut off entirely — and telling two
+    # same-subject threads apart by SENDER is the only reason this line exists; picking the wrong
+    # one mails the wrong customer. Decode BEFORE truncating, or the cut lands mid encoded-word.
+    frm = _readable_addr_entry(e.get("from_raw") or "")
     return (
         f"{(e.get('date') or '?')[:10]} · **{e.get('folder') or '?'}** · "
         f"`{frm[:38]}`\n     {(e.get('subject') or '')[:88]}"
@@ -974,7 +980,10 @@ def offer_email_thread_choice(
             {
                 "date": (e.get("date") or "?")[:10],
                 "folder": e.get("folder") or "?",
-                "from": (e.get("from_raw") or "").strip(),
+                # Decoded, not the wire form: the card truncates this row to 46 chars, so an
+                # encoded CJK name spent all 46 on base64 and hid the address. Same reason as
+                # _describe_candidate — decode first, let the card do the truncating.
+                "from": _readable_addr_entry(e.get("from_raw") or ""),
                 "subject": e.get("subject") or "",
             }
             for e in cands
@@ -1398,6 +1407,63 @@ def _send_manual_reply_email_card(
         send(chat_id, payload)
 
 
+def _readable_addr_entry(entry: str) -> str:
+    """``=?utf-8?b?5p2O?= <li@x.com>`` → ``李 <li@x.com>`` for the card only.
+
+    The wire form is right (that is what ``format_address_pair`` produced and what the header
+    carries), but a CJK or accented name reaching the operator as an encoded word defeats the
+    point of putting names on the card at all. Display-side only — the address is untouched, so
+    this can never change who was mailed.
+    """
+    # Unfold FIRST. A wire header arrives folded, so `from_raw` really does contain CRLF+space
+    # (`"Operations Support Desk, Level 2"\r\n <ops@…>`); left in, it lands inside the card's
+    # backtick span and splits the row into two broken lines. make_header only unfolds around
+    # encoded words, so plain long names need this whether or not they are encoded.
+    raw = re.sub(r"\s*[\r\n\t]+\s*", " ", entry or "").strip()
+    if "=?" not in raw:
+        return raw
+    try:
+        import maintenance_mail as _mm
+
+        # Go through maintenance_mail's decoder, not decode_header/make_header directly: it
+        # routes the charset label through _safe_codec, so an unregistered one ('unknown-8bit',
+        # 'ISO-8859-8-I') no longer raises LookupError and leave the operator staring at the raw
+        # '=?…?=' blob — the exact outcome this function exists to prevent.
+        # Collapse again: the DECODED text of an encoded word can itself hold a CR/LF, which
+        # would re-break the card row that unfolding above just repaired.
+        out = re.sub(r"\s*[\r\n\t]+\s*", " ", _mm._decode_mime_header(raw)).strip()
+    except Exception:  # noqa: BLE001 — an undecodable name is still better shown raw
+        return raw
+    return out or raw
+
+
+def _entry_addr_spec(entry: str) -> str:
+    """Bare lowercase addr-spec out of a header entry like ``"Alice Tan" <a@x.com>``.
+
+    Only used to cross-reference the SMTP ``refused`` map (bare envelope addresses) against
+    To/Cc entries that now carry display names. ``parseaddr`` alone is not enough: since the
+    CVE-2023-27043 hardening it returns ``('', '')`` for anything it dislikes, and silently
+    dropping the match there would put a rejected address back on the delivered list.
+    """
+    raw = (entry or "").strip()
+    if not raw:
+        return ""
+    # Angle brackets first, and deliberately not via parseaddr: on `"unbalanced <bob@h.com>` the
+    # unterminated quote makes parseaddr hand back the WHOLE string as the address, which then
+    # matches no refusal at all and puts a rejected recipient straight back on the delivered
+    # list. The bracketed span is unambiguous whatever the display name does.
+    brackets = [b for b in re.findall(r"<([^<>]*)>", raw) if "@" in b]
+    addr = brackets[-1] if brackets else ""
+    if not addr:
+        try:
+            addr = parseaddr(raw)[1]
+        except Exception:  # noqa: BLE001 — a parser edge case must never lose a refusal
+            addr = ""
+    if not addr:
+        addr = raw
+    return addr.strip().strip("<>").strip().casefold()
+
+
 def _send_jenkins_email_reply(
     send: Callable[..., Any],
     chat_id: str,
@@ -1513,9 +1579,38 @@ def _send_jenkins_email_reply(
         )
         return
     envs = ", ".join(c[0] for c in completions)
-    to_line = ", ".join(sent.get("to") or []) or "(none)"
-    cc_line = ", ".join(sent.get("cc") or []) or "(none)"
-    rcpt_line = ", ".join(sent.get("recipients") or []) or to_line
+    # A partial SMTP refusal accepts the message for everyone else, so the send still "succeeds"
+    # while the refused addresses receive NOTHING. The old card listed them as recipients, which
+    # is the one thing worse than a missing Cc: the operator believes they were told. Keys in the
+    # refused map are bare envelope addr-specs, while to/cc now carry display names, so match on
+    # the addr-spec pulled back out of each header entry.
+    refused = sent.get("refused") or {}
+    refused_keys = {_entry_addr_spec(a) for a in refused if _entry_addr_spec(a)}
+
+    def _addr_line(label: str, items: list[str]) -> str:
+        """``- **To (3):** …`` — count per line, so a suspiciously short list is obvious.
+
+        Rejected entries are removed from the delivered list and only counted here; they are
+        named in full on the REJECTED line above.
+        """
+        delivered = [i for i in items if _entry_addr_spec(i) not in refused_keys]
+        n_bad = len(items) - len(delivered)
+        head = (
+            f"{label} ({len(delivered)} of {len(items)} — {n_bad} rejected)"
+            if n_bad
+            else f"{label} ({len(delivered)})"
+        )
+        shown = ", ".join(_readable_addr_entry(i) for i in delivered)
+        return f"- **{head}:** `{shown or '(none)'}`"
+
+    to_items = list(sent.get("to") or [])
+    cc_items = list(sent.get("cc") or [])
+    # Same fallback as before: no envelope reported ⇒ show the To list rather than "(none)".
+    rcpt_items = list(sent.get("recipients") or []) or to_items
+    refused_line = ""
+    if refused:
+        detail = ", ".join(f"`{addr} — {reason}`" for addr, reason in sorted(refused.items()))
+        refused_line = f"⚠️ **REJECTED by the mail server (received NOTHING):** {detail}\n"
     quoted_line = (
         "✅ quoted (**Show/Hide email thread**)"
         if sent.get("quoted")
@@ -1545,15 +1640,43 @@ def _send_jenkins_email_reply(
             else ""
         )
     )
+    # WHERE the To/Cc placement came from — the two paths do genuinely different things and the
+    # card used to look identical for both. The cache path buckets from the thread ANCHOR (the
+    # newest message, the one a human would have open) and widens every other participant into
+    # Cc; the live path only ever sees the single matched message, so its Cc is narrower than a
+    # manual Reply All on the thread would be. Neither result dict reports the thread-member
+    # count, and the cache dict's folder/target_date describe the thread ROOT rather than the
+    # anchor — so those are left unclaimed here instead of guessed.
+    source = (sent.get("source") or "").strip()
+    if source == "allemail-cache":
+        source_line = (
+            "thread (anchor + other message(s), widened into Cc) — "
+            "member count not reported by `maintenance_mail`"
+        )
+        placement_line = (
+            "the **newest** message in the thread — its folder/date are not reported; "
+            "**Replied into** above is the thread root"
+        )
+    elif source == "live-imap":
+        source_line = "single message — live IMAP fallback, narrower than the thread"
+        placement_line = (
+            f"the matched message in **{sent.get('folder') or '?'}** dated **{tgt_date}**"
+        )
+    else:
+        source_line = f"⚠️ unknown (`source`={source or 'missing'}) — To/Cc unverified"
+        placement_line = "not reported"
     send(
         chat_id,
         f"📧 {label} ({len(completions)} done block(s))\n"
+        f"{refused_line}"
         f"- **From:** `{mm.MAIL_USER}`\n"
-        f"- **Reply-All (all To + Cc):** `{rcpt_line}`\n"
-        f"- **To:** `{to_line}`\n"
-        f"- **Cc:** `{cc_line}`\n"
+        f"{_addr_line('Reply-All (all To + Cc)', rcpt_items)}\n"
+        f"{_addr_line('To', to_items)}\n"
+        f"{_addr_line('Cc', cc_items)}\n"
         f"- **Subject (search / Re:):** `{email_title}`\n"
         f"- **Replied into:** {target_line}\n"
+        f"- **Recipient source:** {source_line}\n"
+        f"- **Placement from:** {placement_line}\n"
         f"- **Environments:** {envs}\n"
         f"- **Thread:** {quoted_line}\n"
         f"- **Threading:** {threaded_line}",

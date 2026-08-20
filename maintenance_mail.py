@@ -26,6 +26,7 @@ IMAP watcher processes **today's mail only** (local ``MAINTENANCE_MAIL_TZ``,
 
 from __future__ import annotations
 
+import codecs
 import copy
 import email
 import hashlib
@@ -49,6 +50,8 @@ from email.header import decode_header, make_header
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.errors import InvalidHeaderDefect
+from email.headerregistry import HeaderRegistry
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 from typing import Any, Callable
 
@@ -529,6 +532,32 @@ ALLEMAIL_MAX_ENTRIES = min(
 ALLEMAIL_REPLY_MAX_AGE_DAYS = min(
     365, max(1, int(os.getenv("ALLEMAIL_REPLY_MAX_AGE_DAYS", "").strip() or "14"))
 )
+# How far apart two messages may sit and still be called the same thread on SUBJECT alone.
+# The request subject on this mailbox is a template reused verbatim per site and per date, so
+# byte-identical subjects are routinely two unrelated customer requests — and since thread
+# participants are now widened into Cc, such a collision mails the other customer's people.
+# Message-ID-linked membership ignores this window entirely; only the subject fallback is bound.
+#
+# It defaults to ALLEMAIL_REPLY_MAX_AGE_DAYS rather than a number of its own. A hard-coded 7
+# made the fallback window NARROWER than the eligibility window (14): the resolver would still
+# happily land on a day-9 customer follow-up that started a fresh thread (a webmail client with
+# no References), and the day-0 request it answers — carrying two participants who exist
+# nowhere else — was refused as "9.0d apart > 7d". Those two people never got the completion
+# notice. WIDENING, so state exactly what it admits: same-subject messages between 7 and
+# ALLEMAIL_REPLY_MAX_AGE_DAYS days from the target that ALSO share a non-own participant with
+# it and are not a Fwd:. It admits no message the resolver could not already have replied to
+# directly, and the shared-participant gate means a colliding stranger thread still cannot get
+# in. Set the env var to tighten it back if a template subject ever does collide within 14d.
+_ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS = min(
+    365,
+    max(
+        1,
+        int(
+            os.getenv("ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS", "").strip()
+            or str(ALLEMAIL_REPLY_MAX_AGE_DAYS)
+        ),
+    ),
+)
 # On a cache miss, scan the last couple of days and retry before falling back to the slow live
 # search. This is what makes a just-arrived email findable without waiting for a scheduled scan.
 _JENKINS_REPLY_TOPUP_ON_MISS = (
@@ -543,9 +572,13 @@ _JENKINS_REPLY_TOPUP_ON_MISS = (
 _JENKINS_REPLY_LIVE_FALLBACK = (
     os.getenv("JENKINS_REPLY_LIVE_FALLBACK", "").strip() or "auto"
 ).lower()
+# REPLY-TO is its own token — IN-REPLY-TO does NOT match it. Without it the index cannot tell
+# that a sender publishing ``From: no-reply@…`` wants the reply at ``Reply-To: helpdesk@…``, and
+# every Reply-All went to the dead no-reply box. Adding it needs a full `allemail-scan`;
+# entries indexed before that simply carry no reply_to and behave as they did.
 _ALLEMAIL_HEADER_FETCH_SPEC = (
     "(BODY.PEEK[HEADER.FIELDS "
-    "(DATE SUBJECT FROM TO CC MESSAGE-ID REFERENCES IN-REPLY-TO AUTO-SUBMITTED)])"
+    "(DATE SUBJECT FROM TO CC REPLY-TO MESSAGE-ID REFERENCES IN-REPLY-TO AUTO-SUBMITTED)])"
 )
 _allemail_lock = threading.Lock()
 _allemail_scanner_started = False
@@ -911,13 +944,37 @@ def subject_matches(subject: str) -> bool:
     return False
 
 
+def _safe_codec(enc: str | None) -> str:
+    """A charset label Python can actually decode with, or ``utf-8``.
+
+    ``decode_header`` hands back whatever label the sender wrote — including the synthetic
+    ``unknown-8bit`` it invents for a header carrying raw 8-bit bytes, and real-but-unregistered
+    names like ``ISO-8859-8-I``. ``bytes.decode`` then raises ``LookupError`` BEFORE it looks at
+    ``errors="replace"``, and that escaped through ~30 call sites: it took out the bounce screen,
+    discarded whole cache hits (every reply to that thread then paid the 25-150s live search) and
+    silently dropped messages from the index.
+    """
+    name = (enc or "").strip()
+    if not name:
+        return "utf-8"
+    try:
+        codecs.lookup(name)
+    except (LookupError, TypeError, ValueError):
+        return "utf-8"
+    return name
+
+
 def _decode_mime_header(raw: str | None) -> str:
-    if not raw:
+    if raw is None or raw == "":
         return ""
+    try:
+        fragments = decode_header(raw if isinstance(raw, str) else str(raw))
+    except Exception:  # noqa: BLE001 — a header is never worth an exception to a caller
+        return str(raw).strip()
     parts: list[str] = []
-    for frag, enc in decode_header(raw):
+    for frag, enc in fragments:
         if isinstance(frag, bytes):
-            parts.append(frag.decode(enc or "utf-8", errors="replace"))
+            parts.append(frag.decode(_safe_codec(enc), errors="replace"))
         else:
             parts.append(str(frag))
     return "".join(parts).strip()
@@ -1873,8 +1930,12 @@ def _forward_subject(subject: str) -> str:
 
 
 def _reply_subject(subject: str) -> str:
+    # ``^re:\s`` demanded a space after the colon, so a sender who wrote "Re:no-space" (or
+    # "Re :") got a second prefix stapled on and the reply went out as "Re: Re:no-space".
+    # ``\s*`` around the colon covers both spellings. ``Fwd:`` is deliberately NOT matched:
+    # a manual reply to a forward keeps the Fwd: and prefixes Re: in front of it.
     s = (subject or "").strip() or "Maintenance"
-    if re.match(r"^re:\s", s, re.IGNORECASE):
+    if re.match(r"^re\s*:", s, re.IGNORECASE):
         return s
     return f"Re: {s}"
 
@@ -1886,13 +1947,13 @@ def _normalize_email_address(addr: str) -> str:
 def _own_smtp_identities() -> set[str]:
     """Addresses that mark a message as **ours** when picking a reply target.
 
-    Deliberately broad (sending mailbox **plus** ``JENKINS_DONE_REPLY_TO``): it is what keeps
+    Deliberately broad (sending mailbox **plus** ``JENKINS_DONE_OWN_EXTRA_IDENTITY``): it keeps
     our own ``Sent`` copies — a self-forward addressed ``To: junchen@, Cc: om@`` — from being
     mistaken for a vendor thread we should reply to. It is **not** the recipient-exclusion set;
     see :func:`_sending_mailbox_identities`.
     """
     ids: set[str] = set()
-    for raw in (MAIL_USER, JENKINS_DONE_REPLY_TO):
+    for raw in (MAIL_USER, JENKINS_DONE_OWN_EXTRA_IDENTITY):
         a = (raw or "").strip()
         if a:
             ids.add(_normalize_email_address(a))
@@ -1964,23 +2025,471 @@ def _set_subject_header(msg: email.message.Message, subject: str) -> None:
     msg["Subject"] = hdr if round_trip else Header(subj, "utf-8")
 
 
-def _parse_header_address_list(msg: email.message.Message, header: str) -> list[str]:
-    """Decode ``To`` / ``Cc`` / ``From`` and return unique addr-specs in order."""
-    raw = _decode_mime_header(msg.get(header)) or ""
-    if not raw.strip():
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for _name, addr in getaddresses([raw]):
-        a = (addr or "").strip()
-        if not a or "@" not in a:
+_HEADER_REGISTRY = HeaderRegistry()
+# Deliberately conservative: an unquoted local part and a dotted domain.
+_ADDR_SPEC_RE = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+# A display name longer than this cannot be a real person's, and one atomic encoded-word cannot
+# be folded — a 250-char CJK name alone blows past the RFC 5322 998-octet line cap.
+_MAX_DISPLAY_NAME_BYTES = 180
+
+
+def _clean_display_name(raw: str) -> str:
+    """MIME-decode a display name and make it safe to put in a header.
+
+    Control characters are stripped, not escaped: ``formataddr`` quotes a name but does not scrub
+    it, so a name decoding to ``Evil\r\nBcc: attacker@evil.com`` made ``msg.as_string()`` raise
+    and the reply was abandoned for good — every retry failed identically. A name is never worth
+    losing the reply over. U+FFFD means the header carried raw 8-bit bytes we could not decode;
+    shipping nine replacement characters to a customer is worse than shipping no name at all.
+    """
+    n = (_decode_mime_header(raw) or "")
+    n = re.sub(r"[\x00-\x1f\x7f]+", " ", n).strip()
+    if "\ufffd" in n:
+        return ""
+    if len(n.encode("utf-8", "replace")) > _MAX_DISPLAY_NAME_BYTES:
+        return ""
+    return n
+
+
+def _is_addr_spec(value: str) -> bool:
+    return bool(_ADDR_SPEC_RE.fullmatch((value or "").strip()))
+
+
+_BRACKET_ADDR_RE = re.compile(r"<([^<>]*@[^<>]*)>")
+
+
+def _group_bracketed(g: str) -> tuple[list[str], str]:
+    """``(bracketed mailboxes, the text they were found in)`` for one comma group.
+
+    BALANCED quoted display names are blanked first: a rewriter that keeps the old address in the
+    name — ``"Bob Lim <bob@old.com>" <bob@new.com>`` — otherwise had its decoy picked and the real
+    mailbox discarded, a stranger added AND a recipient lost at once. Falls back to the unstripped
+    group if blanking leaves nothing.
+
+    The source text is returned with the list because :func:`_pick_bracketed` measures the gap
+    BETWEEN two brackets and must measure it in the same string the list came from — reading the
+    spans off the raw group while the list came from the blanked one is an index mismatch.
+    """
+    # Same-LENGTH filler, and not whitespace. A quoted run collapsed to one space destroyed the
+    # gap _pick_bracketed measures, so `Bob <bob@x> "via the ops list" <list@v>` read as two
+    # ADJACENT brackets and the rule flipped to the list address — a stranger. \x01 cannot occur
+    # in an addr-spec and cannot be mistaken for the whitespace that means "adjacent".
+    unquoted = re.sub(r'"[^"]*"', lambda m: "\x01" * len(m.group(0)), g)
+    out = [c.strip() for c in _BRACKET_ADDR_RE.findall(unquoted) if _is_addr_spec(c)]
+    if out:
+        return out, unquoted
+    return [c.strip() for c in _BRACKET_ADDR_RE.findall(g) if _is_addr_spec(c)], g
+
+
+def _pick_bracketed(src: str, bracketed: list[str], *, starts_in_quote: bool = False) -> str:
+    """Which of a group's bracketed mailboxes is the real one. ADJACENCY decides.
+
+    RFC 5322 says ``mailbox = [display-name] angle-addr`` — exactly ONE angle-addr. So when two
+    of them sit side by side with nothing between, they cannot both belong to one mailbox: the
+    first is display-name material and the SECOND is the recipient. When words separate them, the
+    first IS the mailbox and the trailing bracket is tail material::
+
+        '"Alice Tan <decoy@stranger> <alice@real>'        <a> <b>       -> b   (adjacent)
+        '"Bob <bob@real> via list <list@vendor>'          <a> word <b>  -> a   (separated)
+
+    These two shapes are indistinguishable to ``HeaderRegistry`` (it swallows both as one quoted
+    local part), and an earlier version simply took the leading address — right half the time,
+    and the other half it mailed a stranger. Adjacency is the same principle
+    :func:`_group_bracketed` already applies to balanced quotes, extended to the case where the
+    closing quote is missing. A stray unmatched ``"`` between the two counts as whitespace: it is
+    the very corruption that got us here, not a separator.
+    """
+    spans = [m.span() for m in _BRACKET_ADDR_RE.finditer(src) if _is_addr_spec(m.group(1).strip())]
+    # ONLY when this fragment began inside an open quote: then its lone quote is the CLOSING one
+    # of a display name the comma split tore in half. `"Tan, Alice <old@x> Ops" <bob@y>` splits
+    # into `"Tan` + ` Alice <old@x> Ops" <bob@y>`, and the tail's real mailbox is the first
+    # bracket AFTER that quote — otherwise the adjacency walk stops at the ` Ops ` gap and hands
+    # back `old@x`, an address that exists only inside the name. `"Lastname, Firstname"` is
+    # ordinary corporate quoting, so a fully RFC-valid header reaches this.
+    #
+    # The parity flag is what makes it safe. Without it the same test fired on a genuine
+    # unterminated OPENING quote (`Bob <bob@x> "via <list@vendor>`), where the mailbox is the
+    # bracket BEFORE the quote — and it mailed the list instead. The fragment alone cannot tell
+    # the two apart; only the running quote count across the split can.
+    if starts_in_quote and src.count('"') % 2 == 1 and len(bracketed) > 1:
+        q = src.index('"')
+        after = [k for k, (st, _e) in enumerate(spans) if st > q]
+        if after and any(e <= q for _st, e in spans):
+            return bracketed[after[0]]
+    i = 0
+    while i + 1 < min(len(bracketed), len(spans)):
+        between = src[spans[i][1]:spans[i + 1][0]].replace('"', " ")
+        if between.strip():
+            break
+        i += 1
+    return bracketed[i]
+
+
+def _iter_groups(unfolded: str):
+    """``(group, starts_inside_an_open_quote)`` for each comma/semicolon fragment.
+
+    The split is deliberately naive — quoting is considered afterwards — so a balanced
+    ``"Lastname, Firstname"`` name is torn in half and the tail fragment carries what looks like
+    a stray quote. Running quote parity is the only thing that distinguishes that CLOSING quote
+    from a genuine unterminated OPENING one, and the two want opposite answers in
+    :func:`_pick_bracketed`. Both callers iterate through here so they cannot disagree.
+    """
+    parity = 0
+    for raw in re.split(r"[,;]", unfolded):
+        yield raw.strip(), bool(parity % 2)
+        parity += raw.count('"')
+
+
+def _ambiguous_group_addresses(unfolded: str) -> set[str]:
+    """Addr-specs the RFC parser must NOT be trusted on, because they sit in a group whose
+    quoting is broken and where :func:`_pick_bracketed` chose someone else.
+
+    The parser can commit to one of those on its own — on
+    ``"A <decoy@x> <alice@y>, "B <decoy@x> <bob@y>`` HeaderRegistry returns ``decoy@x`` — and it
+    IS bracketed in the raw header, so the merge's "trust what is bracketed" test let it through
+    even though salvage had already rejected it. Only the rejected addresses are listed; the one
+    adjacency picked stays trustworthy.
+    """
+    out: set[str] = set()
+    for g, in_quote in _iter_groups(unfolded):
+        if not g or "@" not in g:
             continue
-        key = _normalize_email_address(a)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(a)
+        bracketed, src = _group_bracketed(g)
+        if len(bracketed) > 1:
+            rejected = {_normalize_email_address(a) for a in _ADDR_SPEC_RE.findall(g)}
+            rejected.discard(
+                _normalize_email_address(
+                    _pick_bracketed(src, bracketed, starts_in_quote=in_quote)
+                )
+            )
+            out |= rejected
     return out
+
+
+def _salvage_addresses(unfolded: str, *, quiet: bool = False) -> list[str]:
+    """Best-effort addresses out of a header BOTH parsers refused.
+
+    Per comma/semicolon GROUP, not across the whole header. Scanning the whole string promoted an
+    address that only ever appeared inside a display name — ``Bob Lim via ops-list@vendor.com
+    <bob@custa.com>`` added ``ops-list@vendor.com`` to the envelope, which is the mailing-list
+    rewriter's normal output. Mailing a stranger is worse than a missing Cc, so each group
+    contributes exactly one address: the bracketed one chosen by :func:`_pick_bracketed`, else
+    the last addr-spec in the group (``Alice Tan alice@h.com`` → ``alice@h.com``).
+    """
+    out: list[str] = []
+    dropped: list[str] = []
+    for g, in_quote in _iter_groups(unfolded):
+        if not g or "@" not in g:
+            continue
+        found = _ADDR_SPEC_RE.findall(g)
+        if not found:
+            continue
+        bracketed, src = _group_bracketed(g)
+        picks = (
+            [_pick_bracketed(src, bracketed, starts_in_quote=in_quote)]
+            if bracketed
+            else [found[-1]]
+        )
+        out += picks
+        dropped += [f for f in found if f not in picks]
+    if dropped and not quiet:
+        print(
+            f"[maint-mail] salvage ignored non-recipient token(s) inside a display name: "
+            f"{sorted(set(dropped))[:6]}",
+            flush=True,
+        )
+    return out
+
+
+def parse_address_pairs(
+    values: list[str] | str | None, header: str = "To", *, quiet: bool = False
+) -> list[tuple[str, str]]:
+    """``(display name, addr-spec)`` for every mailbox on one or more RAW address headers.
+
+    Parse the **raw wire** header with the RFC 5322 parser, then MIME-decode each display name.
+    Both halves of that order matter, and getting either wrong loses real recipients:
+
+    * Decoding FIRST and then splitting on commas is how the whole recipient list used to
+      vanish. Since CPython's CVE-2023-27043 hardening, one malformed element makes
+      ``getaddresses`` return ``[('', '')]`` for the ENTIRE header — no exception, no log. An
+      unquoted comment with a comma (``Bob Lim (IT, Ops) <bob@h.com>``) or a trailing comma or a
+      semicolon-separated list therefore emptied the whole ``To`` or ``Cc``, and the reply went
+      to whoever was left. ``_address_list_html`` has always parsed raw for this reason; the
+      recipient builder did the opposite.
+    * Decoding first and then handing the result to ``HeaderRegistry`` is worse than useless: an
+      RFC 2047 name whose decoded text contains a comma
+      (``=?utf-8?B?U3VwcG9ydCwgYmlsbGluZ0B2ZW5kb3IuY29t?= <real@vendor.com>``) then INVENTS
+      ``billing@vendor.com`` as a recipient — an address chosen by whoever sent us the mail —
+      and drops the genuine one.
+
+    Headers are unfolded first (``HeaderRegistry`` rejects CR/LF), every value is parsed (so a
+    second ``Cc:`` line from a gateway is not silently ignored), and any mailbox the parser flags
+    ``InvalidHeaderDefect`` is dropped rather than mailed. ``getaddresses`` remains the last-ditch
+    fallback so a parser fault can never lose a reply outright.
+    """
+    if values is None:
+        vals: list[str] = []
+    elif isinstance(values, str):
+        vals = [values]
+    else:
+        vals = [v for v in values if v]
+    out: list[tuple[str, str]] = []
+    for v in vals:
+        unfolded = re.sub(r"\r?\n[ \t]+", " ", str(v or "")).strip()
+        if not unfolded:
+            continue
+        parsed: list[tuple[str, str]] | None = None
+        try:
+            hv = _HEADER_REGISTRY(header, unfolded)
+            parsed = [
+                (str(a.display_name or ""), str(a.addr_spec or ""))
+                for a in hv.addresses
+                if a.addr_spec
+            ]
+            # A defect does NOT invalidate the mailboxes the RFC 5322 parser DID commit to.
+            # Discarding them sent the whole header to the salvage scanner, and on
+            # ``Bob Lim <bob@custa.com> on behalf of Ops <ops@other.com>`` the scanner promoted
+            # the second bracketed address — which the real parser had correctly refused — into
+            # To. Keep what the parser resolved; fall through only when it resolved nothing.
+            if not parsed:
+                raise ValueError(f"no mailbox in {header} header: {hv.defects!r}")
+            if any(isinstance(d, InvalidHeaderDefect) for d in hv.defects):
+                # It stopped early. ``a@x.com; b@y.com`` parses to a@ alone, and b@ would be
+                # lost. Salvage the rest and MERGE — the parser's mailboxes lead, keeping their
+                # display names, and salvage only ever contributes addresses it did not reach.
+                # Propagate `quiet` rather than forcing it: the REFUSED-ambiguous-group line is
+                # the operator's only sign that a recipient was deliberately not mailed, and
+                # hardcoding True here swallowed it on the live and scan paths too.
+                salvaged = _salvage_addresses(unfolded, quiet=quiet)
+                salvaged_keys = {_normalize_email_address(a) for a in salvaged}
+                # An unquoted colon in a display name turns the header into RFC 5322 GROUP
+                # syntax: `Ticket #4821: helpdesk@vendor.example <alice@custa.com>` makes the
+                # parser commit to helpdesk@ — an address that exists only inside the NAME — and
+                # stop before alice@. So on an early stop a parser mailbox is only trusted when
+                # it is bracketed in the raw header or salvage picked it independently.
+                bracketed_keys = {
+                    _normalize_email_address(c)
+                    for c in re.findall(r"<([^<>]*@[^<>]*)>", unfolded)
+                    if _is_addr_spec(c)
+                } - _ambiguous_group_addresses(unfolded)
+                trimmed = [
+                    (n, a)
+                    for n, a in parsed
+                    if _normalize_email_address(a) in bracketed_keys
+                    or _normalize_email_address(a) in salvaged_keys
+                ]
+                dropped_names = [a for _n, a in parsed if (_n, a) not in trimmed]
+                have = {_normalize_email_address(a) for _n, a in trimmed}
+                extra = [a for a in salvaged if _normalize_email_address(a) not in have]
+                merged = trimmed + [("", a) for a in extra]
+                # Re-sort by first appearance in the header: a partial From parse otherwise
+                # leaves the salvaged sender behind the mailbox the parser reached, and the
+                # sender must lead To.
+                merged.sort(key=lambda p: unfolded.find(p[1]) if p[1] in unfolded else 1 << 30)
+                if merged != parsed:
+                    if not quiet:
+                        print(
+                            f"[maint-mail] {header} header stopped early — parser gave "
+                            f"{len(parsed)}, kept {len(trimmed)}, salvaged {len(extra)} more"
+                            + (f", dropped from display names {dropped_names}" if dropped_names else "")
+                            + f": {unfolded[:200]!r}",
+                            flush=True,
+                        )
+                    parsed = merged
+        except Exception as ex:  # noqa: BLE001 — never lose a reply to a parser fault
+            if not quiet:
+                print(
+                    f"[maint-mail] {header} header did not parse ({ex!r}) — "
+                    f"falling back to getaddresses: {unfolded[:200]!r}",
+                    flush=True,
+                )
+            parsed = None
+        if parsed is None:
+            parsed = [
+                (n, a) for n, a in getaddresses([unfolded])
+            ]
+        # Both parsers signal "I could not do this" by handing back junk rather than raising:
+        # getaddresses returns [('', '')], and on an unbracketed ``Alice Tan alice@h.com`` it
+        # returns the WHOLE element as the address. Anything that is not a bare addr-spec would
+        # go straight into RCPT TO and be refused, so validate here and let salvage try instead.
+        parsed = [(n, (a or "").strip()) for n, a in parsed]
+        kept = [(n, a) for n, a in parsed if _is_addr_spec(a)]
+        # Salvage whenever ANY element was unusable, not only when they all were. On
+        # ``Alice Tan alice@h.com, bob@h.com`` getaddresses hands back the whole first element as
+        # the address; dropping just that one and keeping bob looks like a clean parse and Alice
+        # is never mailed. Re-derive the whole header per group and re-attach the names we did
+        # recover, so the good half is not thrown away either.
+        if len(kept) < len(parsed) and "@" in unfolded:
+            names = {_normalize_email_address(a): n for n, a in kept}
+            salvaged = _salvage_addresses(unfolded, quiet=quiet)
+            if salvaged:
+                if not quiet:
+                    print(
+                        f"[maint-mail] {header} header is partly malformed — "
+                        f"{len(parsed) - len(kept)} element(s) unusable, salvaged "
+                        f"{len(salvaged)}: {unfolded[:200]!r}",
+                        flush=True,
+                    )
+                kept = [(names.get(_normalize_email_address(a), ""), a) for a in salvaged]
+        parsed = kept
+        if not parsed and "@" in unfolded:
+            # Last resort: a semicolon list, an unbalanced quote, a stray bracket. Returning []
+            # here is the failure this whole function exists to prevent — the Cc silently
+            # disappears and nobody is told. Names are dropped: once the structure is broken a
+            # name cannot be attributed to an address safely.
+            salvaged = _salvage_addresses(unfolded, quiet=quiet)
+            if salvaged:
+                if not quiet:
+                    print(
+                        f"[maint-mail] {header} header is malformed — salvaged "
+                        f"{len(salvaged)} address(es): {unfolded[:200]!r}",
+                        flush=True,
+                    )
+                parsed = [("", a) for a in salvaged]
+        if not parsed and "@" in unfolded and not quiet:
+            # Everything failed. Saying so is the whole contract of this function — a header that
+            # names mailboxes and yields none must never pass unremarked.
+            print(
+                f"[maint-mail] {header} header yielded NO usable address — dropping: "
+                f"{unfolded[:200]!r}",
+                flush=True,
+            )
+        for name, addr in parsed:
+            a = (addr or "").strip()
+            if not _is_addr_spec(a):
+                continue
+            out.append((_clean_display_name(name), a))
+    return out
+
+
+def _dedupe_address_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """First occurrence wins, but a later occurrence carrying a name fills in a blank one."""
+    order: list[str] = []
+    by_key: dict[str, tuple[str, str]] = {}
+    for name, addr in pairs:
+        key = _normalize_email_address(addr)
+        if key not in by_key:
+            by_key[key] = (name, addr)
+            order.append(key)
+        elif name and not by_key[key][0]:
+            by_key[key] = (name, by_key[key][1])
+    return [by_key[k] for k in order]
+
+
+def format_address_pair(name: str, addr: str) -> str:
+    """``"Alice Tan" <a@x.com>`` — what a manual Reply All puts in the header.
+
+    ``formataddr`` with an explicit charset is mandatory: interpolating the name by hand turns
+    ``Tan, Alice`` into two bogus recipients, and a CJK name into an unparseable blob.
+    """
+    n = _clean_display_name(name)
+    if not n:
+        return addr
+    try:
+        return formataddr((n, addr), charset="utf-8")
+    except Exception:  # noqa: BLE001 — a name is never worth losing the address over
+        return addr
+
+
+def _parse_header_address_list(msg: email.message.Message, header: str) -> list[str]:
+    """Unique addr-specs on ``header``, in order. The envelope's source of truth."""
+    return [a for _n, a in _dedupe_address_pairs(_parse_header_pairs(msg, header))]
+
+
+def _parse_header_pairs(msg: email.message.Message, header: str) -> list[tuple[str, str]]:
+    """``(name, addr)`` for every mailbox on ``header``, including repeated header lines."""
+    try:
+        values = msg.get_all(header, [])
+    except Exception:  # noqa: BLE001 — some stub messages only implement get()
+        values = [msg.get(header)]
+    return _dedupe_address_pairs(parse_address_pairs(values, header))
+
+
+def _bad_reply_recipient(addr: str) -> bool:
+    """Addresses a human would never Reply-All to."""
+    key = _normalize_email_address(addr)
+    return "mailer-daemon" in key or key.startswith("postmaster@")
+
+
+_NOREPLY_LOCALPART_RE = re.compile(r"^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|noreply)\b")
+
+
+def _is_undeliverable_recipient(addr: str) -> bool:
+    """A box that announces it does not accept mail — only ever applied when WIDENING.
+
+    The anchor is untouched by this: there ``Reply-To`` already substitutes for a ``no-reply``
+    ``From``, which is what the button does. But a mid-thread message sent from ``no-reply@`` was
+    pulling that address into our Cc, where nothing replaces it and nobody reads it.
+    """
+    if _bad_reply_recipient(addr):
+        return True
+    key = _normalize_email_address(addr)
+    local = key.split("@", 1)[0] if "@" in key else key
+    return bool(_NOREPLY_LOCALPART_RE.match(local))
+
+
+def reply_all_pairs_from_headers(
+    *,
+    from_pairs: list[tuple[str, str]],
+    reply_to_pairs: list[tuple[str, str]],
+    to_pairs: list[tuple[str, str]],
+    cc_pairs: list[tuple[str, str]],
+    exclude: set[str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
+    """The Reply-All contract, on one message's headers. ``(to, cc, envelope)``.
+
+    Exactly what the button does:
+
+    * **To** = ``Reply-To`` if the sender set one, else ``From`` — the sender leads — followed by
+      the original ``To``. ``Reply-To`` SUBSTITUTES for ``From``, it does not add to it; a sender
+      that publishes ``Reply-To: helpdesk@`` while sending as ``no-reply@`` is asking for the
+      reply to go to the desk, and we used to mail the dead no-reply box instead.
+    * **Cc** = the original ``Cc``.
+    * Our own sending mailbox is removed from both; every other participant is kept.
+    * One address appears once, in the more prominent bucket (To wins over Cc).
+    * If To empties out, one recipient is PROMOTED out of Cc — moved, not copied.
+    """
+    seen: set[str] = set()
+
+    def _take(pairs: list[tuple[str, str]], bucket: list[tuple[str, str]]) -> None:
+        for name, addr in pairs:
+            key = _normalize_email_address(addr)
+            if not key or "@" not in key or key in exclude or key in seen:
+                continue
+            if _bad_reply_recipient(addr):
+                continue
+            seen.add(key)
+            bucket.append((name, addr))
+
+    to_out: list[tuple[str, str]] = []
+    cc_out: list[tuple[str, str]] = []
+    _take(list(reply_to_pairs or from_pairs), to_out)
+    _take(list(to_pairs), to_out)
+    _take(list(cc_pairs), cc_out)
+
+    if not to_out and cc_out:
+        to_out = [cc_out.pop(0)]
+
+    envelope = [a for _n, a in to_out + cc_out]
+    if not envelope:
+        raise ValueError("Original email has no To/Cc recipients to reply to")
+    return to_out, cc_out, envelope
+
+
+def _jenkins_reply_all_pairs(
+    orig: email.message.Message,
+    *,
+    exclude: set[str] | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
+    """:func:`reply_all_pairs_from_headers` applied to a parsed message, names intact."""
+    own = _own_smtp_identities() if exclude is None else exclude
+    return reply_all_pairs_from_headers(
+        from_pairs=_parse_header_pairs(orig, "From"),
+        reply_to_pairs=_parse_header_pairs(orig, "Reply-To"),
+        to_pairs=_parse_header_pairs(orig, "To"),
+        cc_pairs=_parse_header_pairs(orig, "Cc"),
+        exclude=own,
+    )
 
 
 def _jenkins_reply_all_recipients(
@@ -1988,66 +2497,19 @@ def _jenkins_reply_all_recipients(
     *,
     exclude: set[str] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
+    """Bare addr-specs form of :func:`_jenkins_reply_all_pairs`.
+
+    Kept because every candidate-SCREENING caller compares addresses. Paths that build outgoing
+    headers use the pairs form so display names survive — a manual Reply All shows
+    ``"Alice Tan" <alice@x.com>``, not a bare addr-spec.
+
+    ``exclude`` defaults to the broad :func:`_own_smtp_identities` so those screening callers keep
+    their behaviour verbatim; paths that actually send pass the narrow
+    :func:`_sending_mailbox_identities` instead, so a colleague who is a genuine participant is
+    not dropped from a thread a manual Reply All would keep them on.
     """
-    Reply-all: every address on original **To** + **Cc** (+ **From** on To).
-
-    ``Cc`` keeps all original Cc lines (even when the same person is also on To).
-    SMTP delivery dedupes so each mailbox gets one message.
-
-    ``exclude`` defaults to the broad :func:`_own_smtp_identities` so *candidate-selection*
-    callers keep their existing behaviour verbatim. Paths that actually build the outgoing
-    headers pass the narrow :func:`_sending_mailbox_identities` instead, so a colleague who is
-    a genuine participant is not dropped from a thread a manual Reply All would keep them on.
-    """
-    own = _own_smtp_identities() if exclude is None else exclude
-    orig_to = _parse_header_address_list(orig, "To")
-    orig_cc = _parse_header_address_list(orig, "Cc")
-    orig_from = _parse_header_address_list(orig, "From")
-
-    def _bad_recipient(addr: str) -> bool:
-        key = _normalize_email_address(addr)
-        if "mailer-daemon" in key or key.startswith("postmaster@"):
-            return True
-        return False
-
-    to_out: list[str] = []
-    to_norm: set[str] = set()
-    for a in list(orig_to) + list(orig_from):
-        if _bad_recipient(a):
-            continue
-        key = _normalize_email_address(a)
-        if key in own or key in to_norm:
-            continue
-        to_norm.add(key)
-        to_out.append(a)
-
-    cc_out: list[str] = []
-    cc_norm: set[str] = set()
-    for a in orig_cc:
-        if _bad_recipient(a):
-            continue
-        key = _normalize_email_address(a)
-        if key in own or key in cc_norm:
-            continue
-        cc_norm.add(key)
-        cc_out.append(a)
-
-    if not to_out and cc_out:
-        to_out = [cc_out[0]]
-        to_norm.add(_normalize_email_address(to_out[0]))
-
-    smtp_seen: set[str] = set()
-    smtp_recipients: list[str] = []
-    for a in to_out + cc_out:
-        key = _normalize_email_address(a)
-        if key in smtp_seen:
-            continue
-        smtp_seen.add(key)
-        smtp_recipients.append(a)
-
-    if not smtp_recipients:
-        raise ValueError("Original email has no To/Cc recipients to reply to")
-    return to_out, cc_out, smtp_recipients
+    to_pairs, cc_pairs, envelope = _jenkins_reply_all_pairs(orig, exclude=exclude)
+    return [a for _n, a in to_pairs], [a for _n, a in cc_pairs], envelope
 
 
 def _apply_in_reply_to_headers(
@@ -2188,7 +2650,12 @@ def send_egs_maintenance_email(
     )
 
 
-JENKINS_DONE_REPLY_TO = (
+# Renamed from JENKINS_DONE_REPLY_TO, which was a lie: nothing has ever emitted a ``Reply-To``
+# header from it (a manual Reply All emits none either, so that is correct). Its ONLY effect is
+# widening :func:`_own_smtp_identities`, i.e. "a message addressed here is one of OURS, not a
+# vendor thread to reply to". It is not in the recipient-exclusion set — see
+# :func:`_sending_mailbox_identities`. The env var keeps its old name for compatibility.
+JENKINS_DONE_OWN_EXTRA_IDENTITY = (
     os.getenv("JENKINS_UPDATE_DONE_REPLY_TO", "").strip() or "junchen@snsoft.my"
 )
 
@@ -2265,12 +2732,20 @@ def _connect_imap_simple(*, timeout: float | None = None) -> imaplib.IMAP4:
 
 
 def _decode_msg_subject(msg: email.message.Message) -> str:
-    raw = msg.get("Subject", "") or ""
-    parts = decode_header(raw)
+    raw = str(msg.get("Subject", "") or "")
+    try:
+        parts = decode_header(raw)
+    except Exception:  # noqa: BLE001 — a subject is never worth an exception to a caller
+        return raw.strip()
     out: list[str] = []
     for frag, enc in parts:
         if isinstance(frag, bytes):
-            out.append(frag.decode(enc or "utf-8", errors="replace"))
+            # _safe_codec, exactly as _decode_mime_header does. Without it a Subject carrying
+            # raw 8-bit bytes raised LookupError('unknown encoding: unknown-8bit'): the scan
+            # loop's bare except then dropped the whole message from the index, so its
+            # participants were never widened into a reply, and on the live path the reply
+            # raised instead of sending.
+            out.append(frag.decode(_safe_codec(enc), errors="replace"))
         else:
             out.append(str(frag))
     return " ".join(out).strip()
@@ -2350,7 +2825,13 @@ def _should_skip_jenkins_reply_thread(*, from_hdr: str, subject: str) -> bool:
 
     When picking a thread for Reply-All, walk **newest → older** until a normal mail.
     """
-    from_cf = (from_hdr or "").casefold()
+    # MARKER test on the DECODED header: two of _BOUNCE_FROM_MARKERS ("mail delivery
+    # subsystem", "mailer-daemon") live in the DISPLAY NAME, and the index now stores the raw
+    # wire form. A bounce arriving as ``From: =?utf-8?Q?Mail_Delivery_Subsystem?=
+    # <bounces@mail.vendor.com>`` that kept the original subject therefore matched nothing and
+    # became an eligible REPLY TARGET. The addr-spec loop below deliberately stays on the raw
+    # value so the address parser still sees wire form.
+    from_cf = (_decode_mime_header(from_hdr) or from_hdr or "").casefold()
     subj_cf = (subject or "").casefold()
     for marker in _BOUNCE_FROM_MARKERS:
         if marker in from_cf:
@@ -2414,9 +2895,10 @@ def _jenkins_message_has_reply_recipients(msg: email.message.Message) -> bool:
     """Can we Reply-All to this at all — i.e. is anyone left after removing ourselves?
 
     Uses the NARROW sending-mailbox set, deliberately, so this answers the same question the
-    send path answers. With the broad set it stripped ``JENKINS_DONE_REPLY_TO`` too, and a mail
-    addressed only to that colleague was reported as "no To/Cc recipients" even though the
-    reply would have been perfectly deliverable to them. Screening and sending must agree.
+    send path answers. With the broad set it stripped ``JENKINS_DONE_OWN_EXTRA_IDENTITY`` too,
+    and a mail addressed only to that colleague was reported as "no To/Cc recipients" even
+    though the reply would have been perfectly deliverable to them. Screening and sending
+    must agree.
 
     Detecting *our own* messages is a different question and still uses the broad set — see
     :func:`_own_smtp_identities`.
@@ -2656,8 +3138,13 @@ _JENKINS_REPLY_SUBJECT_UID_WINDOW = min(
 _JENKINS_REPLY_HEADER_BATCH = min(
     50, max(5, int(os.getenv("JENKINS_REPLY_HEADER_BATCH", "").strip() or "20"))
 )
+# REPLY-TO is here for the same reason it is in _ALLEMAIL_HEADER_FETCH_SPEC: the recipient
+# formula HONOURS Reply-To, so a peek without it screens on a different message than the one we
+# would send. A sender publishing ``From: no-reply@`` + ``Reply-To: helpdesk@`` scored 0
+# recipients on the peek and the live picker rejected the thread with "its To/Cc are empty or
+# invalid" — sending nothing at all for a thread the send path handles fine.
 _REPLY_HEADER_FETCH_SPEC = (
-    "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM TO CC AUTO-SUBMITTED)])"
+    "(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT FROM TO CC REPLY-TO AUTO-SUBMITTED)])"
 )
 
 # --- Jenkins reply robustness (all opt-in via env; safe defaults) ---
@@ -2714,6 +3201,7 @@ def _reply_peek_from_header_text(text: str) -> dict[str, Any]:
     from_raw = _decode_mime_header(msg.get("From")) or ""
     to_raw = _decode_mime_header(msg.get("To")) or ""
     cc_raw = _decode_mime_header(msg.get("Cc")) or ""
+    reply_to_raw = _decode_mime_header(msg.get("Reply-To")) or ""
     auto_submitted = (_decode_mime_header(msg.get("Auto-Submitted")) or "").strip()
     ts = datetime.min.replace(tzinfo=timezone.utc)
     date_raw = (msg.get("Date") or "").strip()
@@ -2731,6 +3219,9 @@ def _reply_peek_from_header_text(text: str) -> dict[str, Any]:
         "from_hdr": from_raw,
         "to_raw": to_raw,
         "cc_raw": cc_raw,
+        # Carried so the screening stubs below can honour Reply-To exactly as the send path
+        # does; absent, screening and sending answer different questions.
+        "reply_to_raw": reply_to_raw,
         "auto_submitted": auto_submitted,
     }
 
@@ -2829,22 +3320,49 @@ def _imap_uid_fetch_headers_batch(
     return result
 
 
-def _headers_have_reply_recipients(
-    to_raw: str, cc_raw: str, from_raw: str
-) -> bool:
-    stub = email.message_from_string(
-        f"To: {to_raw or ''}\nCc: {cc_raw or ''}\nFrom: {from_raw or ''}\n\n"
+def _reply_peek_stub(
+    to_raw: str, cc_raw: str, from_raw: str, reply_to_raw: str = ""
+) -> email.message.Message:
+    """A throwaway message carrying just the peeked address headers.
+
+    Every value is unfolded first: these come straight off the wire, and a folded ``Reply-To``
+    pasted in with its embedded newline would end the header block early — the ``To:`` line
+    after it would parse as BODY and the stub would look like it had no recipients at all,
+    which is the very false negative these screens exist to avoid.
+    """
+
+    def _flat(v: str) -> str:
+        return re.sub(r"\s*\r?\n[ \t]*", " ", (v or "")).strip()
+
+    return email.message_from_string(
+        f"To: {_flat(to_raw)}\nCc: {_flat(cc_raw)}\nFrom: {_flat(from_raw)}\n"
+        f"Reply-To: {_flat(reply_to_raw)}\n\n"
     )
+
+
+def _headers_have_reply_recipients(
+    to_raw: str, cc_raw: str, from_raw: str, reply_to_raw: str = ""
+) -> bool:
+    stub = _reply_peek_stub(to_raw, cc_raw, from_raw, reply_to_raw)
     return _jenkins_message_has_reply_recipients(stub)
 
 
-def _header_reply_recipient_count(to_raw: str, cc_raw: str, from_raw: str) -> int:
-    """Unique SMTP recipients from header peek (To + Cc + From, minus our mailbox)."""
-    stub = email.message_from_string(
-        f"To: {to_raw or ''}\nCc: {cc_raw or ''}\nFrom: {from_raw or ''}\n\n"
-    )
+def _header_reply_recipient_count(
+    to_raw: str, cc_raw: str, from_raw: str, reply_to_raw: str = ""
+) -> int:
+    """Unique SMTP recipients from header peek (To + Cc + From, minus our sending mailbox).
+
+    Narrow exclusion set, like :func:`_jenkins_message_has_reply_recipients`: this number is a
+    tie-break in the live picker's ranking, so with the broad set a thread whose only extra
+    participant is ``JENKINS_DONE_OWN_EXTRA_IDENTITY`` counted one recipient short and could
+    lose the tie — changing WHICH message the reply lands on, not just what a diagnostic says.
+    Counting must agree with sending.
+    """
+    stub = _reply_peek_stub(to_raw, cc_raw, from_raw, reply_to_raw)
     try:
-        _to, _cc, smtp = _jenkins_reply_all_recipients(stub)
+        _to, _cc, smtp = _jenkins_reply_all_recipients(
+            stub, exclude=_sending_mailbox_identities()
+        )
         return len(smtp)
     except ValueError:
         return 0
@@ -2975,6 +3493,7 @@ def _pick_reply_uid_among_candidates(
                 row[2].get("to_raw") or "",
                 row[2].get("cc_raw") or "",
                 row[2].get("from_hdr") or "",
+                row[2].get("reply_to_raw") or "",
             ),
             row[0],
         ),
@@ -2997,10 +3516,11 @@ def _pick_reply_uid_among_candidates(
         from_hdr = h.get("from_hdr") or ""
         to_raw = h.get("to_raw") or ""
         cc_raw = h.get("cc_raw") or ""
+        reply_to_raw = h.get("reply_to_raw") or ""
         reason = ""
         if _should_skip_jenkins_reply_thread(from_hdr=from_hdr, subject=subj):
             reason = "bounce/daemon (headers)"
-        elif not _headers_have_reply_recipients(to_raw, cc_raw, from_hdr):
+        elif not _headers_have_reply_recipients(to_raw, cc_raw, from_hdr, reply_to_raw):
             body_peek = _fetch_body_peek_for_uid(mail, uid, limit=900)
             if _body_is_failed_send_notification(body_peek):
                 reason = 'Failed to send "Re: …" delivery notice (body)'
@@ -3008,7 +3528,9 @@ def _pick_reply_uid_among_candidates(
                 reason = "no To/Cc recipients (headers)"
         else:
             if _header_is_prior_bot_reply(h, own=own):
-                rcpt_n = _header_reply_recipient_count(to_raw, cc_raw, from_hdr)
+                rcpt_n = _header_reply_recipient_count(
+                    to_raw, cc_raw, from_hdr, reply_to_raw
+                )
                 nonlocal bot_with_rcpt, bot_with_rcpt_n
                 if rcpt_n > bot_with_rcpt_n:
                     bot_with_rcpt = uid
@@ -5215,13 +5737,36 @@ def _allemail_parse_header_bytes(raw: bytes, *, folder: str, uid: str) -> dict[s
     """Parse a HEADER.FIELDS fetch into an allemail entry (subject, message_id, From/To/Cc)."""
     msg = email.message_from_bytes(raw or b"")
     subject = _decode_msg_subject(msg)
-    from_raw = _decode_mime_header(msg.get("From")) or ""
-    to_raw = _decode_mime_header(msg.get("To")) or ""
-    cc_raw = _decode_mime_header(msg.get("Cc")) or ""
-    message_id = (msg.get("Message-ID") or "").strip()
-    references = (msg.get("References") or "").strip()
-    auto = (_decode_mime_header(msg.get("Auto-Submitted")) or "").strip()
-    date_raw = (msg.get("Date") or "").strip()
+    # Store the raw WIRE form, not a MIME-decoded one. Decoding first destroys the encoded-word
+    # boundary, so a display name whose decoded text contains a comma can never be re-parsed
+    # correctly afterwards — and it is precisely that case that used to invent a recipient out
+    # of the sender's own display name. `_parse_header_pairs` decodes each name after parsing.
+    # str(): under compat32 msg.get() returns an email.header.Header — not a str — whenever the
+    # header carries raw 8-bit bytes (an unencoded UTF-8 display name, exactly the CJK case).
+    # .strip() on that raised AttributeError and the scan loop's bare except dropped the whole
+    # message from the index without a word.
+    def _hdr_all(name: str) -> str:
+        # A gateway or list expander can emit a SECOND To:/Cc: line. msg.get() returns only the
+        # first, so the cached path lost those recipients while the live path (get_all) kept
+        # them — the same header, two different answers, decided by whether the message happened
+        # to be indexed. Joining with ", " is safe: each value is already a complete address-list.
+        try:
+            vals = msg.get_all(name) or []
+        except Exception:  # noqa: BLE001 — stub messages may only implement get()
+            vals = [msg.get(name)]
+        return ", ".join(v for v in (str(x or "").strip() for x in vals) if v)
+
+    from_raw = _hdr_all("From")
+    to_raw = _hdr_all("To")
+    cc_raw = _hdr_all("Cc")
+    reply_to_raw = _hdr_all("Reply-To")
+    # str() for the same reason as the four raws above: any of these can come back as an
+    # email.header.Header, and .strip() on that dropped the whole message from the index via the
+    # scan loop's bare except — a thread whose root has an 8-bit References became invisible.
+    message_id = str(msg.get("Message-ID") or "").strip()
+    references = str(msg.get("References") or "").strip()
+    auto = (_decode_mime_header(str(msg.get("Auto-Submitted") or "")) or "").strip()
+    date_raw = str(msg.get("Date") or "").strip()
     ts = 0.0
     date_iso = ""
     if date_raw:
@@ -5239,9 +5784,10 @@ def _allemail_parse_header_bytes(raw: bytes, *, folder: str, uid: str) -> dict[s
         now = datetime.now(timezone.utc)
         ts = now.timestamp()
         date_iso = now.isoformat()
-    to_list = [a for _n, a in getaddresses([to_raw]) if a and "@" in a]
-    cc_list = [a for _n, a in getaddresses([cc_raw]) if a and "@" in a]
-    from_list = [a for _n, a in getaddresses([from_raw]) if a and "@" in a]
+    to_pairs = _dedupe_address_pairs(parse_address_pairs([to_raw], "To"))
+    cc_pairs = _dedupe_address_pairs(parse_address_pairs([cc_raw], "Cc"))
+    from_pairs = _dedupe_address_pairs(parse_address_pairs([from_raw], "From"))
+    reply_to_pairs = _dedupe_address_pairs(parse_address_pairs([reply_to_raw], "Reply-To"))
     return {
         "subject": subject,
         "message_id": message_id,
@@ -5249,9 +5795,22 @@ def _allemail_parse_header_bytes(raw: bytes, *, folder: str, uid: str) -> dict[s
         "from_raw": from_raw,
         "to_raw": to_raw,
         "cc_raw": cc_raw,
-        "from": from_list,
-        "to": to_list,
-        "cc": cc_list,
+        "reply_to_raw": reply_to_raw,
+        # Entries written before this change stored *_raw already MIME-DECODED. Re-parsing one of
+        # those as if it were wire form is the decode-then-parse order that INVENTS a recipient
+        # out of the sender's own display name, so entry_address_pairs must be able to tell them
+        # apart. Absent marker = legacy = never re-parse the raw.
+        "raw_is_wire": True,
+        # Names alongside the bare lists: the bare ones stay the key every existing reader uses,
+        # the pairs let the reply reproduce "Alice Tan" <a@x> the way the button does.
+        "from_pairs": from_pairs,
+        "to_pairs": to_pairs,
+        "cc_pairs": cc_pairs,
+        "reply_to_pairs": reply_to_pairs,
+        "from": [a for _n, a in from_pairs],
+        "to": [a for _n, a in to_pairs],
+        "cc": [a for _n, a in cc_pairs],
+        "reply_to": [a for _n, a in reply_to_pairs],
         "date": date_iso,
         "date_ts": ts,
         "auto_submitted": auto,
@@ -5475,8 +6034,8 @@ def allemail_store_message(
     if not _allemail_enabled():
         return
     try:
-        mid = (orig.get("Message-ID") or "").strip()
-        date_raw = (orig.get("Date") or "").strip()
+        mid = str(orig.get("Message-ID") or "").strip()
+        date_raw = str(orig.get("Date") or "").strip()
         ts = 0.0
         date_iso = ""
         if date_raw:
@@ -5494,16 +6053,26 @@ def allemail_store_message(
         entry = {
             "subject": _decode_msg_subject(orig),
             "message_id": mid,
-            "references": (orig.get("References") or "").strip(),
-            "from_raw": _decode_mime_header(orig.get("From")) or "",
-            "to_raw": _decode_mime_header(orig.get("To")) or "",
-            "cc_raw": _decode_mime_header(orig.get("Cc")) or "",
+            "references": str(orig.get("References") or "").strip(),
+            # Raw wire form, matching _allemail_parse_header_bytes — see the note there.
+            "from_raw": str(orig.get("From") or "").strip(),
+            "to_raw": str(orig.get("To") or "").strip(),
+            "cc_raw": str(orig.get("Cc") or "").strip(),
+            "reply_to_raw": str(orig.get("Reply-To") or "").strip(),
+            "raw_is_wire": True,
+            "from_pairs": _parse_header_pairs(orig, "From"),
+            "to_pairs": _parse_header_pairs(orig, "To"),
+            "cc_pairs": _parse_header_pairs(orig, "Cc"),
+            "reply_to_pairs": _parse_header_pairs(orig, "Reply-To"),
             "from": _parse_header_address_list(orig, "From"),
             "to": _parse_header_address_list(orig, "To"),
             "cc": _parse_header_address_list(orig, "Cc"),
+            "reply_to": _parse_header_address_list(orig, "Reply-To"),
             "date": date_iso,
             "date_ts": ts,
-            "auto_submitted": (_decode_mime_header(orig.get("Auto-Submitted")) or "").strip(),
+            "auto_submitted": (
+                _decode_mime_header(str(orig.get("Auto-Submitted") or "")) or ""
+            ).strip(),
             "folder": folder,
             "uid": (uid or "").strip(),
         }
@@ -5526,18 +6095,94 @@ def _allemail_entry_stub(entry: dict[str, Any]) -> email.message.Message:
     header lines into the stub.
     """
     stub = email.message.Message()
-    to_list = entry.get("to") or []
-    cc_list = entry.get("cc") or []
-    from_list = entry.get("from") or []
-    if not from_list and entry.get("from_raw"):
-        from_list = [a for _n, a in getaddresses([entry.get("from_raw") or ""]) if a and "@" in a]
-    if to_list:
-        stub["To"] = ", ".join(to_list)
-    if cc_list:
-        stub["Cc"] = ", ".join(cc_list)
-    if from_list:
-        stub["From"] = ", ".join(from_list)
+    for header, field in (("To", "to"), ("Cc", "cc"), ("From", "from"), ("Reply-To", "reply_to")):
+        pairs = entry_address_pairs(entry, field)
+        if pairs:
+            stub[header] = ", ".join(format_address_pair(n, a) for n, a in pairs)
     return stub
+
+
+# A plain dict, not an OrderedDict: dicts have been insertion-ordered since 3.7 and give the same
+# FIFO semantics, while OrderedDict leaks ~0.25 kB per insert under sustained insert+evict churn
+# (measured +97 MB over 2M inserts at a fixed 200k cap, versus flat for a dict).
+_legacy_recovery_seen: dict[tuple[str, str, str], bool] = {}
+
+
+def _note_legacy_recovery(entry: dict[str, Any], header: str) -> None:
+    """One line per (folder, uid, header), not one per index rebuild.
+
+    ``_allemail_match_view`` re-runs the eligibility pass over the WHOLE index every time the
+    60s top-up invalidates the cache, so an unconditional print here was ~1.8M journal lines a
+    day on a store with a few percent of legacy headers.
+    """
+    key = (str(entry.get("folder") or ""), str(entry.get("uid") or ""), header)
+    if key in _legacy_recovery_seen:
+        return
+    _legacy_recovery_seen[key] = True
+    # Evict oldest, never wipe: clearing the whole set made the line re-fire on every rebuild
+    # for any store with more than ~1250 legacy entries — which is precisely the state the hour
+    # after a deploy, and worse than the flood the rate limit exists to prevent.
+    while len(_legacy_recovery_seen) > 200000:
+        del _legacy_recovery_seen[next(iter(_legacy_recovery_seen))]
+    print(
+        f"[allemail] recovered {header} address(es) from a legacy index entry "
+        f"({key[0]}/{key[1]}) — run `allemail-scan` to re-index properly",
+        flush=True,
+    )
+
+
+def entry_address_pairs(entry: dict[str, Any], field: str) -> list[tuple[str, str]]:
+    """``(name, addr)`` for ``to`` / ``cc`` / ``from`` / ``reply_to`` on an index entry.
+
+    Three shapes have to work at once: entries written by the current scanner (``*_pairs``),
+    entries written before names were indexed (bare ``to``/``cc`` lists), and entries whose only
+    surviving fidelity is the raw header. Re-parsing ``*_raw`` when the pairs are absent is what
+    lets an index written before the parser fix recover a Cc it had dropped, without a re-scan.
+    """
+    pairs = entry.get(f"{field}_pairs")
+    if isinstance(pairs, list) and pairs:
+        out: list[tuple[str, str]] = []
+        for p in pairs:
+            if not isinstance(p, (list, tuple)) or len(p) != 2:
+                continue
+            addr = str(p[1] or "").strip()
+            if _is_addr_spec(addr):
+                out.append((_clean_display_name(str(p[0] or "")), addr))
+        if out:
+            return _dedupe_address_pairs(out)
+    raw = entry.get(f"{field}_raw")
+    header = {"to": "To", "cc": "Cc", "from": "From", "reply_to": "Reply-To"}.get(field, "To")
+    has_raw = isinstance(raw, str) and bool(raw.strip())
+    if entry.get("raw_is_wire") and has_raw:
+        # quiet: this runs over the WHOLE index on every 60s view rebuild. The scanner already
+        # logged any parse trouble once, at index time, where it is actionable.
+        parsed = _dedupe_address_pairs(parse_address_pairs([raw], header, quiet=True))
+        if parsed:
+            return parsed
+    plain = entry.get(field) if isinstance(entry.get(field), list) else []
+    stored = [a for a in plain if str(a or "").strip()]
+    bare = _dedupe_address_pairs(
+        [("", str(a).strip()) for a in stored if _is_addr_spec(str(a))]
+    )
+    # Recover when ANY stored element was unusable, not only when they all were — the same rule
+    # parse_address_pairs uses. The old scanner kept every getaddresses element containing '@',
+    # so 'Dave Wong dave@custa.com' was stored verbatim; _is_addr_spec drops it, leaving a
+    # non-empty-but-short list, and dave was never mailed again.
+    if bare and len(bare) >= len(stored):
+        return bare
+    # LEGACY entries (written before `raw_is_wire`) hold an already-MIME-DECODED raw, so parsing
+    # it is the decode-then-parse order that can read an address out of a display name. Consult
+    # it ONLY when the stored list is empty — i.e. exactly the entries the old parser truncated
+    # to nothing, where the alternative is replying to nobody. Because salvage now works per
+    # comma group and prefers the bracketed address, the two known display-name traps
+    # ("Support, billing@vendor.com <real@vendor.com>" and "X <a@v> via b@v <real@v>") yield only
+    # the real address. It can recover, it cannot widen.
+    if has_raw:
+        recovered = _dedupe_address_pairs(parse_address_pairs([raw], header, quiet=True))
+        if recovered:
+            _note_legacy_recovery(entry, header)
+            return recovered
+    return bare
 
 
 def _allemail_entry_reply_recipients(
@@ -5546,14 +6191,31 @@ def _allemail_entry_reply_recipients(
     for_send: bool = False,
 ) -> tuple[list[str], list[str], list[str]] | None:
     """``for_send=True`` builds the real recipient list (drops only our sending mailbox);
-    the default is the broad candidate-screening set — see :func:`_jenkins_reply_all_recipients`."""
+    the default is the broad candidate-screening set — see :func:`_jenkins_reply_all_recipients`.
+
+    **Every** caller now passes ``for_send=True``. The default is kept only so the signature
+    does not change, and should stay unused: the callers that took it — ``debug_allemail_list``,
+    ``debug_allemail_why`` and the eligibility gate — each reported "no Reply-All recipients"
+    for threads the send path replies to, because they subtracted a colleague the send path
+    keeps. A diagnostic that disagrees with production sends the operator hunting the wrong bug.
+    """
+    # Straight from the stored pairs. Routing through _allemail_entry_stub +
+    # _jenkins_reply_all_recipients formatted four headers and then re-parsed them with
+    # HeaderRegistry, re-deriving what the scanner had already parsed — ~3.7 parses per entry,
+    # over the WHOLE index, every time the 60s top-up invalidates the view cache (measured 2.8x
+    # slower index rebuild). It was also lossy: a display name the parser rejects came back as a
+    # different address after the round trip.
     try:
-        return _jenkins_reply_all_recipients(
-            _allemail_entry_stub(entry),
-            exclude=_sending_mailbox_identities() if for_send else None,
+        to_pairs, cc_pairs, envelope = reply_all_pairs_from_headers(
+            from_pairs=entry_address_pairs(entry, "from"),
+            reply_to_pairs=entry_address_pairs(entry, "reply_to"),
+            to_pairs=entry_address_pairs(entry, "to"),
+            cc_pairs=entry_address_pairs(entry, "cc"),
+            exclude=_sending_mailbox_identities() if for_send else _own_smtp_identities(),
         )
     except ValueError:
         return None
+    return [a for _n, a in to_pairs], [a for _n, a in cc_pairs], envelope
 
 
 def _auto_submitted_blocks_reply(auto_submitted: str) -> bool:
@@ -5576,9 +6238,19 @@ def _allemail_subject_is_reply_or_forward(subject: str) -> bool:
     return bool(re.match(r"^\s*(?:re|fw|fwd|aw)\s*:", (subject or ""), re.I))
 
 
-def _allemail_from_is_own(from_raw: str) -> bool:
+def _allemail_from_is_own(from_raw: str, entry: dict[str, Any] | None = None) -> bool:
+    """Is this message from us? Prefers the entry's ALREADY-PARSED From.
+
+    Called once per entry on every ``_allemail_match_view`` rebuild, i.e. over the whole index
+    every 60s. Re-parsing ``from_raw`` there meant a full RFC 5322 parse per entry plus, for the
+    very common ``=?utf-8?B?…?=<addr>`` form that HeaderRegistry rejects, an unrate-limited
+    "header did not parse" line per entry per rebuild.
+    """
     own = _own_smtp_identities()
-    for _n, addr in getaddresses([from_raw or ""]):
+    pairs = entry_address_pairs(entry, "from") if isinstance(entry, dict) else []
+    if not pairs:
+        pairs = parse_address_pairs([from_raw or ""], "From", quiet=True)
+    for _n, addr in pairs:
         if _normalize_email_address(addr) in own:
             return True
     return False
@@ -5602,7 +6274,7 @@ def _allemail_entry_ineligible_reason(e: dict[str, Any]) -> str | None:
     "not found".
     """
     subj = e.get("subject") or ""
-    if _allemail_from_is_own(e.get("from_raw", "")):
+    if _allemail_from_is_own(e.get("from_raw", ""), e):
         return "you sent it yourself (From is our own mailbox)"
     if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
         return "it is a bounce / mailer-daemon notice"
@@ -5651,29 +6323,131 @@ def _allemail_match_view() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return entries, idf_table
 
 
+def _allemail_entry_participants(
+    entry: dict[str, Any], *, fields: tuple[str, ...] = ("from", "to", "cc", "reply_to")
+) -> set[str]:
+    """Non-own addresses on an entry, normalised.
+
+    Own addresses are excluded using the BROAD :func:`_own_smtp_identities`: our mailbox is on
+    virtually every message in the index, so counting it would make "shares a participant" true
+    for any two messages at all — which is exactly the unbounded matching the caller's overlap
+    test exists to stop.
+
+    ``fields`` narrows it. The subject-only thread gate passes ``("from", "to")`` on purpose: a
+    shared **Cc** is usually a distribution or role box (``ops-list@vendor.com``), and two
+    unrelated customers who are both Cc'd on the same list and whose template subject matches
+    byte-for-byte were being merged into one thread — every stranger on the other customer's mail
+    then widened into our Cc. Being addressed to or from the same person is real evidence of one
+    conversation; sharing a mailing list is not.
+    """
+    own = _own_smtp_identities()
+    out: set[str] = set()
+    for field in fields:
+        for _name, addr in entry_address_pairs(entry, field):
+            key = _normalize_email_address(addr)
+            if key and key not in own:
+                out.add(key)
+    return out
+
+
 def _allemail_thread_members(entry: dict[str, Any]) -> list[dict[str, Any]]:
     """Every indexed message belonging to the same conversation as ``entry``, newest first.
 
     Matched on the *conversation* rather than the subject: the ``References`` chain first, then
-    the root ``Message-ID`` that later replies point back at, then the normalised subject body.
-    A ``Re:``-prefixed reply and its original therefore land in one list.
+    the root ``Message-ID`` that later replies point back at, then — bounded — the normalised
+    subject body. A ``Re:``-prefixed reply and its original therefore land in one list.
+
+    The two Message-ID tests are the trustworthy ones and are unconditional:
+
+    * **descendants** — ``mid == entry`` or the entry's id appears in that message's
+      ``References``;
+    * **ancestors** — that message's id appears in the ENTRY's ``References``. This direction
+      is not theoretical: the resolver regularly lands on a mid-thread reply, because
+      :func:`subject_match.member_order` can only prefer a non-reply among the ELIGIBLE members
+      and the thread root is ineligible whenever we sent it ourselves. From such an entry the
+      descendant test can never see the root.
+
+    The subject fallback is the untrustworthy one, and is now bounded. It used to admit any
+    indexed message whose prefix-stripped subject matched byte-for-byte — no id link, no
+    participant overlap, no date bound — while on this mailbox the subject is a template reused
+    verbatim per site and per date. Two unrelated customer requests collided, and since thread
+    participants are widened into **Cc**, the collision mailed the other customer's people. A
+    subject-only member must now also (i) share a non-own participant with the entry, (ii) sit
+    within ``ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS`` (defaults to
+      ``ALLEMAIL_REPLY_MAX_AGE_DAYS``, currently 14) of it, and (iii) not be a ``Fwd:`` —
+    ``strip_reply_prefixes`` strips ``Fwd:`` too, so a forward to outside parties looked like a
+    thread member. Every subject-only admission and rejection is logged with its reason, so a
+    person who did not get the mail is a grep away.
     """
     root_mid = _normalize_message_id(entry.get("message_id") or "")
+    # Only ``References`` — ``In-Reply-To`` is fetched but not indexed, and a direct reply
+    # carries its parent's id in References anyway.
+    entry_refs = {
+        _normalize_message_id(x) for x in (entry.get("references") or "").split() if x.strip()
+    }
+    entry_refs.discard("")
     root_body = subject_match.match_normalize(
         subject_match.strip_reply_prefixes(entry.get("subject") or "")[0]
     )
+    self_key = _allemail_entry_key(entry)
+    entry_ts = float(entry.get("date_ts") or 0.0)
+    participants = _allemail_entry_participants(entry, fields=("from", "to"))
     entries, _idf = _allemail_match_view()
     out: list[dict[str, Any]] = []
     for e in entries:
         refs = {_normalize_message_id(x) for x in (e.get("references") or "").split() if x.strip()}
         mid = _normalize_message_id(e.get("message_id") or "")
-        same = False
-        if root_mid and (mid == root_mid or root_mid in refs):
-            same = True
-        elif root_body and e.get("_t", {}).get("body") == root_body:
-            same = True
-        if same:
+        # The entry itself always belongs to its own thread — never let a gate below (an entry
+        # whose own subject is a Fwd:, say) drop it and hand the anchor slot to another message.
+        if _allemail_entry_key(e) == self_key:
             out.append(e)
+            continue
+        if root_mid and (mid == root_mid or root_mid in refs):
+            out.append(e)
+            continue
+        if mid and mid in entry_refs:
+            print(
+                f"[allemail] thread: +ancestor {(e.get('folder') or '?')}/{e.get('uid') or '?'} "
+                f"mid={mid} (in the entry's References)",
+                flush=True,
+            )
+            out.append(e)
+            continue
+        if not (root_body and (e.get("_t") or {}).get("body") == root_body):
+            continue
+        # Subject-only candidate: everything below is the bound.
+        label = (
+            f"{(e.get('folder') or '?')}/{e.get('uid') or '?'} "
+            f"date={(e.get('date') or '?')[:10]}"
+        )
+        e_ts = float(e.get("date_ts") or 0.0)
+        delta_d = abs(entry_ts - e_ts) / 86400.0 if (entry_ts > 0 and e_ts > 0) else -1.0
+        shared = participants & _allemail_entry_participants(e, fields=("from", "to"))
+        reason = ""
+        if (e.get("_t") or {}).get("is_fwd"):
+            reason = "it is a Fwd: (a forward is addressed to outside parties, not the thread)"
+        elif delta_d < 0:
+            reason = "one of the two messages has no usable Date"
+        elif delta_d > _ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS:
+            reason = (
+                f"{delta_d:.1f}d apart > {_ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS}d window "
+                "(ALLEMAIL_THREAD_SUBJECT_WINDOW_DAYS)"
+            )
+        elif not shared:
+            reason = "no shared non-own From/To participant (a shared Cc list is not evidence)"
+        if reason:
+            print(
+                f"[allemail] thread: REJECTED subject-only {label} — {reason}; "
+                f"subject={(e.get('subject') or '')!r}",
+                flush=True,
+            )
+            continue
+        print(
+            f"[allemail] thread: +subject-only {label} — shares "
+            f"{', '.join(sorted(shared))} and is {delta_d:.1f}d away",
+            flush=True,
+        )
+        out.append(e)
     out.sort(key=lambda e: float(e.get("date_ts") or 0.0), reverse=True)
     return out
 
@@ -5698,19 +6472,37 @@ def _allemail_thread_quote_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return members[0] if members else entry
 
 
-def _allemail_thread_reply_all_recipients(
+def _allemail_thread_reply_all_pairs(
     entry: dict[str, Any],
-) -> tuple[list[str], list[str], list[str]] | None:
-    """Reply-All across the WHOLE conversation, not just the one message we resolved to.
+    *,
+    provenance: dict[str, Any] | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]] | None:
+    """Reply-All on the thread, bucketed exactly as the button would, then widened into Cc.
 
-    A manual Reply All addresses the message you happen to be reading. That is wrong for a
-    "deployment done" notice: the people who need it are everyone on the request thread, and
-    the message the resolver landed on may be a later reply with a much narrower To/Cc — which
-    is exactly how a reply reached one colleague instead of the three original requesters.
+    Two rules, and the split between them is the whole point:
 
-    So: union To + Cc + From over every indexed message in the thread, drop our own sending
-    address and obvious daemons, and keep first-seen order (the original's recipients lead).
-    ``To`` is the union of every To plus every From; ``Cc`` is everyone else.
+    * **Placement comes from the ANCHOR alone** — the newest message in the conversation that
+      is not one of OURS, i.e. the one a human would have open when they click Reply All (our
+      own ``Sent`` copy is not it). Its ``Reply-To``/``From`` and
+      its ``To`` become our To; its ``Cc`` becomes our Cc. The old code unioned every member
+      oldest-first behind a single ``seen`` set, so the FIRST message that ever mentioned an
+      address fixed that address's bucket forever: someone Cc'd on the original request and
+      later promoted to To stayed in our Cc, and vice versa. That is the "the Cc is wrong"
+      half of the complaint.
+    * **Everyone else on the thread is still reached, but only in Cc.** A "deployment done"
+      notice belongs to the people who asked for it, and the resolver may have landed on a late
+      reply with a much narrower To/Cc — that is how a reply once reached one colleague instead
+      of three requesters. Widening can only ADD, and only into Cc, so it can never invert a
+      bucket or displace someone the button would have put in To.
+
+    Returns ``(to_pairs, cc_pairs, envelope)`` with display names intact, or ``None``.
+
+    Pass a dict as ``provenance`` to have it filled with ``anchor`` / ``anchor_label`` /
+    ``anchor_skipped_ours`` (newer members passed over because we sent them) /
+    ``members`` / ``member_count`` / ``anchor_to`` / ``anchor_cc`` / ``widened`` (address →
+    the member label it came from) / ``excluded_as_ours``. It is write-only and never changes
+    what is returned — it exists so the dry-run preview and the send audit line can say WHERE
+    each recipient came from instead of the operator having to reconstruct it.
     """
     try:
         members = _allemail_thread_members(entry)
@@ -5720,30 +6512,154 @@ def _allemail_thread_reply_all_recipients(
         members = [entry]
     exclude = _sending_mailbox_identities()
 
-    def _ok(a: str) -> bool:
-        key = _normalize_email_address(a)
-        if not key or "@" not in key or key in exclude:
-            return False
-        return "mailer-daemon" not in key and not key.startswith("postmaster@")
+    # _allemail_thread_members sorts newest first; the anchor is the message a human would have
+    # open — which is never one of OUR OWN. ``Sent`` is in the default scanned folder set, so
+    # the copy of our own auto-reply (or the operator's manual Reply All) was routinely the
+    # newest member and drove To/Cc placement: with our Sent copy on top, dave@custa.com was
+    # demoted out of To even though the newest CUSTOMER message has him there. Nobody was lost
+    # — widening keeps everyone in Cc — but it is exactly the mis-bucketing the anchor rule
+    # exists to prevent. Skip ours, and fall back to members[0] when the whole thread is ours.
+    own_ids = _own_smtp_identities()
 
-    to_out: list[str] = []
-    cc_out: list[str] = []
-    seen: set[str] = set()
-    # Oldest first so the original request's recipients lead the list.
+    def _from_is_ours(m: dict[str, Any]) -> bool:
+        m_from = entry_address_pairs(m, "from")
+        return bool(m_from) and all(
+            _normalize_email_address(a) in own_ids for _n, a in m_from
+        )
+
+    self_key = _allemail_entry_key(entry)
+
+    def _label(m: dict[str, Any]) -> str:
+        return f"{(m.get('folder') or '?')}/{m.get('uid') or '?'}"
+
+    def _is_foreign_fwd(m: dict[str, Any]) -> bool:
+        # The RESOLVED entry is exempt: if the mail we were told to answer is itself a Fwd:,
+        # that is the message a human would have open, and its To/Cc are the right placement.
+        return bool((m.get("_t") or {}).get("is_fwd")) and _allemail_entry_key(m) != self_key
+
+    # Anchor preference, strongest first. A forward is refused at BOTH levels rather than only in
+    # the first pass: the widening loop below already refuses to widen from one because its
+    # recipients are outside parties, and anchoring is strictly worse — the anchor sets **To**,
+    # so a forward left as the fallback put two strangers in To and demoted a real participant.
+    anchor = None
+    anchor_skipped_ours: list[str] = []
+    anchor_skipped_fwd: list[str] = []
+    for m in members:
+        if _from_is_ours(m):
+            anchor_skipped_ours.append(_label(m))
+            continue
+        if _is_foreign_fwd(m):
+            anchor_skipped_fwd.append(_label(m))
+            continue
+        anchor = m
+        break
+    if anchor is None:
+        # Nobody else's non-forward message. Our own newest is the next best placement — it
+        # reproduces the To/Cc a human would see replying to their own last message — and only
+        # if every single member is a forward do we fall back to the resolved entry itself.
+        anchor = next((m for m in members if not _is_foreign_fwd(m)), None) or entry
+        anchor_skipped_ours = [x for x in anchor_skipped_ours if x != _label(anchor)]
+        anchor_skipped_fwd = [x for x in anchor_skipped_fwd if x != _label(anchor)]
+    try:
+        to_pairs, cc_pairs, _env = reply_all_pairs_from_headers(
+            from_pairs=entry_address_pairs(anchor, "from"),
+            reply_to_pairs=entry_address_pairs(anchor, "reply_to"),
+            to_pairs=entry_address_pairs(anchor, "to"),
+            cc_pairs=entry_address_pairs(anchor, "cc"),
+            exclude=exclude,
+        )
+    except ValueError:
+        to_pairs, cc_pairs = [], []
+
+    anchor_to = list(to_pairs)
+    anchor_cc = list(cc_pairs)
+    widened: dict[str, str] = {}
+    excluded_as_ours: set[str] = set()
+
+    seen = {_normalize_email_address(a) for _n, a in to_pairs + cc_pairs}
+    # Oldest first so the original request's participants lead the widened block.
     for e in sorted(members, key=lambda x: float(x.get("date_ts") or 0.0)):
-        for field, bucket in (("to", to_out), ("from", to_out), ("cc", cc_out)):
-            for a in e.get(field) or []:
-                key = _normalize_email_address(a)
-                if not _ok(a) or key in seen:
+        if e is anchor:
+            continue
+        e_label = f"{(e.get('folder') or '?')}/{e.get('uid') or '?'}"
+        if (e.get("_t") or {}).get("is_fwd"):
+            # Membership can keep a forward (it threads, and it may be the newest body worth
+            # quoting) but we must never WIDEN from one: a Fwd: is addressed to outside parties,
+            # so its recipients are exactly the strangers a manual Reply All would not include.
+            print(
+                f"[allemail] thread: not widening from {e_label} — it is a Fwd: "
+                "(addressed to outside parties)",
+                flush=True,
+            )
+            continue
+        # Both From AND Reply-To, unlike the anchor. Substituting one for the other here would
+        # drop a real human: a colleague who wrote in the thread and set Reply-To to a desk
+        # address is still a participant, and losing participants is the complaint this whole
+        # change set exists to fix. What must not come along is a box that announces it does not
+        # accept mail — see _is_undeliverable_recipient.
+        for field in ("to", "from", "cc", "reply_to"):
+            for name, addr in entry_address_pairs(e, field):
+                if _is_undeliverable_recipient(addr):
+                    continue
+                key = _normalize_email_address(addr)
+                if not key:
+                    continue
+                if key in exclude:
+                    excluded_as_ours.add(key)
+                    continue
+                if key in seen:
+                    continue
+                if _bad_reply_recipient(addr):
                     continue
                 seen.add(key)
-                bucket.append(a)
-    if not to_out and cc_out:
-        to_out = [cc_out.pop(0)]
-    recipients = to_out + [a for a in cc_out if a not in to_out]
-    if not recipients:
+                cc_pairs.append((name, addr))
+                widened[key] = f"{e_label}:{field}"
+
+    if not to_pairs and cc_pairs:
+        to_pairs = [cc_pairs.pop(0)]
+    envelope = [a for _n, a in to_pairs + cc_pairs]
+    if provenance is not None:
+        provenance.update(
+            anchor=anchor,
+            anchor_label=f"{(anchor.get('folder') or '?')}/{anchor.get('uid') or '?'}",
+            anchor_skipped_ours=anchor_skipped_ours,
+            anchor_skipped_fwd=anchor_skipped_fwd,
+            members=members,
+            member_count=len(members),
+            anchor_to=anchor_to,
+            anchor_cc=anchor_cc,
+            widened=widened,
+            excluded_as_ours=sorted(
+                excluded_as_ours
+                | {
+                    k
+                    for k in (
+                        _normalize_email_address(a)
+                        for _n, a in (
+                            entry_address_pairs(anchor, "from")
+                            + entry_address_pairs(anchor, "to")
+                            + entry_address_pairs(anchor, "cc")
+                            + entry_address_pairs(anchor, "reply_to")
+                        )
+                    )
+                    if k in exclude
+                }
+            ),
+        )
+    if not envelope:
         return None
-    return to_out, cc_out, recipients
+    return to_pairs, cc_pairs, envelope
+
+
+def _allemail_thread_reply_all_recipients(
+    entry: dict[str, Any],
+) -> tuple[list[str], list[str], list[str]] | None:
+    """Bare addr-spec form of :func:`_allemail_thread_reply_all_pairs`."""
+    got = _allemail_thread_reply_all_pairs(entry)
+    if got is None:
+        return None
+    to_pairs, cc_pairs, envelope = got
+    return [a for _n, a in to_pairs], [a for _n, a in cc_pairs], envelope
 
 
 def resolve_reply_target(title: str) -> subject_match.Res:
@@ -5801,6 +6717,9 @@ def _send_jenkins_reply_all(
     orig_references: str,
     quote_source: email.message.Message | None = None,
     folder: str = "",
+    anchor_label: str = "",
+    thread_members: int = 0,
+    excluded_as_ours: list[str] | None = None,
 ) -> tuple[bool, dict[str, str]]:
     """Build + send the Reply-All, threading in the original via In-Reply-To.
 
@@ -5811,7 +6730,10 @@ def _send_jenkins_reply_all(
     old plain-text body, so a reply is never lost just because quoting failed.
 
     ``folder`` is only carried through to the SMTP log line so a send can be traced back to
-    the thread it answered; it changes nothing about the message.
+    the thread it answered; it changes nothing about the message. ``anchor_label`` /
+    ``thread_members`` / ``excluded_as_ours`` are likewise log-only provenance for the
+    ``RCPT-AUDIT`` line below — they answer "why did Eve not get this?" from a grep instead of
+    an investigation, and default to empty so no caller is obliged to supply them.
 
     Returns ``(quoted, refused)``: whether the sent mail carried the quoted thread, and the
     recipients the server REJECTED — ``{address: "550 No such user"}``, empty on a clean send.
@@ -5839,6 +6761,9 @@ def _send_jenkins_reply_all(
         msg = MIMEText(body, "plain", "utf-8")
     _set_subject_header(msg, reply_subject)
     msg["From"] = formataddr((FORWARD_FROM_NAME, MAIL_USER))
+    # ``to_addrs`` / ``cc_addrs`` may carry display names ("Alice Tan" <a@x>) — that is what a
+    # manual Reply All shows, and formataddr has already encoded any non-ASCII name. The SMTP
+    # ENVELOPE (``recipients``) stays bare addr-specs regardless.
     msg["To"] = ", ".join(to_addrs)
     if cc_addrs:
         msg["Cc"] = ", ".join(cc_addrs)
@@ -5851,12 +6776,25 @@ def _send_jenkins_reply_all(
         msg["References"] = f"{refs} {omid}".strip() if refs else omid
     ctx = ssl.create_default_context()
     # Serialise before connecting: a MIME/encoding fault here never touched the wire.
-    payload = msg.as_string()
-    # smtplib.sendmail() normalises the line endings and ascii-encodes the body BEFORE it opens
-    # the transaction — that is exactly why UnicodeEncodeError counts as pre-delivery above.
-    # smtp.data() only encodes after the server's 354, so do it here instead or the explicit
-    # phases below would re-tag a bad header as "maybe sent" and block the retry that fixes it.
-    wire = re.sub(r"(?:\r\n|\r|\n)", "\r\n", payload).encode("ascii")
+    #
+    # maxheaderlen matters now that names are preserved: 30 recipients with display names is a
+    # ~1.7 kB ``To:`` line, and RFC 5322 caps a line at 998 octets. as_string() does NOT fold by
+    # default, so a wide Reply All produced an over-long header that a strict MTA may reject or
+    # truncate — taking the tail of the recipient list with it.
+    #
+    # ascii-encode here, not in smtp.data(): sendmail() encodes before opening the transaction,
+    # which is why UnicodeEncodeError counts as pre-delivery. Doing it after the server's 354
+    # would re-tag a bad header as "maybe sent" and block the retry that fixes it.
+    try:
+        payload = msg.as_string(maxheaderlen=78)
+        wire = re.sub(r"(?:\r\n|\r|\n)", "\r\n", payload).encode("ascii")
+    except Exception as ex:  # noqa: BLE001 — nothing has touched the wire yet
+        print(
+            f"[maint-mail] SMTP FAIL (pre-serialise) subject={reply_subject!r} "
+            f"rcpt={len(recipients)} err={ex!r}",
+            flush=True,
+        )
+        raise
     sent_msgid = (msg.get("Message-ID") or "").strip()
     _sig = f"subject={reply_subject!r} msgid={sent_msgid} rcpt={len(recipients)}"
     # Only failures that can leave the message mid-transaction may be re-tagged as
@@ -5871,7 +6809,10 @@ def _send_jenkins_reply_all(
             SMTP_HOST, SMTP_PORT, timeout=IMAP_TIMEOUT, context=ctx
         ) as smtp:
             smtp.login(MAIL_USER, MAIL_PASSWORD)
-            if all(callable(getattr(smtp, ph, None)) for ph in ("mail", "rcpt", "data")):
+            if all(
+                callable(getattr(smtp, ph, None))
+                for ph in ("mail", "rcpt", "data", "putcmd", "getreply", "send")
+            ):
                 # Drive MAIL FROM / RCPT TO / DATA by hand instead of sendmail(). sendmail()
                 # is one opaque call, so the "handed over" flag had to be set before it — and a
                 # disconnect during RCPT TO, strictly before any body byte moved, was then
@@ -5911,12 +6852,36 @@ def _send_jenkins_reply_all(
                     # pre-DATA, so it stays recoverable.
                     _smtp_rset_quietly(smtp)
                     raise smtplib.SMTPRecipientsRefused(raw_refused)
+                # DATA is TWO exchanges, and smtp.data() hides the seam: it issues the verb and
+                # reads the 354 before a single body byte moves. Setting the flag before that
+                # call meant a disconnect while waiting for the 354 — nothing transmitted —
+                # raised SMTPServerDisconnected, which is not in _SMTP_PRE_DELIVERY_ERRORS, so
+                # the generic handler re-tagged it "maybe sent" and blocked the retry that
+                # would have worked. That is the exact failure these hand-driven phases exist
+                # to eliminate. So drive the 354 ourselves and flip the flag only once the body
+                # is genuinely on its way.
+                smtp.putcmd("data")
+                icode, iresp = smtp.getreply()
+                if icode != 354:
+                    if icode == 421 and callable(getattr(smtp, "close", None)):
+                        smtp.close()  # service closing: QUIT on __exit__ would mask this
+                    else:
+                        _smtp_rset_quietly(smtp)
+                    # SMTPDataError is already pre-delivery, so a refused DATA stays retryable.
+                    raise smtplib.SMTPDataError(icode, iresp)
                 sent_attempted = True
-                data_reply = smtp.data(wire) or (250, b"")
+                # Byte-for-byte what smtplib.data() would put on the wire: dot-stuffing
+                # (RFC 5321 §4.5.2) and the CRLF "." CRLF terminator. ``wire`` is already
+                # CRLF-normalised and ascii-encoded above.
+                dotted = re.sub(rb"(?m)^\.", b"..", wire)
+                if not dotted.endswith(b"\r\n"):
+                    dotted += b"\r\n"
+                smtp.send(dotted + b".\r\n")
+                data_reply = smtp.getreply() or (250, b"")
                 if data_reply[0] != 250:
-                    # smtp.data() RETURNS the final reply where sendmail() raises on it. Left
-                    # unchecked, a body the server rejected outright (552 too big) would be
-                    # reported as delivered — the exact "card posted, no mail sent" silence
+                    # The post-body reply is RETURNED, not raised, where sendmail() raises on
+                    # it. Left unchecked, a body the server rejected outright (552 too big)
+                    # would be reported as delivered — the "card posted, no mail sent" silence
                     # this whole change is about. SMTPDataError keeps it pre-delivery, so the
                     # taxonomy above is unchanged.
                     if data_reply[0] == 421 and callable(getattr(smtp, "close", None)):
@@ -5949,6 +6914,21 @@ def _send_jenkins_reply_all(
     # was posted but no mail arrived" had nothing to check against.
     print(
         f"[maint-mail] SMTP OK {_sig} refused={len(refused)} folder={folder!r}",
+        flush=True,
+    )
+    # Per-address provenance, one greppable line. "Eve didn't get it" has four possible
+    # answers — she was never on the thread, she was dropped as one of ours, the server
+    # refused her, or she was there all along and the mail is in her spam — and until this
+    # line existed none of them could be told apart after the fact.
+    print(
+        # Diagnostic fields FIRST, bulk recipient lists last: at 200 recipients this line is
+        # ~18 kB, and if journald ever truncates it the half worth keeping is the tail of
+        # refused/excluded, not a second copy of the To/Cc already logged above.
+        f"[maint-mail] RCPT-AUDIT msgid={sent_msgid} "
+        f"anchor={(anchor_label or folder or '?')} members={thread_members} "
+        f"n_to={len(to_addrs)} n_cc={len(cc_addrs)} refused={sorted(refused)!r} "
+        f"excluded_as_ours={sorted(excluded_as_ours or [])!r} subject={reply_subject!r} "
+        f"to={to_addrs!r} cc={cc_addrs!r}",
         flush=True,
     )
     if refused:
@@ -6115,6 +7095,7 @@ def _thread_newest_quote(
     subject: str,
     references: str = "",
     not_older_than: float = 0.0,
+    anchor_headers: email.message.Message | None = None,
 ) -> tuple[email.message.Message | None, dict[str, Any] | None]:
     """The NEWEST message in this conversation, re-read from IMAP. ``(message, entry)``.
 
@@ -6134,7 +7115,32 @@ def _thread_newest_quote(
         return None, None
     try:
         members = _allemail_thread_members(
-            {"message_id": message_id, "subject": subject, "references": references}
+            {
+                "message_id": message_id,
+                "subject": subject,
+                "references": references,
+                # The subject fallback in _allemail_thread_members is now bounded by date and
+                # participant overlap, and this synthetic entry has to carry both or every
+                # subject-only sibling is rejected for "no usable Date" and the live path
+                # quietly loses its collapsible thread. ``not_older_than`` IS this message's
+                # own timestamp. The bound matters here for more than tidiness: quoting is
+                # what puts another message's BODY inside our reply, so an unbounded
+                # same-subject match could paste one customer's mail into another's.
+                "date_ts": not_older_than,
+                # str(): msg.get() returns an email.header.Header for a raw 8-bit header, and
+                # .strip() on that raised AttributeError — swallowed below, so the live path
+                # silently lost its collapsible thread for exactly the senders the rest of this
+                # work hardened for. raw_is_wire because these values ARE the wire form; without
+                # it entry_address_pairs took the legacy branch and told the operator on every
+                # single reply to run allemail-scan for an index that was never stale.
+                "raw_is_wire": True,
+                "from_raw": str(anchor_headers.get("From") or "").strip() if anchor_headers else "",
+                "to_raw": str(anchor_headers.get("To") or "").strip() if anchor_headers else "",
+                "cc_raw": str(anchor_headers.get("Cc") or "").strip() if anchor_headers else "",
+                "reply_to_raw": (
+                    str(anchor_headers.get("Reply-To") or "").strip() if anchor_headers else ""
+                ),
+            }
         )
     except Exception as ex:  # noqa: BLE001 — falling back to the anchor is always valid
         print(f"[allemail] thread-latest lookup failed: {ex!r}", flush=True)
@@ -6245,13 +7251,22 @@ def _reply_jenkins_update_done_email_via_cache(
         cached = res.target
         if not cached:
             raise JenkinsReplyNeedsChoiceError(title, res)
-    # Reply-All means everyone on the CONVERSATION, not only the message we resolved to.
-    recips = _allemail_thread_reply_all_recipients(cached)
-    if recips is None:
-        recips = _allemail_entry_reply_recipients(cached, for_send=True)
-    if recips is None:
+    # Placement from the anchor, widening into Cc — see _allemail_thread_reply_all_pairs.
+    prov: dict[str, Any] = {}
+    pairs = _allemail_thread_reply_all_pairs(cached, provenance=prov)
+    if pairs is None:
+        try:
+            pairs = _jenkins_reply_all_pairs(
+                _allemail_entry_stub(cached), exclude=_sending_mailbox_identities()
+            )
+        except ValueError:
+            pairs = None
+    if pairs is None:
         return None
-    to_addrs, cc_addrs, recipients = recips
+    to_pairs, cc_pairs, recipients = pairs
+    # Header form keeps the display names; the SMTP envelope stays bare addr-specs.
+    to_addrs = [format_address_pair(n, a) for n, a in to_pairs]
+    cc_addrs = [format_address_pair(n, a) for n, a in cc_pairs]
     subj = _reply_subject(cached.get("subject") or title)
     cached_mid_raw = (cached.get("message_id") or "").strip()
     # `<>` is degenerate: it would produce In-Reply-To: <> and an unmatchable header search.
@@ -6324,6 +7339,9 @@ def _reply_jenkins_update_done_email_via_cache(
         orig_references=orig_refs,
         quote_source=quote_src,
         folder=cached_folder,
+        anchor_label=prov.get("anchor_label") or f"{cached_folder}/{cached_uid}",
+        thread_members=int(prov.get("member_count") or 1),
+        excluded_as_ours=list(prov.get("excluded_as_ours") or []),
     )
     envs = ", ".join(c[0] for c in completions)
     level = "" if quoted else "⚠️ "
@@ -6610,9 +7628,11 @@ def reply_jenkins_update_done_email(
             f"Reply to a thread that has an external sender or recipient. "
             f"Folder(s) searched: {', '.join(JENKINS_REPLY_IMAP_FOLDERS)}."
         )
-    to_addrs, cc_addrs, recipients = _jenkins_reply_all_recipients(
+    to_pairs, cc_pairs, recipients = _jenkins_reply_all_pairs(
         orig, exclude=_sending_mailbox_identities()
     )
+    to_addrs = [format_address_pair(n, a) for n, a in to_pairs]
+    cc_addrs = [format_address_pair(n, a) for n, a in cc_pairs]
     subj = _reply_subject(_decode_msg_subject(orig))
     # The picker's last-resort pass can hand back one of OUR OWN prior auto-replies. Quoting
     # that would nest our history-quote-wrapper inside the new one, which no manual Reply All
@@ -6655,6 +7675,7 @@ def reply_jenkins_update_done_email(
             subject=_decode_msg_subject(orig),
             references=(orig.get("References") or "").strip(),
             not_older_than=_message_date_ts(orig),
+            anchor_headers=orig,
         )
         if newest_src is not None:
             # Thread on what we quote, exactly as the cache path does.
@@ -6678,6 +7699,23 @@ def reply_jenkins_update_done_email(
         orig_references=(anchor.get("References") or "").strip(),
         quote_source=quote_src if _JENKINS_REPLY_QUOTE_THREAD else None,
         folder=orig_folder,
+        # The live path has no index behind it, so there is exactly one member: the message
+        # the picker chose. Saying members=1 is honest — it is the reason a live-path reply
+        # is narrower than a cache-path one on the same thread.
+        anchor_label=f"{orig_folder}/{orig_uid}",
+        thread_members=1,
+        excluded_as_ours=sorted(
+            {
+                _normalize_email_address(a)
+                for _n, a in (
+                    _parse_header_pairs(orig, "From")
+                    + _parse_header_pairs(orig, "Reply-To")
+                    + _parse_header_pairs(orig, "To")
+                    + _parse_header_pairs(orig, "Cc")
+                )
+            }
+            & _sending_mailbox_identities()
+        ),
     )
     # Index the found original so the NEXT reply to this subject is an instant cache hit —
     # with its UID, so that reply can fetch it directly instead of searching by Message-ID.
@@ -8531,7 +9569,12 @@ def debug_allemail_list(filter_text: str = "", *, limit: int = 60) -> int:
     from collections import Counter
 
     by_folder = Counter(e.get("folder") or "?" for e in entries)
-    usable_total = sum(1 for e in entries if _allemail_entry_reply_recipients(e) is not None)
+    # for_send=True: the SEND path drops only our sending mailbox, so the broad default made
+    # this count (and the USABLE flag below) report "no Reply-All recipients" for threads the
+    # send path answers happily — a diagnostic that disagrees with production is worse than none.
+    usable_total = sum(
+        1 for e in entries if _allemail_entry_reply_recipients(e, for_send=True) is not None
+    )
     print(
         f"index: {len(entries)} entries  ({_allemail_retention_label()})  "
         f"folders: {', '.join(f'{k}={v}' for k, v in by_folder.most_common())}",
@@ -8546,16 +9589,21 @@ def debug_allemail_list(filter_text: str = "", *, limit: int = 60) -> int:
         subj = e.get("subject") or ""
         usable = (
             not _allemail_subject_is_reply_or_forward(subj)
-            and not _allemail_from_is_own(e.get("from_raw", ""))
+            and not _allemail_from_is_own(e.get("from_raw", ""), e)
             and not _should_skip_jenkins_reply_thread(
                 from_hdr=e.get("from_raw", ""), subject=subj
             )
             and not _auto_submitted_blocks_reply(e.get("auto_submitted") or "")
-            and _allemail_entry_reply_recipients(e) is not None
+            and _allemail_entry_reply_recipients(e, for_send=True) is not None
         )
+        # DECODE before truncating. from_raw is the raw wire header now, so a CJK sender
+        # rendered as ``=?utf-8?B?5p2O5Zub…`` with the address cut off entirely — and this
+        # column exists so a human can tell two same-subject threads apart. Truncating first
+        # would slice an encoded word in half and leave it undecodable.
+        who = _decode_mime_header(e.get("from_raw") or "")
         print(
             f"  {(e.get('date') or '')[:10]}  {'USABLE  ' if usable else 'not-target'}  "
-            f"{(e.get('folder') or '?'):<14} {(e.get('from_raw') or '')[:34]:<34} {subj}",
+            f"{(e.get('folder') or '?'):<14} {who[:34]:<34} {subj}",
             flush=True,
         )
     if len(shown) > limit:
@@ -8606,18 +9654,23 @@ def debug_allemail_why(needle: str) -> int:
             why.append(f"subject score {score} — needle is not contained in this subject")
         if _allemail_subject_is_reply_or_forward(subj):
             why.append("subject is a Re:/Fw:")
-        if _allemail_from_is_own(e.get("from_raw", "")):
+        if _allemail_from_is_own(e.get("from_raw", ""), e):
             why.append("From is one of our own addresses")
         if _should_skip_jenkins_reply_thread(from_hdr=e.get("from_raw", ""), subject=subj):
             why.append("bounce / mailer-daemon")
         auto = (e.get("auto_submitted") or "").strip().casefold()
         if auto and auto != "no":
             why.append(f"Auto-Submitted={auto}")
-        if _allemail_entry_reply_recipients(e) is None:
-            why.append("no Reply-All recipients left after removing our own addresses")
+        # for_send=True — the same set the send path excludes. With the broad default this
+        # line accused entries of having no recipients that a real reply reaches fine.
+        if _allemail_entry_reply_recipients(e, for_send=True) is None:
+            why.append("no Reply-All recipients left after removing our own sending address")
+        # Decoded before truncating — see debug_allemail_list; the raw wire header truncates
+        # to an encoded blob with the address gone.
+        who = _decode_mime_header(e.get("from_raw") or "")
         print(
             f"  {(e.get('date') or '')[:10]}  score={score:>4}  uid={e.get('uid') or '-':>8}  "
-            f"{(e.get('folder') or '?'):<14} {(e.get('from_raw') or '')[:36]:<36} "
+            f"{(e.get('folder') or '?'):<14} {who[:36]:<36} "
             + ("USABLE" if not why else "REJECTED: " + "; ".join(why)),
             flush=True,
         )
@@ -8686,7 +9739,22 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
         cached_uid=(cached.get("uid") or "").strip(),
         cached_subject=cached.get("subject") or "",
     )
-    real = _allemail_entry_reply_recipients(cached, for_send=True)
+    # Mirror the real send: _allemail_thread_reply_all_pairs, with the single-entry formula
+    # only as the fallback — exactly as _reply_jenkins_update_done_email_via_cache does. This
+    # line used to print the single-entry formula ALONE, so on any multi-member thread the
+    # "real reply would go to" list was strictly narrower than what production delivers, and a
+    # test send reassured the operator about a recipient set that was never going to be used.
+    prov: dict[str, Any] = {}
+    real_pairs = _allemail_thread_reply_all_pairs(cached, provenance=prov)
+    real_formula = "thread (anchor placement + widened Cc)"
+    if real_pairs is None:
+        try:
+            real_pairs = _jenkins_reply_all_pairs(
+                _allemail_entry_stub(cached), exclude=_sending_mailbox_identities()
+            )
+            real_formula = "single-entry FALLBACK (thread formula returned nothing)"
+        except ValueError:
+            real_pairs = None
     subj = _reply_subject(cached.get("subject") or t)
     body = (
         "Hi team,\n\nDone <environment>\nRemarks : <time>\n\n"
@@ -8696,8 +9764,35 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
 
     print(f"Subject:     {subj}", flush=True)
     print(f"Quote route: {route}", flush=True)
-    if real:
-        print(f"Real reply would go to: {', '.join(real[2])}", flush=True)
+    if real_pairs:
+        real_to, real_cc, real_env = real_pairs
+        print(
+            f"Real reply anchor: {prov.get('anchor_label') or '(single entry)'} "
+            f"— newest of {prov.get('member_count', 1)} thread member(s), "
+            f"formula: {real_formula}",
+            flush=True,
+        )
+        if prov.get("anchor_skipped_fwd"):
+            print(
+                f"  (skipped as Fwd:: {', '.join(prov['anchor_skipped_fwd'])})",
+                flush=True,
+            )
+        if prov.get("anchor_skipped_ours"):
+            print(
+                f"  (skipped as ours: {', '.join(prov['anchor_skipped_ours'])})",
+                flush=True,
+            )
+        print(
+            f"Real reply To: {', '.join(format_address_pair(n, a) for n, a in real_to) or '(none)'}",
+            flush=True,
+        )
+        print(
+            f"Real reply Cc: {', '.join(format_address_pair(n, a) for n, a in real_cc) or '(none)'}",
+            flush=True,
+        )
+        print(f"Real reply envelope: {', '.join(real_env)}", flush=True)
+    else:
+        print("Real reply would go to: (nothing — no usable recipient)", flush=True)
     print(f"*** TEST SEND — delivering ONLY to: {dest} ***", flush=True)
 
     quoted, refused = _send_jenkins_reply_all(
@@ -8710,6 +9805,10 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
         orig_references=cached.get("references") or "",
         quote_source=quote_src,
         folder=(cached.get("folder") or "").strip(),
+        # A test send deliberately overrides the recipients, so members=1: the audit line must
+        # not claim this reached a thread it never went near.
+        anchor_label=f"{(cached.get('folder') or '?')}/{cached.get('uid') or '?'} (TEST SEND)",
+        thread_members=1,
     )
     print(
         f"Sent to {dest} — quoted={quoted} threaded={bool(mid)} refused={refused or '{}'}.\n"
@@ -8729,6 +9828,12 @@ def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
     lookup, the Reply-All recipient computation, the IMAP re-read of the original, and the Lark
     quote HTML. It reads IMAP but never writes and never sends.
 
+    The recipients printed here are computed with :func:`_allemail_thread_reply_all_pairs`,
+    the SAME call the real send makes, with the single-entry formula as the same fallback.
+    It used to use the single-entry formula ONLY, so a dry run under-reported who would be
+    mailed — which is precisely why the "the reply reached fewer people than Reply All" bug
+    needed an investigation instead of one preview.
+
     Exit codes: 0 = built with the quoted thread, 1 = no reply target, 2 = built unquoted.
     """
     t = (title or "").strip()
@@ -8743,15 +9848,48 @@ def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
     if not cached:
         print(
             f"NO cache match for {t!r} — the live IMAP search would run instead "
-            "(slow on large folders). Try `allemail-scan` first.",
+            "(slow on large folders), and THIS PREVIEW CANNOT SHOW IT: the live path picks its "
+            "target over IMAP and there is nothing here to preview. Run `allemail-scan` (or "
+            "`allemail-why` to see why the subject did not resolve) and try again.",
             flush=True,
         )
         return 1
-    recips = _allemail_entry_reply_recipients(cached, for_send=True)
-    if recips is None:
-        print("Cache hit has no usable Reply-All recipients.", flush=True)
+
+    # Mirror the send path exactly: thread pairs first, single-entry formula only as fallback
+    # — see _reply_jenkins_update_done_email_via_cache.
+    prov: dict[str, Any] = {}
+    pairs = _allemail_thread_reply_all_pairs(cached, provenance=prov)
+    formula = "thread (anchor placement + widened Cc)"
+    if pairs is None:
+        try:
+            pairs = _jenkins_reply_all_pairs(
+                _allemail_entry_stub(cached), exclude=_sending_mailbox_identities()
+            )
+            formula = "single-entry FALLBACK (thread formula returned nothing)"
+        except ValueError:
+            pairs = None
+    if pairs is None:
+        print(
+            "Cache hit has no usable Reply-All recipients — every address on the thread is "
+            "one of ours, so nothing would be sent.",
+            flush=True,
+        )
         return 1
-    to_addrs, cc_addrs, recipients = recips
+    to_pairs, cc_pairs, recipients = pairs
+    to_addrs = [format_address_pair(n, a) for n, a in to_pairs]
+    cc_addrs = [format_address_pair(n, a) for n, a in cc_pairs]
+
+    # The anchor-only set: what a manual Reply All on the anchor alone would produce. Printing
+    # it beside the final set is what makes the widening visible instead of surprising.
+    anchor_entry = prov.get("anchor") or cached
+    try:
+        a_to_pairs, a_cc_pairs, _a_env = _jenkins_reply_all_pairs(
+            _allemail_entry_stub(anchor_entry), exclude=_sending_mailbox_identities()
+        )
+    except ValueError:
+        a_to_pairs, a_cc_pairs = [], []
+    anchor_to = [format_address_pair(n, a) for n, a in a_to_pairs]
+    anchor_cc = [format_address_pair(n, a) for n, a in a_cc_pairs]
 
     mid_raw = (cached.get("message_id") or "").strip()
     mid = mid_raw if _normalize_message_id(mid_raw) else ""
@@ -8766,10 +9904,56 @@ def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
     body = (
         "Hi team,\n\nDone <environment>\nRemarks : <time>\n\nBest Regards,\nJC\n"
     )
+    members = prov.get("members") or []
+    widened = prov.get("widened") or {}
     print(f"Subject:   {_reply_subject(cached.get('subject') or t)}", flush=True)
     print(f"From:      {formataddr((FORWARD_FROM_NAME, MAIL_USER))}", flush=True)
-    print(f"To:        {', '.join(to_addrs) or '(none)'}", flush=True)
-    print(f"Cc:        {', '.join(cc_addrs) or '(none)'}", flush=True)
+    print(f"Resolved:  {cached.get('folder')!r}/{cached.get('uid')!r} "
+          f"date={(cached.get('date') or '?')[:10]}", flush=True)
+    print(
+        f"Anchor:    {prov.get('anchor_label') or '(single entry)'} "
+        f"date={(anchor_entry.get('date') or '?')[:10]} "
+        f"— newest of {prov.get('member_count', 1)} thread member(s) considered",
+        flush=True,
+    )
+    if prov.get("anchor_skipped_fwd"):
+        print(
+            f"           passed over as Fwd:: {', '.join(prov['anchor_skipped_fwd'])}",
+            flush=True,
+        )
+    if prov.get("anchor_skipped_ours"):
+        # Otherwise "why is the anchor not the newest message?" has no visible answer.
+        print(
+            f"           passed over as OURS: {', '.join(prov['anchor_skipped_ours'])}",
+            flush=True,
+        )
+    for m in members:
+        mark = "*" if m is anchor_entry else " "
+        print(
+            f"   {mark} {(m.get('date') or '?')[:10]} "
+            f"{(m.get('folder') or '?')}/{m.get('uid') or '?'} "
+            f"{(m.get('subject') or '')[:64]!r}",
+            flush=True,
+        )
+    print(f"Formula:   {formula}", flush=True)
+    print("", flush=True)
+    print(f"ANCHOR-ONLY To: {', '.join(anchor_to) or '(none)'}", flush=True)
+    print(f"ANCHOR-ONLY Cc: {', '.join(anchor_cc) or '(none)'}", flush=True)
+    print(f"FINAL To:  {', '.join(to_addrs) or '(none)'}", flush=True)
+    print(f"FINAL Cc:  {', '.join(cc_addrs) or '(none)'}", flush=True)
+    if widened:
+        print(
+            "Δ widened into Cc: "
+            + "; ".join(f"{addr} ← {src}" for addr, src in sorted(widened.items())),
+            flush=True,
+        )
+    else:
+        print("Δ widened into Cc: (none — the anchor already had everyone)", flush=True)
+    if prov.get("excluded_as_ours"):
+        print(
+            f"excluded as ours: {', '.join(prov['excluded_as_ours'])}",
+            flush=True,
+        )
     print(f"Envelope:  {', '.join(recipients)}", flush=True)
     print(f"In-Reply-To: {mid or '(none — reply would NOT be threaded)'}", flush=True)
     print(f"Folder/UID: {cached.get('folder')!r}/{cached.get('uid')!r}", flush=True)
@@ -9024,11 +10208,49 @@ if __name__ == "__main__":
         _t = _rest
         _hit = _allemail_reply_lookup(_t)
         if _hit:
+            # RAW beside PARSED, on adjacent lines. A raw header listing three mailboxes next
+            # to a parsed list of zero is the whole parsing bug in one screen — that used to
+            # take an IMAP session to see, because only the parsed lists were printed.
             print(
-                f"MATCH subject={_hit.get('subject')!r} mid={_hit.get('message_id')!r}\n"
-                f"  From: {_hit.get('from_raw')!r}\n  To: {_hit.get('to')!r}\n  Cc: {_hit.get('cc')!r}",
+                f"MATCH subject={_hit.get('subject')!r} mid={_hit.get('message_id')!r} "
+                f"{_hit.get('folder')!r}/{_hit.get('uid')!r} "
+                f"date={(_hit.get('date') or '?')[:10]}",
                 flush=True,
             )
+            for _label, _field in (
+                ("From", "from"),
+                ("To", "to"),
+                ("Cc", "cc"),
+                ("Reply-To", "reply_to"),
+            ):
+                _raw = _hit.get(f"{_field}_raw")
+                _parsed = [a for _n, a in entry_address_pairs(_hit, _field)]
+                _flag = (
+                    "  ⚠️ raw is non-empty but nothing parsed out of it"
+                    if (_raw or "").strip() and not _parsed
+                    else ""
+                )
+                print(
+                    f"  {_label + ' raw:':<16}"
+                    f"{(_raw if _raw is not None else '(not indexed)')!r}",
+                    flush=True,
+                )
+                print(f"  {_label + ' parsed:':<16}{_parsed!r}{_flag}", flush=True)
+            _prov: dict[str, Any] = {}
+            _pairs = _allemail_thread_reply_all_pairs(_hit, provenance=_prov)
+            if _pairs is None:
+                print("  WOULD SEND: (nothing — no usable recipient)", flush=True)
+            else:
+                _to_p, _cc_p, _env = _pairs
+                print(
+                    f"  WOULD SEND To: {[format_address_pair(n, a) for n, a in _to_p]!r}\n"
+                    f"  WOULD SEND Cc: {[format_address_pair(n, a) for n, a in _cc_p]!r}\n"
+                    f"  WOULD SEND envelope: {_env!r}\n"
+                    f"  anchor={_prov.get('anchor_label')} "
+                    f"members={_prov.get('member_count')} "
+                    f"widened_into_cc={sorted((_prov.get('widened') or {}))!r}",
+                    flush=True,
+                )
             raise SystemExit(0)
         print(f"NO MATCH for {_t!r} in allemail.json", flush=True)
         raise SystemExit(1)
