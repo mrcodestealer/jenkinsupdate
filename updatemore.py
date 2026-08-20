@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
+import time
 from typing import Any, Callable
 
 UPDATEMORE_CMD_RE = re.compile(r"/updatemore\b", re.I)
@@ -13,6 +15,56 @@ UPDATEMORE_CMD_RE = re.compile(r"/updatemore\b", re.I)
 # Per-chat ``/updatemore`` queue — survives when jenkinsupdate is unavailable (fallback path).
 _chat_updatemore_queues: dict[str, dict[str, Any]] = {}
 _chat_updatemore_lock = threading.Lock()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = (os.getenv(name) or "").strip()
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+# A queue lives in ``_chat_updatemore_queues`` keyed by chat id alone and nothing on the happy
+# path deletes it, so an abandoned (or merely finished) run used to sit there forever and absorb
+# the NEXT callback in that chat — the RC-UAT-UPDATE #315 incident: a matching subject was
+# recorded into a long-dead batch, came back "pending", and no email was ever sent.
+QUEUE_TTL_SEC = _env_float("UPDATEMORE_QUEUE_TTL_SEC", 6 * 3600.0)
+# In-process guard against the same completion being replied to twice (the HTTP callback and the
+# Lark text fallback both reach handle_jenkins_email_done, and neither can see the other).
+REPLY_DEDUPE_TTL_SEC = _env_float("JENKINS_REPLY_DEDUPE_TTL_SEC", 900.0)
+_recent_replies: dict[str, float] = {}
+_recent_replies_lock = threading.Lock()
+
+
+def _reply_dedupe_claim(key: str) -> float:
+    """Claim ``key`` for :data:`REPLY_DEDUPE_TTL_SEC`. Returns 0.0 on a fresh claim, else its age."""
+    k = (key or "").strip()
+    if not k:
+        return 0.0
+    now = time.time()
+    with _recent_replies_lock:
+        for old, ts in list(_recent_replies.items()):
+            if now - ts > REPLY_DEDUPE_TTL_SEC:
+                _recent_replies.pop(old, None)
+        prev = _recent_replies.get(k)
+        if prev is not None:
+            return max(now - prev, 0.001)
+        _recent_replies[k] = now
+    return 0.0
+
+
+def _reply_dedupe_release(key: str) -> None:
+    """Drop a claim so a failed attempt can be retried immediately."""
+    k = (key or "").strip()
+    if not k:
+        return
+    with _recent_replies_lock:
+        _recent_replies.pop(k, None)
+
+
+def _log(msg: str) -> None:
+    print(f"[updatemore] {msg}", flush=True)
 _SAME_MARKER = "same"
 _NOT_SAME_MARKERS = frozenset({"not same", "notsame"})
 _SEGMENT_MARKERS = frozenset({_SAME_MARKER, *_NOT_SAME_MARKERS})
@@ -402,11 +454,57 @@ def sync_chat_updatemore_queue(chat_id: str, q: dict[str, Any] | None) -> None:
             _chat_updatemore_queues[cid] = q
 
 
-def persist_queue(q: dict[str, Any] | None) -> None:
-    """Persist in-memory queue mutations to the per-chat fallback store."""
+def release_chat_queue(chat_id: str, q: dict[str, Any] | None) -> bool:
+    """Drop ``q`` from the per-chat store, but only while that store still holds it.
+
+    The mirror of :func:`persist_queue_if_current`, and needed for the same reason: the store is
+    keyed by chat id alone, so an unconditional clear from a run that is retiring ALSO evicted a
+    second ``/updatemore``'s live queue — and a run with no entry in that store then reads as
+    superseded, so it never arms its watch and its customer email never goes out.
+    """
+    cid = (chat_id or "").strip() or str((q or {}).get("chat_id") or "").strip()
+    if not cid:
+        return False
+    if not isinstance(q, dict):
+        # Nothing identified to release. Popping "whatever is there" is exactly the unguarded
+        # clear this function exists to replace, so refuse rather than quietly reinstate it.
+        return False
+    with _chat_updatemore_lock:
+        cur = _chat_updatemore_queues.get(cid)
+        if cur is None:
+            return False
+        if cur is not q:
+            _log(f"release skipped for chat={cid!r} — the store holds a different queue")
+            return False
+        _chat_updatemore_queues.pop(cid, None)
+    return True
+
+
+def persist_queue_if_current(q: dict[str, Any] | None) -> bool:
+    """Persist ``q`` to the per-chat fallback store, but only while that store still holds it.
+
+    This is the ONLY way a running segment should write the store back. ``init_queue`` claims the
+    chat and ``clear_queue_from_session`` releases it, both through
+    :func:`sync_chat_updatemore_queue`; everything in between must go through here.
+
+    ``_chat_updatemore_queues`` is keyed by chat id ALONE, so a caller that checked ownership
+    against its own ``chat_id:sender_id`` session row cannot see a newer queue parked by a second
+    ``/updatemore`` — least of all one started by a different user in the same chat. An
+    unconditional write from a finishing run then overwrote that newer queue in the one store the
+    reply path falls back to, and the newer run's customer email was never sent.
+    """
     if not isinstance(q, dict) or q.get("stopped"):
-        return
-    sync_chat_updatemore_queue(str(q.get("chat_id") or ""), q)
+        return False
+    cid = str(q.get("chat_id") or "").strip()
+    if not cid:
+        return False
+    with _chat_updatemore_lock:
+        cur = _chat_updatemore_queues.get(cid)
+        if cur is not None and cur is not q:
+            _log(f"persist skipped for chat={cid!r} — a newer queue owns the per-chat store")
+            return False
+        _chat_updatemore_queues[cid] = q
+    return True
 
 
 def queue_owner_session_key(q: dict[str, Any] | None) -> str | None:
@@ -437,6 +535,7 @@ def init_queue(
         "email_batches": build_email_batch_state(segments),
         "email_watches": [],
         "skip_build": bool(skip_build),
+        "created_at": time.time(),
     }
     if skip_build:
         register_email_batch_watches(q, segments)
@@ -541,11 +640,21 @@ def segment_has_email(q: dict[str, Any]) -> bool:
     return bool((seg.get("email_subject") or "").strip())
 
 
-def clear_queue_from_session(sess: dict[str, Any]) -> None:
+def clear_queue_from_session(sess: dict[str, Any], chat_id: str = "") -> None:
+    """Retire a queue: mark it stopped, then drop it from the session AND the per-chat store.
+
+    ``stopped`` is set FIRST so any other thread already holding a reference to this dict sees a
+    dead queue; and ``chat_id`` may be passed because a queue built without one used to survive in
+    ``_chat_updatemore_queues`` forever (``sync_chat_updatemore_queue`` returns early on "").
+    """
     q = sess.get("updatemore_queue") if isinstance(sess, dict) else None
+    cid = (chat_id or "").strip()
     if isinstance(q, dict):
-        sync_chat_updatemore_queue(str(q.get("chat_id") or ""), None)
-    sess.pop("updatemore_queue", None)
+        q["stopped"] = True
+        cid = cid or str(q.get("chat_id") or "").strip()
+        release_chat_queue(cid, q)
+    if isinstance(sess, dict):
+        sess.pop("updatemore_queue", None)
 
 
 def cancel_active_updatemore_in_chat(
@@ -563,7 +672,7 @@ def cancel_active_updatemore_in_chat(
             if not isinstance(sess, dict):
                 continue
             if get_queue(sess):
-                clear_queue_from_session(sess)
+                clear_queue_from_session(sess, chat_id)
                 cleared = True
     cid = (chat_id or "").strip()
     with _chat_updatemore_lock:
@@ -573,6 +682,16 @@ def cancel_active_updatemore_in_chat(
     return cleared
 
 
+def queue_is_expired(q: dict[str, Any] | None) -> bool:
+    """True when a queue is older than :data:`QUEUE_TTL_SEC` (0 disables expiry)."""
+    if not isinstance(q, dict) or QUEUE_TTL_SEC <= 0:
+        return False
+    started = q.get("created_at")
+    if not isinstance(started, (int, float)) or started <= 0:
+        return False
+    return (time.time() - float(started)) > QUEUE_TTL_SEC
+
+
 def _find_chat_fallback_queue(chat_id: str) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Queue stored via :func:`sync_chat_updatemore_queue` when jenkins sessions are gone."""
     cid = (chat_id or "").strip()
@@ -580,9 +699,64 @@ def _find_chat_fallback_queue(chat_id: str) -> tuple[str | None, dict[str, Any] 
         return None, None, None
     with _chat_updatemore_lock:
         q = _chat_updatemore_queues.get(cid)
+        if isinstance(q, dict) and queue_is_expired(q):
+            # An abandoned run must not keep eating this chat's callbacks. Reap it here rather
+            # than only on the (rarely reached) success path.
+            q["stopped"] = True
+            _chat_updatemore_queues.pop(cid, None)
+            _log(
+                f"fallback queue for chat={cid!r} expired after "
+                f"{QUEUE_TTL_SEC:.0f}s — reaped"
+            )
+            q = None
     if isinstance(q, dict) and not q.get("stopped"):
         return None, q, {"updatemore_queue": q}
     return None, None, None
+
+
+def queue_owns_email(q: dict[str, Any] | None, email_title: str) -> bool:
+    """True when *this* queue is the one that should absorb a completion for ``email_title``.
+
+    A callback binds to a queue only when the queue is still expecting that subject — either a
+    live ``email_watches`` entry (registered when this run clicked **Build**) or an
+    ``email_batches`` entry that is still short of completions. Without this test any non-stopped
+    queue in the chat swallowed a same-subject callback into ``"pending"`` and no mail was sent.
+    """
+    if not isinstance(q, dict) or q.get("stopped"):
+        return False
+    key = normalize_email_key(email_title)
+    if not key:
+        return False
+    for watch in q.get("email_watches") or []:
+        if isinstance(watch, dict) and normalize_email_key(str(watch.get("title") or "")) == key:
+            return True
+    for batch in (q.get("email_batches") or {}).values():
+        if not isinstance(batch, dict) or batch.get("closed_at"):
+            continue
+        if normalize_email_key(str(batch.get("title") or "")) != key:
+            continue
+        indices = list(batch.get("indices") or [])
+        done = dict(batch.get("done_by_idx") or {})
+        if len(done) < len(indices):
+            return True
+    return False
+
+
+def queue_has_outstanding_work(q: dict[str, Any] | None) -> bool:
+    """True while a queue still owes a segment dispatch or an email completion."""
+    if not isinstance(q, dict) or q.get("stopped"):
+        return False
+    segs = q.get("segments") or []
+    if int(q.get("index") or 0) + 1 < len(segs):
+        return True
+    if q.get("email_watches"):
+        return True
+    for batch in (q.get("email_batches") or {}).values():
+        if not isinstance(batch, dict) or batch.get("closed_at"):
+            continue
+        if len(dict(batch.get("done_by_idx") or {})) < len(list(batch.get("indices") or [])):
+            return True
+    return False
 
 
 def register_email_build_watch(
@@ -604,7 +778,8 @@ def record_email_build_success(
     when: str,
 ) -> tuple[str, list[tuple[str, str]] | None, str]:
     """
-    Returns ``(status, rows, canonical_title)`` — ``status`` is ``sent`` or ``pending``.
+    Returns ``(status, rows, canonical_title)`` — ``status`` is ``sent``, ``pending`` or
+    ``already_sent`` (this subject's batch was completed and replied to earlier).
     """
     title = (email_title or "").strip()
     key = normalize_email_key(title)
@@ -624,6 +799,11 @@ def record_email_build_success(
                 continue
             if normalize_email_key(str(batch.get("title") or "")) != key:
                 continue
+            if batch.get("closed_at"):
+                # This batch already went out. Re-arming it (the old ``done_by_idx = {}``) meant
+                # the NEXT completion for the same subject was recorded as 1-of-N and silently
+                # parked at "pending" forever.
+                return "already_sent", None, str(batch.get("title") or title)
             indices_lookup = list(batch.get("indices") or [])
             done_lookup = dict(batch.get("done_by_idx") or {})
             spare = [ix for ix in indices_lookup if ix not in done_lookup]
@@ -646,6 +826,8 @@ def record_email_build_success(
         batch = {"title": canonical, "indices": indices, "done_by_idx": {}}
         batches[bid] = batch
         q["email_batches"] = batches
+    if batch.get("closed_at"):
+        return "already_sent", None, canonical
 
     done_by_idx: dict[int, dict[str, str]] = dict(batch.get("done_by_idx") or {})
     if seg_idx is not None and seg_idx >= 0:
@@ -670,7 +852,8 @@ def record_email_build_success(
         for ix in sorted(indices)
         if ix in done_by_idx
     ]
-    batch["done_by_idx"] = {}
+    # Close the batch instead of re-arming it — see the ``already_sent`` guard above.
+    batch["closed_at"] = time.time()
     return "sent", rows, canonical
 
 
@@ -995,6 +1178,10 @@ def find_waiting_queue_for_chat(
             if not isinstance(sess, dict):
                 continue
             q = get_queue(sess)
+            if q and queue_is_expired(q):
+                clear_queue_from_session(sess, chat_id)
+                _log(f"session queue for {sk!r} expired after {QUEUE_TTL_SEC:.0f}s — reaped")
+                continue
             if q and q.get("waiting_jenkins") and not q.get("stopped"):
                 return str(sk), q, sess
     _k, q, sess = _find_chat_fallback_queue(chat_id)
@@ -1033,6 +1220,13 @@ def find_active_queue_for_chat(
             if not isinstance(sess, dict):
                 continue
             q = get_queue(sess)
+            if q and queue_is_expired(q):
+                # Same reaping as _find_chat_fallback_queue: an abandoned run must not keep
+                # owning this chat's callbacks. Production stores the queue HERE, so without
+                # this the TTL added after the #315 incident was dead code on the real path.
+                clear_queue_from_session(sess, chat_id)
+                _log(f"session queue for {sk!r} expired after {QUEUE_TTL_SEC:.0f}s — reaped")
+                continue
             if q and not q.get("stopped"):
                 return str(sk), q, sess
     _k, q, sess = _find_chat_fallback_queue(chat_id)
@@ -1058,7 +1252,7 @@ def attach_queue_to_session(
             if em:
                 stub["email_reply_subject"] = em
         sessions[sk] = stub
-    persist_queue(q)
+    persist_queue_if_current(q)
     return sk
 
 
@@ -1213,9 +1407,23 @@ def _send_jenkins_email_reply(
     body_override: str | None = None,
     label: str = "Auto-replied email",
     target_entry: dict | None = None,
+    dedupe_key: str = "",
 ) -> None:
     import maintenance_mail as mm
 
+    # Both ingresses (the HTTP callback and the Lark ``/replyupdateemail`` fallback) land here and
+    # neither can see the other, so the same completion could be replied to twice. Claim the key
+    # BEFORE the 25-150s mailbox search so a duplicate is rejected cheaply, and release it again
+    # if the attempt failed without handing anything to SMTP.
+    age = _reply_dedupe_claim(dedupe_key)
+    if age:
+        _log(f"duplicate reply suppressed key={dedupe_key!r} age={age:.1f}s")
+        send(
+            chat_id,
+            f"ℹ️ **Duplicate ignored** — a reply for `{email_title}` was already sent "
+            f"{age:.0f}s ago. Nothing was sent again.",
+        )
+        return
     try:
         sent = mm.reply_jenkins_update_done_email(
             email_title=email_title,
@@ -1224,6 +1432,8 @@ def _send_jenkins_email_reply(
             target_entry=target_entry,
         )
     except mm.JenkinsReplyNeedsChoiceError as need:
+        # The user still has to pick a thread — the send has not happened, so do not hold the claim.
+        _reply_dedupe_release(dedupe_key)
         # The index knows this subject but cannot commit to one thread. Offer the candidates
         # rather than reporting a dead end.
         offer_email_thread_choice(
@@ -1232,6 +1442,7 @@ def _send_jenkins_email_reply(
         )
         return
     except mm.JenkinsReplyOnlyBouncesError as ex:
+        _reply_dedupe_release(dedupe_key)
         folders = ", ".join(mm.JENKINS_REPLY_IMAP_FOLDERS)
         detail = (
             "❌ **Email not found** — no reply sent.\n"
@@ -1246,7 +1457,27 @@ def _send_jenkins_email_reply(
             send, chat_id, detail_md=detail, completions=completions
         )
         return
+    except getattr(mm, "JenkinsReplyTimeoutError", ()) as ex:
+        # Must come BEFORE EmailThreadNotFoundError (it subclasses it). "Email not found" would
+        # send the operator to check an Email: line that is perfectly correct; the real problem is
+        # that the mailbox search ran out of its wall-clock budget and nothing was sent.
+        _reply_dedupe_release(dedupe_key)
+        detail = (
+            "⏱️ **Mailbox search timed out** — no reply sent, nothing was delivered.\n"
+            f"Subject: `{email_title}`\n"
+            "Re-run `/replyupdateemail | "
+            f"{email_title} | {', '.join(c[0] for c in completions)} | "
+            f"{completions[0][1] if completions else ''}` to try again, "
+            "or raise `JENKINS_REPLY_TOTAL_BUDGET` if this keeps happening.\n"
+            f"_{ex}_"
+        )
+        send(chat_id, detail)
+        _send_manual_reply_email_card(
+            send, chat_id, detail_md=detail, completions=completions
+        )
+        return
     except mm.EmailThreadNotFoundError:
+        _reply_dedupe_release(dedupe_key)
         folders = ", ".join(mm.JENKINS_REPLY_IMAP_FOLDERS)
         detail = (
             "❌ **Email not found** — no reply sent.\n"
@@ -1272,6 +1503,9 @@ def _send_jenkins_email_reply(
         )
         return
     except Exception as ex:
+        # Nothing reached SMTP on this path (JenkinsReplyMaybeSentError covers the case that did),
+        # so let an operator retry the same completion without tripping the duplicate guard.
+        _reply_dedupe_release(dedupe_key)
         send(
             chat_id,
             f"❌ **Jenkins email reply failed:** {ex}\n"
@@ -1339,8 +1573,24 @@ def handle_jenkins_email_done(
     session_key_fn: Callable[[str, str], str],
     dispatch_update_body: Callable[..., bool],
 ) -> bool:
-    """Process jenkinsbot email-done notification (with or without ``/updatemore`` queue)."""
+    """Process jenkinsbot email-done notification (with or without ``/updatemore`` queue).
+
+    Every exit logs one ``decision=`` line naming the branch it took. Before that line existed,
+    the four outcomes (batched-pending, batched-sent, no-queue-sent, error) were indistinguishable
+    after the fact — the reason the RC-UAT-UPDATE #315 "no email, no error" report could not be
+    settled from the journal.
+    """
     key, q, sess = find_active_queue_for_chat(chat_id, sessions, sessions_lock)
+
+    # A queue only absorbs a completion it is actually waiting for. Any other non-stopped queue in
+    # the chat (a finished or abandoned run) must not swallow this subject into "pending".
+    if q and not queue_owns_email(q, email_title):
+        _log(
+            f"decision=queue-not-owner chat={chat_id!r} title={email_title!r} — active queue "
+            f"(index={q.get('index')}, segs={len(q.get('segments') or [])}) does not expect this "
+            "subject; treating as a single /update"
+        )
+        key, q, sess = None, None, None
 
     if q and not q.get("stopped"):
         with sessions_lock:
@@ -1350,6 +1600,12 @@ def handle_jenkins_email_done(
                 environment=environment,
                 when=when,
             )
+            persist_queue_if_current(q)
+        _log(
+            f"decision=queue status={status!r} chat={chat_id!r} title={email_title!r} "
+            f"env={environment!r} rows={len(rows or [])} index={q.get('index')} "
+            f"waiting_jenkins={bool(q.get('waiting_jenkins'))}"
+        )
         if status == "pending":
             progress = ""
             email_key = normalize_email_key(email_title)
@@ -1369,8 +1625,27 @@ def handle_jenkins_email_done(
                 "_Need more Jenkins **SUCCESS** → `replyupdateemail` (or "
                 "`/SuccessInformMeTime` on the other build(s))._",
             )
-        elif status == "sent" and rows:
+        elif status == "already_sent":
+            send(
+                chat_id,
+                f"ℹ️ **No email sent** — the reply for `{canonical or email_title}` already went "
+                f"out for this `/updatemore` batch. This build (**{environment}** at **{when}**) "
+                "was not added to it.\n"
+                "_To reply again, run_ `/replyupdateemail | "
+                f"{canonical or email_title} | {environment} | {when}`.",
+            )
+        elif status == "sent":
             subj = canonical or email_title
+            if not rows:
+                # Unreachable by construction today, but total silence is the worst possible
+                # outcome here — degrade to this segment's own row and say so.
+                rows = [(environment, when)]
+                send(
+                    chat_id,
+                    f"⚠️ Batch bookkeeping was inconsistent for `{subj}` — replying with **this "
+                    "segment only**.",
+                )
+                _log(f"decision=sent-empty-rows chat={chat_id!r} title={subj!r} — degraded")
             envs = ", ".join(c[0] for c in rows)
             send(
                 chat_id,
@@ -1383,6 +1658,11 @@ def handle_jenkins_email_done(
                     chat_id,
                     email_title=subj,
                     completions=rows,
+                    # Keyed on the INCOMING completion, identically to the no-queue branch
+                    # below — not on the combined rows. The two branches used different keys,
+                    # so a retried callback that fell through to the no-queue branch minted a
+                    # fresh key and mailed the customer a second time.
+                    dedupe_key=f"{normalize_email_key(email_title)}|{environment}|{when}",
                 )
             except Exception as ex:
                 send(chat_id, f"❌ Jenkins email auto-reply failed: {ex}")
@@ -1390,23 +1670,56 @@ def handle_jenkins_email_done(
             if q.get("skip_build"):
                 with sessions_lock:
                     if sess:
-                        clear_queue_from_session(sess)
+                        clear_queue_from_session(sess, chat_id)
                 send(chat_id, "✅ **`/updatemore skip build`** test finished.")
                 return True
+        else:
+            send(
+                chat_id,
+                f"⚠️ Unhandled `/updatemore` email state `{status}` for `{email_title}` — "
+                "no email was sent. Run `/replyupdateemail | "
+                f"{email_title} | {environment} | {when}` to reply manually.",
+            )
+            _log(f"decision=unknown-status status={status!r} chat={chat_id!r}")
 
         if q.get("waiting_jenkins") and not q.get("stopped"):
+            finished = False
+            pending_hold = False
+            next_body = ""
             with sessions_lock:
                 q["waiting_jenkins"] = False
                 next_idx = int(q.get("index") or 0) + 1
                 q["index"] = next_idx
                 segs = q.get("segments") or []
                 if next_idx >= len(segs):
-                    if sess:
-                        clear_queue_from_session(sess)
-                    send(chat_id, "✅ All `/updatemore` segments finished.")
-                    return True
-                next_body = segment_to_update_body(segs[next_idx])
-                persist_queue(q)
+                    # Segments exhausted — but a batch can still be short a completion (the
+                    # "pending" status one line above). Retiring here threw that recorded row
+                    # away with the queue, and the missing half then arrived with no queue at
+                    # all, so the customer got a reply with only one of the two Done blocks.
+                    if queue_has_outstanding_work(q):
+                        persist_queue_if_current(q)
+                        pending_hold = True
+                    elif sess:
+                        clear_queue_from_session(sess, chat_id)
+                        finished = True
+                    else:
+                        q["stopped"] = True
+                        release_chat_queue(chat_id, q)
+                        finished = True
+                else:
+                    next_body = segment_to_update_body(segs[next_idx])
+                    persist_queue_if_current(q)
+            # send() is a blocking Lark HTTP call — never make it from under sessions_lock.
+            if pending_hold:
+                _log(
+                    f"decision=queue-held chat={chat_id!r} — segments exhausted but a batch is "
+                    "still short a completion; queue kept alive"
+                )
+                return True
+            if finished:
+                send(chat_id, "✅ All `/updatemore` segments finished.")
+                _log(f"decision=queue-finished chat={chat_id!r}")
+                return True
             send(chat_id, f"▶️ Next `/updatemore` segment ({next_idx + 1})…")
             dispatch_sk = key or attach_queue_to_session(q, sessions, sessions_lock)
             if not dispatch_sk:
@@ -1418,15 +1731,39 @@ def handle_jenkins_email_done(
                 send,
                 from_updatemore=True,
             )
+            return True
+
+        # Nothing left to dispatch and nothing left to collect → retire the queue so it cannot
+        # absorb the next callback in this chat.
+        if not queue_has_outstanding_work(q):
+            with sessions_lock:
+                if sess:
+                    clear_queue_from_session(sess, chat_id)
+                else:
+                    q["stopped"] = True
+                    release_chat_queue(chat_id, q)
+            _log(f"decision=queue-retired chat={chat_id!r} title={email_title!r}")
         return True
 
     # Single ``/update`` with Email (no queue)
+    _log(
+        f"decision=no-queue chat={chat_id!r} title={email_title!r} env={environment!r} "
+        f"when={when!r} — searching mailbox"
+    )
+    # The batched path announces itself before the (25-150s) mailbox search; this one used to go
+    # straight into IMAP and say nothing at all, which is what "no email, no error" looks like.
+    send(
+        chat_id,
+        f"📧 Jenkins **{environment}** done at **{when}** — searching mailbox and sending "
+        f"**Reply-All** for subject `{email_title}`…",
+    )
     try:
         _send_jenkins_email_reply(
             send,
             chat_id,
             email_title=email_title,
             completions=[(environment, when)],
+            dedupe_key=f"{normalize_email_key(email_title)}|{environment}|{when}",
         )
     except Exception as ex:
         send(chat_id, f"❌ Jenkins email auto-reply failed: {ex}")
@@ -1531,7 +1868,9 @@ def handle_jenkinsbot_callback(
             q["stopped"] = True
             q["waiting_jenkins"] = False
             if sess:
-                clear_queue_from_session(sess)
+                clear_queue_from_session(sess, chat_id)
+            else:
+                release_chat_queue(chat_id, q)
         send(
             chat_id,
             "⛔ **/updatemore** stopped — Jenkins build failed or was aborted.",
@@ -1592,6 +1931,8 @@ def handle_jenkinsbot_callback(
                 "queue in this chat (already finished, cancelled, or queue was cleared).",
             )
             return True
+        finished = False
+        next_body = ""
         with sessions_lock:
             q["waiting_jenkins"] = False
             idx = int(q.get("index") or 0) + 1
@@ -1599,11 +1940,18 @@ def handle_jenkinsbot_callback(
             segs = q.get("segments") or []
             if idx >= len(segs):
                 if sess:
-                    clear_queue_from_session(sess)
-                send(chat_id, "✅ All `/updatemore` segments finished.")
-                return True
-            next_body = segment_to_update_body(segs[idx])
-            persist_queue(q)
+                    clear_queue_from_session(sess, chat_id)
+                else:
+                    q["stopped"] = True
+                    release_chat_queue(chat_id, q)
+                finished = True
+            else:
+                next_body = segment_to_update_body(segs[idx])
+                persist_queue_if_current(q)
+        # send() is a blocking Lark HTTP call — it must not run while sessions_lock is held.
+        if finished:
+            send(chat_id, "✅ All `/updatemore` segments finished.")
+            return True
         send(chat_id, f"▶️ Next `/updatemore` segment ({idx + 1})…")
         dispatch_sk = key or attach_queue_to_session(q, sessions, sessions_lock)
         if not dispatch_sk:

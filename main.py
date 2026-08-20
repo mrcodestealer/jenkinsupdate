@@ -22,12 +22,16 @@ WebSocket). Set ``LARK_EVENT_MODE=websocket`` in ``.env`` (default here) and run
 
 import atexit
 import base64
+import collections
 import contextvars
+import hashlib
+import hmac
 import http
 import json
 import mimetypes
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -346,7 +350,40 @@ def _lark_post_message_reply(
         body["reply_in_thread"] = True
     if mentions:
         body["mentions"] = mentions
-    return requests.post(url, headers=headers, json=body).json()
+    # Every Lark call here is timed out: a half-open socket on this thread blocks forever, and
+    # some callers hold ``_fpms_lark_sessions_lock`` while sending — one stuck POST wedges the bot.
+    return requests.post(url, headers=headers, json=body, timeout=(5, 30)).json()
+
+
+def _lark_check_send_result(resp: Any, chat_id, text, *, via: str) -> Any:
+    """Log a Lark-side rejection of an outgoing message; returns ``resp`` untouched.
+
+    ``send_message`` used to throw the API result away, so "bot is not in this chat", "content
+    too long" and rate-limit rejections were indistinguishable from a delivered message — and
+    this is the channel every diagnostic in this file is reported on, so a silent failure here
+    hides all the others too. Never raises: the caller contract stays "returns the parsed body".
+    """
+    code = -1
+    msg = ""
+    if isinstance(resp, dict):
+        try:
+            code = int(resp.get("code", -1))
+        except (TypeError, ValueError):
+            code = -1
+        msg = str(resp.get("msg") or "")
+    if code == 0:
+        return resp
+    try:
+        preview = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    except Exception:
+        preview = str(text)
+    preview = (preview or "")[:160].replace("\n", " ⏎ ")
+    print(
+        f"[lark] send_message FAILED code={code} msg={msg!r} chat={chat_id!r} "
+        f"via={via} text={preview!r}",
+        flush=True,
+    )
+    return resp
 
 
 def send_message(
@@ -363,8 +400,13 @@ def send_message(
     else:
         reply_mid = (_lark_user_message_id.get() or "").strip() or None
     if reply_mid:
-        return _lark_post_message_reply(
-            reply_mid, text, msg_type=msg_type, mentions=mentions, reply_in_thread=False
+        return _lark_check_send_result(
+            _lark_post_message_reply(
+                reply_mid, text, msg_type=msg_type, mentions=mentions, reply_in_thread=False
+            ),
+            chat_id,
+            text,
+            via=f"reply:{reply_mid}",
         )
     token = get_tenant_access_token()
     if not token:
@@ -382,8 +424,8 @@ def send_message(
         body["mentions"] = mentions
     rid_type = (receive_id_type or "chat_id").strip() or "chat_id"
     params = {"receive_id_type": rid_type}
-    response = requests.post(url, headers=headers, params=params, json=body)
-    return response.json()
+    response = requests.post(url, headers=headers, params=params, json=body, timeout=(5, 30))
+    return _lark_check_send_result(response.json(), chat_id, text, via=f"create:{rid_type}")
 
 
 def _extract_lark_message_id(resp: Any) -> str:
@@ -427,7 +469,7 @@ def send_file(chat_id, file_token):
         "content": json.dumps({"file_key": file_token}),
     }
     params = {"receive_id_type": "chat_id"}
-    response = requests.post(url, headers=headers, params=params, json=payload)
+    response = requests.post(url, headers=headers, params=params, json=payload, timeout=(5, 30))
     return response.json()
 
 
@@ -438,7 +480,7 @@ def upload_file_to_drive(file_path):
     with open(file_path, "rb") as f:
         files = {"file": f}
         data = {"file_name": os.path.basename(file_path)}
-        resp = requests.post(url, headers=headers, files=files, data=data)
+        resp = requests.post(url, headers=headers, files=files, data=data, timeout=(5, 30))
     result = resp.json()
     if result.get("code") == 0:
         return result["data"]["file_token"]
@@ -458,7 +500,7 @@ def upload_image_lark(image_path: str):
     with open(image_path, "rb") as f:
         files = {"image": (os.path.basename(image_path), f, mime)}
         data = {"image_type": "message"}
-        resp = requests.post(url, headers=headers, files=files, data=data)
+        resp = requests.post(url, headers=headers, files=files, data=data, timeout=(5, 30))
     result = resp.json()
     if result.get("code") == 0:
         return result.get("data", {}).get("image_key")
@@ -476,7 +518,7 @@ def send_image_message(chat_id, image_key: str):
         "content": json.dumps({"image_key": image_key}),
     }
     params = {"receive_id_type": "chat_id"}
-    return requests.post(url, headers=headers, params=params, json=payload).json()
+    return requests.post(url, headers=headers, params=params, json=payload, timeout=(5, 30)).json()
 
 
 # ================= /update thread binding (replies stay under the user's command message) =================
@@ -682,11 +724,37 @@ def _lark_full_message_body(
 
 # ================= WebSocket redelivery dedup + stale-event filter =================
 processed_messages = set()
+# Insertion-ordered companion to ``processed_messages``. Pruning used to call ``set.pop()``, which
+# evicts an ARBITRARY element: a message id seen seconds ago could be thrown out while a stale one
+# survived, and Lark's redelivery of that id after a WS reconnect was then handled a second time.
+_processed_message_order: collections.deque = collections.deque()
 processed_lock = threading.Lock()
 _MAX_PROCESSED_MESSAGE_IDS = 50_000
 _PROCESSED_PRUNE_CHUNK = 10_000
 # Lark WebSocket may redeliver recent events after reconnect; in-memory dedup is cleared on restart.
 _BOT_STARTED_AT_MS = int(time.time() * 1000)
+
+
+def _lark_coerce_create_time_ms(raw) -> Optional[int]:
+    """``create_time`` → milliseconds, tolerating a SECONDS-valued timestamp.
+
+    Only ``header.create_time`` is documented as ms; the legacy/normalized envelopes below carry
+    whatever the sender put there. A seconds value (~1.7e9) is always smaller than
+    ``_BOT_STARTED_AT_MS`` (~1.7e12), so the stale filter would drop **100% of messages** while
+    the bot looked perfectly healthy. 1e11 is the safe cut: it is year-5138 in seconds and
+    March-1973 in ms, so no real timestamp is ambiguous.
+    """
+    if raw is None:
+        return None
+    try:
+        val = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    if val < 10**11:
+        val *= 1000
+    return val
 
 
 def _lark_event_create_time_ms(data: dict) -> Optional[int]:
@@ -695,28 +763,19 @@ def _lark_event_create_time_ms(data: dict) -> Optional[int]:
         return None
     hdr = data.get("header")
     if isinstance(hdr, dict):
-        ct = hdr.get("create_time")
-        if ct is not None:
-            try:
-                return int(ct)
-            except (TypeError, ValueError):
-                pass
+        ms = _lark_coerce_create_time_ms(hdr.get("create_time"))
+        if ms is not None:
+            return ms
     ev = data.get("event")
     if isinstance(ev, dict):
         msg = ev.get("message")
         if isinstance(msg, dict):
-            ct = msg.get("create_time")
-            if ct is not None:
-                try:
-                    return int(ct)
-                except (TypeError, ValueError):
-                    pass
-        ct = ev.get("create_time")
-        if ct is not None:
-            try:
-                return int(ct)
-            except (TypeError, ValueError):
-                pass
+            ms = _lark_coerce_create_time_ms(msg.get("create_time"))
+            if ms is not None:
+                return ms
+        ms = _lark_coerce_create_time_ms(ev.get("create_time"))
+        if ms is not None:
+            return ms
     return None
 
 
@@ -748,12 +807,13 @@ def _remember_processed_message_id(message_id: str) -> bool:
         if message_id in processed_messages:
             return True
         if len(processed_messages) >= _MAX_PROCESSED_MESSAGE_IDS:
+            # FIFO: drop the OLDEST ids, never a random one (see _processed_message_order).
             for _ in range(_PROCESSED_PRUNE_CHUNK):
-                try:
-                    processed_messages.pop()
-                except KeyError:
+                if not _processed_message_order:
                     break
+                processed_messages.discard(_processed_message_order.popleft())
         processed_messages.add(message_id)
+        _processed_message_order.append(message_id)
         return False
 
 
@@ -1211,6 +1271,73 @@ def _jenkins_bot_open_id() -> str:
 
 # Chat to post reply-email status into when a jenkinsbot callback / internal POST omits chat_id.
 DUTY_CHAT_ID = (os.getenv("DUTY_CHAT_ID") or "").strip() or None
+
+
+def _is_jenkins_duty_command_text(*parts: str) -> bool:
+    """True when any of ``parts`` carries a jenkinsbot duty command (``/replyupdateemail`` …).
+
+    Deliberately loose (it inherits ``is_jenkinsbot_duty_command``'s "<title> <env> <h:mm AM/PM>"
+    fallback). Only widen things with it — the group @mention gate, log wording. Anything that
+    *skips* a safety filter must use ``_is_jenkins_duty_slash_command_text`` instead.
+    """
+    try:
+        import updatemore as _um
+
+        probe = _um.resolve_duty_command_body(*parts)
+        if _um.is_jenkinsbot_duty_command(probe):
+            return True
+        return any(_um.is_reply_update_email_text(p or "") for p in parts)
+    except Exception:
+        # updatemore missing/broken must not make the bot deaf to the one command that sends the
+        # customer email — fall back to the bare pattern.
+        blob = " ".join(p or "" for p in parts)
+        return bool(re.search(r"/?replyupdateemail\b", blob, re.I))
+
+
+_DUTY_SLASH_CMD_RE = re.compile(r"/?replyupdateemail\b|/SuccessProceedNext\b|/FailedStop\b", re.I)
+
+
+def _is_jenkins_duty_slash_command_text(*parts: str) -> bool:
+    """True only for the unmistakable slash commands — never the legacy fallback.
+
+    ``is_jenkinsbot_duty_command``'s last branch matches ANY text ending in a clock time
+    (``<anything> <word> 3:30 PM``), so "let's meet at 3:30 PM" counts as a duty command. That is
+    harmless when it merely widens the group @mention gate, but using it to skip the WS-replay
+    guard let a human message stamped an hour before startup be replayed and dispatched as live.
+    """
+    try:
+        import updatemore as _um
+
+        for cand in (_um.resolve_duty_command_body(*parts), *parts):
+            s = (cand or "").strip()
+            if not s:
+                continue
+            if (
+                _um.is_reply_update_email_text(s)
+                or _um.is_success_proceed_message(s)
+                or _um.is_failed_stop_message(s)
+            ):
+                return True
+        return False
+    except Exception:
+        # Same reasoning as above: a broken updatemore must not make the bot deaf to the one
+        # command that sends the customer email.
+        blob = " ".join(p or "" for p in parts)
+        return bool(_DUTY_SLASH_CMD_RE.search(blob))
+
+
+def _sender_may_use_stale_duty_exemption(sender_id: Optional[str]) -> bool:
+    """Only jenkinsbot (or an unidentifiable sender) may skip the stale-event filter.
+
+    The exemption exists for jenkinsbot's post-build ``/replyupdateemail``; letting every chat
+    replay slash commands from before startup is a hole nobody asked for. An empty ``sender_id``
+    still passes: dropping the real command because Lark omitted the open_id would resurrect
+    exactly the missing-customer-email bug this exemption was added to prevent.
+    """
+    known = _jenkins_bot_open_id()
+    if not known or not sender_id:
+        return True
+    return sender_id == known
 
 
 def _run_jenkins_warm_status_check(chat_id: str) -> None:
@@ -1710,12 +1837,51 @@ def lark_webhook():
         sender_id = sid_obj.get("open_id") if isinstance(sid_obj, dict) else None
         sender_union_id = sid_obj.get("union_id") if isinstance(sid_obj, dict) else None
 
+        # jenkinsbot posts the ``/replyupdateemail`` fallback right after a build finishes. If we
+        # were deploying/restarting at that moment the stale-event filter ate it and printed a
+        # one-liner nobody reads — the build was SUCCESS, the card was posted, and the customer
+        # email was never sent. Exempt duty commands from the stale filter and say so loudly.
+        is_duty_cmd = _is_jenkins_duty_command_text(text, message_content_raw)
+        # The stale exemption uses the STRICT matcher plus a sender check. With the loose one the
+        # WS-replay guard was open to every chat: any pre-startup text ending in a clock time
+        # ("let's meet at 3:30 PM") was replayed and dispatched as if it had just arrived.
+        stale_exempt = _sender_may_use_stale_duty_exemption(
+            sender_id
+        ) and _is_jenkins_duty_slash_command_text(text, message_content_raw)
+
         if _lark_skip_stale_event_on_startup(data):
-            print(f"⏭️ Stale event ignored (before bot start) message_id={message_id!r}", flush=True)
-            return _lark_im_done()
+            if stale_exempt:
+                print(
+                    f"⚠️ [duty-exempt] STALE jenkinsbot duty command processed anyway "
+                    f"message_id={message_id!r} chat={chat_id!r} "
+                    f"created_ms={_lark_event_create_time_ms(data)} bot_started_ms={_BOT_STARTED_AT_MS} "
+                    f"text={(text or '')[:120]!r}\n"
+                    f"    → a restart during a running build must not swallow the reply-email command.",
+                    flush=True,
+                )
+            else:
+                # Name the sender when the text looked duty-ish but did not earn the exemption,
+                # so "the reply-email command vanished on restart" stays a one-line diagnosis.
+                _why = (
+                    f" (duty-ish text from sender={sender_id!r}, not jenkinsbot"
+                    f" {_jenkins_bot_open_id()!r} / not a slash command)"
+                    if is_duty_cmd
+                    else ""
+                )
+                print(
+                    f"⏭️ Stale event ignored (before bot start) message_id={message_id!r}{_why}",
+                    flush=True,
+                )
+                return _lark_im_done()
 
         if message_id and _remember_processed_message_id(message_id):
-            print(f"⏭️ Duplicate message {message_id} ignored", flush=True)
+            # Duplicates stay dropped even for duty commands — updatemore's own dedupe guard is
+            # keyed on the email, but replaying the SAME message_id is always Lark redelivery.
+            print(
+                f"⏭️ Duplicate message {message_id} ignored"
+                f"{' (jenkinsbot duty command — already handled once)' if is_duty_cmd else ''}",
+                flush=True,
+            )
             return _lark_im_done()
 
         if sender_id and BOT_OPEN_ID and sender_id == BOT_OPEN_ID:
@@ -1750,27 +1916,14 @@ def lark_webhook():
         # jenkinsbot → reply-email commands (/replyupdateemail, etc.) work in groups WITHOUT an
         # @mention — treat them as addressed so the group gate below lets them through (any sender).
         if chat_type != "p2p" and not bot_mentioned:
-            try:
-                import updatemore as _um
-
-                _duty_probe = _um.resolve_duty_command_body(
-                    original_text, clean_text, message_content_raw
+            if is_duty_cmd or _is_jenkins_duty_command_text(
+                original_text, clean_text, message_content_raw
+            ):
+                bot_mentioned = True
+                print(
+                    "✅ Jenkins reply-email command — treat as mentioned (any sender)",
+                    flush=True,
                 )
-                if _um.is_jenkinsbot_duty_command(_duty_probe) or _um.is_reply_update_email_text(
-                    message_content_raw or ""
-                ):
-                    bot_mentioned = True
-                    print(
-                        "✅ Jenkins reply-email command — treat as mentioned (any sender)",
-                        flush=True,
-                    )
-            except Exception:
-                if re.search(
-                    r"/?replyupdateemail\b",
-                    f"{clean_text or ''} {message_content_raw or ''}",
-                    re.I,
-                ):
-                    bot_mentioned = True
 
         ju = _get_jenkinsupdate()
         jenkins_sess_active = (
@@ -1825,52 +1978,146 @@ def lark_webhook():
 
 
 # ================= Internal HTTP: jenkinsbot → reply update email =================
+def _reply_callback_cid(payload: dict) -> str:
+    """8-char correlation id for one callback, so all its log lines can be grepped together.
+
+    The RC-UAT-UPDATE #315 email never went out and this whole ingress logged NOTHING — there was
+    no way to tell whether jenkinsbot's POST even reached this process. Every line below carries
+    this id; it is derived from the payload alone so the HTTP thread and the background thread
+    compute the same one without sharing state.
+    """
+    p = payload if isinstance(payload, dict) else {}
+    email_title = (p.get("email_title") or "").strip()
+    environment = (p.get("environment") or "").strip()
+    when = (p.get("when") or "").strip()
+    return hashlib.sha1(f"{email_title}|{environment}|{when}".encode()).hexdigest()[:8]
+
+
+def _validate_reply_update_payload(payload: dict) -> tuple[Optional[dict], str, int]:
+    """Validate a reply-update-email payload once. ``(fields, "", 200)`` or ``(None, why, status)``.
+
+    The HTTP route and the background handler each carried their own line-for-line copy of these
+    checks with a different reporting channel, so a fix to one would silently leave the other on
+    the old rules.
+    """
+    p = payload if isinstance(payload, dict) else {}
+    fields = {
+        "chat_id": (p.get("chat_id") or DUTY_CHAT_ID or "").strip(),
+        "email_title": (p.get("email_title") or "").strip(),
+        "environment": (p.get("environment") or "").strip(),
+        "when": (p.get("when") or "").strip(),
+    }
+    if not fields["chat_id"]:
+        return None, "missing chat_id", 400
+    if not (fields["email_title"] and fields["environment"] and fields["when"]):
+        return None, "missing email_title, environment, or when", 400
+    if _get_jenkinsupdate() is None:
+        return None, "jenkinsupdate module unavailable", 503
+    try:
+        import updatemore  # noqa: F401
+    except Exception as ex:
+        return None, f"updatemore import failed: {ex}", 503
+    return fields, "", 200
+
+
 def _handle_reply_update_email_internal(payload: dict) -> tuple[bool, str, int]:
     """Shared handler for ``POST /internal/reply-update-email``. Returns ``(ok, message, status)``."""
-    chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
-    email_title = (payload.get("email_title") or "").strip()
-    environment = (payload.get("environment") or "").strip()
-    when = (payload.get("when") or "").strip()
-    if not chat_id:
-        return False, "missing chat_id", 400
-    if not email_title or not environment or not when:
-        return False, "missing email_title, environment, or when", 400
+    cid = _reply_callback_cid(payload)
+    fields, err, status = _validate_reply_update_payload(payload)
+    if fields is None:
+        print(f"[reply-callback] {cid} handler REJECT status={status} reason={err}", flush=True)
+        return False, err, status
     ju = _get_jenkinsupdate()
-    if ju is None:
-        return False, "jenkinsupdate module unavailable", 503
-    try:
-        import updatemore as um
-    except Exception as ex:
-        return False, f"updatemore import failed: {ex}", 503
+    import updatemore as um
+
+    print(
+        f"[reply-callback] {cid} handler → updatemore.process_reply_update_email "
+        f"title={fields['email_title']!r} env={fields['environment']!r} when={fields['when']!r} "
+        f"chat={fields['chat_id']!r}",
+        flush=True,
+    )
     um.process_reply_update_email(
-        chat_id,
-        email_title,
-        environment,
-        when,
+        fields["chat_id"],
+        fields["email_title"],
+        fields["environment"],
+        fields["when"],
         send_message,
         sessions=ju._fpms_lark_sessions,
         sessions_lock=ju._fpms_lark_sessions_lock,
         session_key_fn=ju._fpms_lark_session_key,
-        dispatch_update_body=lambda cid, sk, body, snd, **kw: ju._dispatch_lark_update_command_body(
-            cid, sk, body, snd, **kw
+        dispatch_update_body=lambda cid_, sk, body, snd, **kw: ju._dispatch_lark_update_command_body(
+            cid_, sk, body, snd, **kw
         ),
     )
+    print(f"[reply-callback] {cid} handler returned processed", flush=True)
     return True, "processed", 200
 
 
 def _run_reply_update_email_background(payload: dict) -> None:
     """Run the IMAP reply off the HTTP thread so the caller does not hit its POST timeout."""
+    cid = _reply_callback_cid(payload)
+    started = time.time()
     try:
         ok, msg, code = _handle_reply_update_email_internal(payload)
+        # Printed UNCONDITIONALLY — the success case used to be completely silent, so a callback
+        # that ran and decided "pending" looked exactly like one that never arrived.
+        print(
+            f"[reply-callback] {cid} background done ok={ok} code={code} msg={msg!r} "
+            f"took={time.time() - started:.1f}s",
+            flush=True,
+        )
         if not ok:
             chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
             if chat_id:
                 send_message(chat_id, f"❌ Jenkins email callback failed ({code}): {msg}")
     except Exception as ex:
         chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
+        print(
+            f"[reply-callback] {cid} background ERROR after {time.time() - started:.1f}s: {ex!r}",
+            flush=True,
+        )
         print(f"❌ reply-update-email background error: {ex}", flush=True)
         if chat_id:
             send_message(chat_id, f"❌ Jenkins email callback error: {ex}")
+
+
+def _strip_bearer_prefix(raw: str) -> str:
+    """Drop a case-insensitive ``Bearer`` prefix from an Authorization header.
+
+    ``.replace("Bearer", "")`` was a GLOBAL substring strip: it missed lowercase ``bearer``
+    (403 for a legitimate caller) and would also gnaw a token that happened to contain the word.
+    """
+    val = (raw or "").strip()
+    if val[:6].lower() == "bearer":
+        val = val[6:].strip()
+    return val
+
+
+def _internal_auth_ok() -> bool:
+    """Optional shared-secret gate for ``/internal/*`` (unset ``DUTY_INTERNAL_TOKEN`` = no gate)."""
+    token_need = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
+    if not token_need:
+        return True
+    got = (request.headers.get("X-Duty-Internal-Token") or "").strip() or _strip_bearer_prefix(
+        request.headers.get("Authorization") or ""
+    )
+    return hmac.compare_digest(got.encode("utf-8"), token_need.encode("utf-8"))
+
+
+_LOOPBACK_ADDRS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"})
+
+
+def _request_is_loopback() -> bool:
+    """True only for a request that really originated on this box.
+
+    A forwarded request also arrives from 127.0.0.1 when the reverse proxy runs here, so any
+    forwarding header disqualifies it — otherwise ``LARK_EVENT_MODE=http`` (bind 0.0.0.0 behind a
+    public proxy) would hand the whole diagnostics dump to the internet.
+    """
+    for hdr in ("X-Forwarded-For", "X-Real-IP", "Forwarded", "X-Forwarded-Host"):
+        if (request.headers.get(hdr) or "").strip():
+            return False
+    return (request.remote_addr or "").strip() in _LOOPBACK_ADDRS
 
 
 @app.route("/internal/reply-update-email", methods=["POST"])
@@ -1879,36 +2126,146 @@ def internal_reply_update_email():
     An external jenkinsbot POSTs here when a Lark bot→bot @mention does not reach this bot.
     Optional header ``X-Duty-Internal-Token`` must match ``DUTY_INTERNAL_TOKEN`` when that env is set.
     """
-    token_need = (os.getenv("DUTY_INTERNAL_TOKEN") or "").strip()
-    if token_need:
-        got = (
-            (request.headers.get("X-Duty-Internal-Token") or "").strip()
-            or (request.headers.get("Authorization") or "").replace("Bearer", "").strip()
+    # A JSON array body (``[1,2,3]``) parses fine and is NOT a dict — ``payload.get(...)`` below
+    # then raised AttributeError and turned this route into an HTTP 500 HTML page.
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    cid = _reply_callback_cid(payload)
+    if not _internal_auth_ok():
+        # Rejected before the arrival line: logging an unauthenticated caller's title/env strings
+        # would let anyone who can reach this port write whatever they like into our logs.
+        print(
+            f"[reply-callback] {cid} REJECT status=403 reason=unauthorized "
+            f"from {request.remote_addr or '?'}",
+            flush=True,
         )
-        if got != token_need:
-            return jsonify({"ok": False, "error": "unauthorized"}), 403
-    payload = request.get_json(silent=True) or {}
-    chat_id = (payload.get("chat_id") or DUTY_CHAT_ID or "").strip()
-    email_title = (payload.get("email_title") or "").strip()
-    environment = (payload.get("environment") or "").strip()
-    when = (payload.get("when") or "").strip()
-    if not chat_id:
-        return jsonify({"ok": False, "error": "missing chat_id"}), 400
-    if not email_title or not environment or not when:
-        return jsonify({"ok": False, "error": "missing email_title, environment, or when"}), 400
-    ju = _get_jenkinsupdate()
-    if ju is None:
-        return jsonify({"ok": False, "error": "jenkinsupdate module unavailable"}), 503
-    try:
-        import updatemore  # noqa: F401
-    except Exception as ex:
-        return jsonify({"ok": False, "error": f"updatemore import failed: {ex}"}), 503
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    # Arrival is logged before every other check: this is the decision point for whether a
+    # customer email is sent, and previously all six exits from here were silent.
+    print(
+        f"[reply-callback] {cid} POST from {request.remote_addr or '?'} "
+        f"title={(payload.get('email_title') or '')!r} env={(payload.get('environment') or '')!r} "
+        f"when={(payload.get('when') or '')!r} "
+        f"chat={((payload.get('chat_id') or DUTY_CHAT_ID) or '')!r}",
+        flush=True,
+    )
+    fields, err, status = _validate_reply_update_payload(payload)
+    if fields is None:
+        print(f"[reply-callback] {cid} REJECT status={status} reason={err}", flush=True)
+        return jsonify({"ok": False, "error": err}), status
     threading.Thread(
         target=_run_reply_update_email_background,
         args=(payload,),
         daemon=True,
     ).start()
-    return jsonify({"ok": True, "message": "accepted", "accepted": True}), 202
+    print(f"[reply-callback] {cid} ACCEPTED status=202 — background thread started", flush=True)
+    return jsonify({"ok": True, "message": "accepted", "accepted": True, "cid": cid}), 202
+
+
+@app.route("/internal/status", methods=["GET"])
+def internal_status():
+    """
+    Dump the state that decides **pending vs send** for a Jenkins reply email.
+
+    Added after RC-UAT-UPDATE #315: the queue that absorbed the completion lived only in this
+    process's memory, so from outside there was no way to see that a stale batch existed at all.
+    Contains no secrets — ``mail_ready`` is a bool, never the password. Same optional
+    ``DUTY_INTERNAL_TOKEN`` gate as the POST route, but it carries chat ids and customer email
+    SUBJECT LINES, so with no token configured the full dump is loopback-only: in
+    ``LARK_EVENT_MODE=http`` this app binds 0.0.0.0 behind a public proxy.
+    """
+    _loopback = _request_is_loopback()
+    if not _internal_auth_ok():
+        if not _loopback:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+        # Identity only. The startup bind probe is a local, deliberately UNAUTHENTICATED GET whose
+        # whole job is to learn which pid owns the port; answering it 403 would make "a sibling
+        # checkout stole the port" and "the token is set" look identical.
+        return jsonify({"ok": True, "pid": os.getpid(), "redacted": "unauthorized"})
+
+    # No token configured → anyone who can reach the port is unauthenticated; hand out counts
+    # instead of subject lines and chat ids unless the caller is on this box.
+    _full = _loopback or bool((os.getenv("DUTY_INTERNAL_TOKEN") or "").strip())
+
+    mail_ready: Optional[bool] = None
+    allemail_entries: Optional[int] = None
+    try:
+        import maintenance_mail as _mm
+
+        mail_ready = bool(_mm.MAIL_PASSWORD)
+        # Only the already-parsed matcher view is read here — loading allemail.json (up to
+        # ALLEMAIL_MAX_ENTRIES rows) on a diagnostics GET would be slower than the thing it
+        # diagnoses, and IMAP is never touched.
+        view = getattr(_mm, "_allemail_view_cache", None)
+        if isinstance(view, tuple) and len(view) >= 2 and isinstance(view[1], list):
+            allemail_entries = len(view[1])
+    except Exception as ex:
+        print(f"[status] maintenance_mail unavailable: {ex!r}", flush=True)
+
+    queues: list[dict[str, Any]] = []
+    try:
+        import updatemore as um
+
+        now = time.time()
+        with um._chat_updatemore_lock:
+            snapshot = list(um._chat_updatemore_queues.items())
+        for q_chat_id, q in snapshot:
+            if not isinstance(q, dict):
+                continue
+            created_at = q.get("created_at")
+            batches = []
+            for batch in (q.get("email_batches") or {}).values():
+                if not isinstance(batch, dict):
+                    continue
+                batches.append(
+                    {
+                        # A batch title IS the customer's email subject line — counts only off-box.
+                        "title": str(batch.get("title") or "") if _full else None,
+                        "done": len(dict(batch.get("done_by_idx") or {})),
+                        "total": len(list(batch.get("indices") or [])),
+                        "closed": bool(batch.get("closed_at")),
+                    }
+                )
+            _watch_titles = [
+                str(w.get("title") or "")
+                for w in (q.get("email_watches") or [])
+                if isinstance(w, dict)
+            ]
+            queues.append(
+                {
+                    "chat_id": q_chat_id if _full else None,
+                    "index": q.get("index"),
+                    "segments": len(q.get("segments") or []),
+                    "waiting_jenkins": bool(q.get("waiting_jenkins")),
+                    "stopped": bool(q.get("stopped")),
+                    "created_at": created_at,
+                    "age_seconds": (
+                        round(now - float(created_at), 1)
+                        if isinstance(created_at, (int, float)) and created_at > 0
+                        else None
+                    ),
+                    "email_watches": _watch_titles if _full else len(_watch_titles),
+                    "email_batches": batches,
+                }
+            )
+    except Exception as ex:
+        print(f"[status] updatemore queue dump failed: {ex!r}", flush=True)
+
+    return jsonify(
+        {
+            "ok": True,
+            "pid": os.getpid(),
+            "python": sys.version.split()[0],
+            "uptime_seconds": round(time.time() - (_BOT_STARTED_AT_MS / 1000.0), 1),
+            "mail_ready": mail_ready,
+            "allemail_entries": allemail_entries,
+            "bot_open_id": (BOT_OPEN_ID or None) if _full else None,
+            "duty_chat_id": DUTY_CHAT_ID if _full else None,
+            "redacted": None if _full else "off-box caller, no DUTY_INTERNAL_TOKEN configured",
+            "queues": queues,
+        }
+    )
 
 
 # ================= Lark persistent connection (long connection / WebSocket) =================
@@ -2247,6 +2604,42 @@ def _start_scheduler() -> None:
         print("[scheduler] started (midnight run-history reset)", flush=True)
 
 
+def _probe_diag_port_owner(port: int) -> tuple[str, Optional[int], str]:
+    """Who owns 127.0.0.1:``port``? Returns ``(verdict, owner_pid, detail)``.
+
+    Three outcomes, never two: ``"ours"`` (a 200 from /internal/status carrying OUR pid — the only
+    proof there is), ``"dead"`` (nothing accepted a connection), ``"unproven"`` (something answered
+    but did not identify itself as us: another pid, no pid, 401/403, or 404 from an older sibling
+    checkout with no such route). Scoring "unproven" as ours is how a sibling holding the port
+    printed a green confirmation while jenkinsbot's callbacks went to the wrong process.
+
+    Deliberately sends NO ``X-Duty-Internal-Token``: this asks *who are you*, and handing over our
+    secret could only ever turn a stranger's rejection into a false positive.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+    except OSError as sock_err:
+        return "dead", None, repr(sock_err)
+
+    try:
+        resp = requests.get(f"http://127.0.0.1:{port}/internal/status", timeout=(2, 5))
+    except Exception as st_err:
+        return "unproven", None, f"/internal/status unreachable ({st_err!r})"
+
+    if resp.status_code != 200:
+        return "unproven", None, f"answered HTTP {resp.status_code} to /internal/status"
+    try:
+        owner_pid = int((resp.json() or {}).get("pid") or 0) or None
+    except Exception as body_err:
+        return "unproven", None, f"/internal/status body unreadable ({body_err!r})"
+    if owner_pid is None:
+        return "unproven", None, "answered 200 but reported no pid"
+    if owner_pid == os.getpid():
+        return "ours", owner_pid, ""
+    return "unproven", owner_pid, f"owned by pid {owner_pid}"
+
+
 def _run_main_entry() -> int:
     """
     ``LARK_EVENT_MODE=websocket`` (default here) — Flask in a background thread (diag only) +
@@ -2291,7 +2684,21 @@ def _run_main_entry() -> int:
 
         if _lark_ws_uses_persistent_connection():
             def _flask_bg() -> None:
-                app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
+                # A bind failure inside this daemon thread used to be swallowed whole: the thread
+                # died, nothing was printed, and the "Flask on ..." line below still claimed
+                # success. This box has run three checkouts of this bot at once, so losing the
+                # port to a sibling process is the expected failure, not an exotic one.
+                try:
+                    app.run(
+                        host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False
+                    )
+                except BaseException as flask_err:
+                    print(
+                        f"❌ [lark] Flask diag server FAILED on 127.0.0.1:{port}: {flask_err!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    traceback.print_exc(file=sys.stderr)
 
             threading.Thread(target=_flask_bg, daemon=True, name="updatejenkins-flask").start()
             print(
@@ -2300,6 +2707,64 @@ def _run_main_entry() -> int:
                 flush=True,
             )
             time.sleep(1.0)
+
+            # Prove it. "The thread started" is not "the port is bound", and "the port is bound"
+            # is not "bound by US" — /internal/status reports the owning pid, so ask it.
+            verdict, owner_pid, detail = _probe_diag_port_owner(port)
+
+            if verdict == "ours":
+                print(
+                    f"[lark] ✅ Flask diag server confirmed listening on http://127.0.0.1:{port} "
+                    f"(pid={os.getpid()})",
+                    flush=True,
+                )
+            elif verdict == "dead":
+                # Nothing accepted a connection at all: app.run died (or is still starting) and no
+                # sibling took the port either.
+                print(
+                    "\n".join(
+                        [
+                            "=" * 78,
+                            f"❌ [lark] NOTHING IS LISTENING ON 127.0.0.1:{port} — {detail}",
+                            "    → jenkinsbot's POST /internal/reply-update-email callbacks have",
+                            "      nowhere to land. Builds will finish SUCCESS, the Jenkins card",
+                            "      will post, and the customer reply email will NEVER be sent.",
+                            "    → check the Flask diag server traceback printed above.",
+                            "=" * 78,
+                        ]
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                # Someone answered, but not provably us. An unidentifiable owner used to be scored
+                # as "it's ours" — which is exactly the sibling-checkout case (a 404 from an older
+                # build with no /internal/status route) this probe was written to catch.
+                _why = (
+                    f"port answered but /internal/status reports pid={owner_pid}, "
+                    f"this process is pid={os.getpid()}"
+                    if owner_pid is not None
+                    else f"port answered but ownership is unproven: {detail} "
+                    f"(this process is pid={os.getpid()})"
+                )
+                print(
+                    "\n".join(
+                        [
+                            "=" * 78,
+                            f"⚠️ [lark] PORT {port} IS NOT PROVABLY SERVED BY THIS PROCESS — {_why}",
+                            "    → most likely an older checkout of this bot is holding the port,",
+                            "      so jenkinsbot's POST /internal/reply-update-email callbacks will",
+                            "      NOT reach this process: builds finish SUCCESS, the Jenkins card",
+                            "      posts, and the customer reply email is NEVER sent.",
+                            "    → stop the other checkout, or set PORT= / LARKBOT_PORT= to a free",
+                            f"      port and restart. Check the owner with: lsof -nP -iTCP:{port} -sTCP:LISTEN",
+                            "=" * 78,
+                        ]
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
             _run_lark_ws_forever()
             return 0
 

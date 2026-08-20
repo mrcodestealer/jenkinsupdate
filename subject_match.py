@@ -33,6 +33,10 @@ Why each piece exists:
 * **Refusal over guessing.** Within ``MATCH_MARGIN`` of the runner-up the result is
   ``ambiguous`` and the caller must ask. Age never blocks eligibility — it downgrades ``ok`` to
   ``ok_stale`` so the caller can confirm.
+* **The customer site refuses instead of vetoing.** A trailing ``- CP`` / ``- CQ`` the target
+  thread does not confirm downgrades ``ok`` to ``ambiguous`` with every candidate still on the
+  card. It is deliberately NOT a veto: dropping the site-bearing rivals would just hand the
+  automatic reply to a site-less thread instead.
 
 Result kinds from :func:`resolve`: ``ok``, ``ok_stale``, ``ambiguous``, ``too_broad``,
 ``all_ineligible``, ``none``.
@@ -55,7 +59,12 @@ _DQUOTES = "“”„″"
 _ZW = "​‌‍⁠﻿­"
 
 
-def match_normalize(s: str) -> str:
+def _shape(s: str) -> str:
+    """Everything :func:`match_normalize` does EXCEPT the casefold.
+
+    The site code is the one slot in this module that reads case — ``CP`` is a customer code,
+    ``done`` is a word — so it needs the width/dash/space normalisation with the case intact.
+    """
     t = unicodedata.normalize("NFKC", s or "")
     t = t.replace("\xa0", " ")
     for ch in _ZW:
@@ -67,7 +76,11 @@ def match_normalize(s: str) -> str:
     for ch in _DQUOTES:
         t = t.replace(ch, '"')
     t = re.sub(r"\s+", " ", t)
-    return t.strip().casefold()
+    return t.strip()
+
+
+def match_normalize(s: str) -> str:
+    return _shape(s).casefold()
 
 
 _REPLY_PREFIX = re.compile(
@@ -111,7 +124,22 @@ _MD2_RE = re.compile(rf"\b({_MONALT})[a-z]*\s*[-/. ]\s*(\d{{1,2}})\b", re.I)
 _NUM3_RE = re.compile(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})\b")
 _YM_RE = re.compile(r"\b(20\d\d)[-/](\d{1,2})\b")
 _BIGID_RE = re.compile(r"(?<!\d)(\d{7,14})(?!\d)")
-_VER_RE = re.compile(r"\bv?(\d{1,3}(?:\.\d{1,4}){1,3})\b")
+# the build letter is PART of the version: 'v1.12.26u' and 'v1.12.27u' are different releases.
+# A trailing \b cannot fire between '6' and 'u', so the old pattern matched only '1.12', spilled
+# '26' and 'u' into the word bag, and a Jenkins Done for 1.12.26u scored 0.85 on the 1.12.27u
+# thread — over MATCH_MIN_COVERAGE, veto None, wrong release told the customer it was live.
+# (?!\w) is the old \b whenever the suffix is empty, so no suffix-less subject tokenises anew.
+# No re.I: this pattern only ever runs over an already-casefolded body, so the flag could not
+# change a single match and only suggested the suffix class was broader than [a-z].
+_VER_RE = re.compile(r"\bv?(\d{1,3}(?:\.\d{1,4}){1,3})([a-z]{0,2})(?!\w)")
+# customer site: '... UPDATE PRODUCTION - CP (2026-08-14)'. EVERY ' - XX' segment is collected,
+# not just the trailing one, because a real title routinely appends a note after the site
+# ('- CQ (2026-08-14) - DONE'), and reading only the last segment let that note hide the site.
+# What separates a site from a note is NOT the word itself — no blocklist survives contact with
+# an open class of tails ('- TBD', '- WIP', '- ACK' each turned a working auto-reply into a pick
+# card) — it is whether any INDEXED thread uses that code. `resolve` intersects with that
+# vocabulary, so an unseen tail fails open and only a code the mailbox really uses can refuse.
+_SITE_RE = re.compile(r" - ([A-Z]{2,4})(?![A-Za-z0-9])")
 _WORD_RE = re.compile(r"[a-z][a-z']*|\d+")
 _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]+")
 
@@ -130,7 +158,8 @@ def _iso(y, mo, d):
 
 
 def match_tokens(subject: str) -> dict:
-    norm = match_normalize(subject)
+    shaped = _shape(subject)
+    norm = shaped.casefold()
     body, is_reply, is_fwd = strip_reply_prefixes(norm)
     spans: list[tuple[int, int]] = []
 
@@ -202,8 +231,16 @@ def match_tokens(subject: str) -> dict:
         parts = v.split(".")
         if len(parts) > 4 or any(len(p) == 4 and p.startswith("20") for p in parts):
             continue
-        vers.add(v)
+        vers.add(v + m.group(2).lower())
         take(m)
+    # A '- CP' / '- CQ' segment names the CUSTOMER SITE, and two sites share every other token
+    # of the same template. As a bare 2-letter word it could only shave coverage — 0.85 still
+    # cleared MATCH_MIN_COVERAGE — so a Done for CP matched the CQ thread and was replied to
+    # automatically. Typed here so `resolve` can hand the operator a pick card instead; the word
+    # token is deliberately LEFT in place (no take()) so coverage and IDF stay as they are today.
+    # Caps only, and every candidate kept: which of these is really a site is decided in
+    # `resolve` against the codes the indexed threads actually use, never by this function.
+    sites = frozenset(w.lower() for w in _SITE_RE.findall(shaped))
 
     scrub = list(body)
     for s, e in spans:
@@ -226,8 +263,8 @@ def match_tokens(subject: str) -> dict:
     wordset = set(words) | id_digits
     return {"norm": norm, "body": body, "is_reply": is_reply, "is_fwd": is_fwd,
             "ids": ids, "id_digits": id_digits, "vers": vers, "times": times,
-            "dates": dates, "mds": mds, "months": months, "words": words,
-            "wordset": wordset}
+            "dates": dates, "mds": mds, "months": months, "sites": sites,
+            "words": words, "wordset": wordset}
 
 
 # ---------------- 3. keys + IDF ----------------
@@ -291,6 +328,14 @@ MATCH_MAX_PICKLIST = 8
 TIER_ID, TIER_TOKENS, TIER_WEAK = 2, 1, 0
 
 
+def _ver_split(v):
+    """'1.12.26u' -> ('1.12.26', 'u'); '2.0.6' -> ('2.0.6', '')."""
+    i = len(v)
+    while i and v[i - 1].isalpha():
+        i -= 1
+    return v[:i], v[i:]
+
+
 def match_score(S, N, *, D, anchor_ts=None):
     sdays = resolve_days(S["dates"], anchor_ts)
     s_all = set().union(*sdays) if sdays else set()
@@ -304,7 +349,14 @@ def match_score(S, N, *, D, anchor_ts=None):
     if N["ids"] and S["ids"] and not id_agree:
         veto = f"ticket id {sorted(N['ids'])} vs {sorted(S['ids'])}"
     def ver_ok(nv, sv):
-        a, b = nv.split("."), sv.split(".")
+        # The build letter discriminates only when BOTH sides carry one: a hand-typed subject
+        # routinely drops the 'u' off '1.12.26u', and vetoing that would refuse every honest
+        # retyping. '1.12.26u' vs '1.12.27u' is already dead on the numbers.
+        na, nsfx = _ver_split(nv)
+        sa, ssfx = _ver_split(sv)
+        if nsfx and ssfx and nsfx != ssfx:
+            return False
+        a, b = na.split("."), sa.split(".")
         return a == b[: len(a)] or b == a[: len(b)]
     if not veto and N["vers"] and S["vers"] and not any(
             ver_ok(a, b) for a in N["vers"] for b in S["vers"]):
@@ -529,6 +581,23 @@ def resolve(title, entries, D, *, now, max_age_days=14):
     if not usable:
         return Res("all_ineligible", groups=groups, reason=g[0].get("_elig") or "")
     tgt = usable[0]
+    # The title names a customer site the thread we are about to reply into does not confirm.
+    #
+    # Which of the title's ' - XX' segments is a site is decided HERE, against the codes the
+    # indexed threads actually use: an unseen tail ('- TBD', '- WIP', '- ACK') is not in the
+    # vocabulary and is ignored, so it can never turn a working auto-reply into a pick card,
+    # while 'cq' is in it as soon as any CQ thread is indexed and a CP-vs-CQ mix-up always stops.
+    # A conflict is never a veto — dropping the site-bearing rivals only promoted a site-LESS
+    # thread from "operator picks" to "confident auto-reply", which is the very wrong-thread
+    # reply this slot exists to prevent. Every candidate stays on the pick card.
+    site_vocab = set()
+    for e in entries:
+        site_vocab |= set((e.get("_t") or {}).get("sites") or ())
+    named = set(N.get("sites") or ()) & site_vocab
+    if named and not (named & set((tgt.get("_t") or {}).get("sites") or ())):
+        return Res("ambiguous", groups=groups,
+                   reason=f"title says site {'/'.join(sorted(x.upper() for x in named))}, "
+                          f"{tgt['_k']} does not")
     age = (now - float(tgt.get("date_ts") or 0.0)) / 86400.0
     note = "" if len(groups) == 1 else f"runner-up {groups[1][0]['_k']}"
     if age > max_age_days:

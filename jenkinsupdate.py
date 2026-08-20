@@ -4294,9 +4294,28 @@ def _vpn_find_extract_query(body: str) -> str:
     return ""
 
 
+def _duty_bot_own_port() -> str:
+    """This process's own Flask port (see main.py: ``PORT`` / ``LARKBOT_PORT``, default 5000)."""
+    return (os.environ.get("PORT") or os.environ.get("LARKBOT_PORT") or "5000").strip() or "5000"
+
+
 def _jenkinsbot_internal_base_url() -> str:
+    """
+    Base URL of jenkinsbot's internal HTTP API — ``""`` when it would point back at ourselves.
+
+    jenkinsbot listens on **5008**; the old default here was 5000, which is the duty bot's OWN
+    port, so every internal call looped back into this process and 404'd instead of reaching
+    jenkinsbot. Refuse the loopback outright rather than emitting a confusing HTTP error.
+    """
     host = (os.environ.get("JENKINS_BOT_HOST") or "127.0.0.1").strip() or "127.0.0.1"
-    port = (os.environ.get("JENKINS_BOT_PORT") or "5000").strip() or "5000"
+    port = (os.environ.get("JENKINS_BOT_PORT") or "5008").strip() or "5008"
+    if port == _duty_bot_own_port() and host in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+        print(
+            f"⚠️ jenkinsbot internal call refused: resolved {host}:{port} is THIS bot's own port "
+            "— set JENKINS_BOT_PORT (jenkinsbot listens on 5008).",
+            flush=True,
+        )
+        return ""
     return f"http://{host}:{port}"
 
 
@@ -4315,7 +4334,10 @@ def _jenkinsbot_search_vpn_conf(query: str) -> tuple[list[dict], str | None]:
     q = (query or "").strip()
     if not q:
         return [], "empty query"
-    url = _jenkinsbot_internal_base_url() + "/internal/vpn-conf-search"
+    base = _jenkinsbot_internal_base_url()
+    if not base:
+        return [], "jenkinsbot port misconfigured (points at this bot) — set JENKINS_BOT_PORT=5008"
+    url = base + "/internal/vpn-conf-search"
     try:
         r = requests.post(
             url,
@@ -4342,7 +4364,10 @@ def _jenkinsbot_deliver_vpn_conf(
     reply_message_id: str | None = None,
 ) -> tuple[bool, str]:
     """Ask jenkinsbot to download + send one ``.conf`` into this chat."""
-    url = _jenkinsbot_internal_base_url() + "/internal/vpn-conf-deliver"
+    base = _jenkinsbot_internal_base_url()
+    if not base:
+        return False, "jenkinsbot port misconfigured (points at this bot) — set JENKINS_BOT_PORT=5008"
+    url = base + "/internal/vpn-conf-deliver"
     payload = {
         "chat_id": chat_id,
         "build": int(row.get("build") or 0),
@@ -10114,14 +10139,21 @@ def _updatemore_split_segments_by_environment(segments: list[dict]) -> list[dict
                     ]
                     pieces = []
                     for i, (env, svcs) in enumerate(owner.items()):
-                        pieces.append(
-                            {
-                                "env_line": seg.get("env_line"),
-                                "lines": [f"environment: {env}", *keep, "services:", *svcs],
-                                "email_subject": seg.get("email_subject") if i == 0 else None,
-                                "same_as_prev": True if i > 0 else bool(seg.get("same_as_prev")),
-                            }
+                        # Every piece keeps the parent's ``Email:`` subject so the pieces re-batch
+                        # into ONE reply. Giving it to piece 1 only sent a partial-row Reply-All
+                        # per piece and left the real batch "pending" forever (no email at all).
+                        # ``email_batch_id`` / ``email_batch_indices`` are dropped on purpose:
+                        # they index the OLD segment list and are wrong the moment we re-index.
+                        # Callers MUST re-run ``updatemore.assign_email_batches`` on the result.
+                        piece = dict(seg)
+                        piece.pop("email_batch_id", None)
+                        piece.pop("email_batch_indices", None)
+                        piece["lines"] = [f"environment: {env}", *keep, "services:", *svcs]
+                        piece["email_subject"] = seg.get("email_subject")
+                        piece["same_as_prev"] = (
+                            True if i > 0 else bool(seg.get("same_as_prev"))
                         )
+                        pieces.append(piece)
                     print(
                         f"→ /updatemore: split one segment across {len(owner)} environments "
                         f"({', '.join(owner)}) — they share a job link, so they run in order.",
@@ -10192,6 +10224,13 @@ def _fpms_maybe_split_run_by_environment(
         version = str(data.get("version") or "").strip()
         headline = _jenkins_update_first_non_empty_line(raw_prompt_body or "")
         headline = JENKINS_UPDATE_CMD_RE.sub("", headline, count=1).strip() or "update"
+        # The run's ``Email:`` subject has to survive the split. Dropping it (the old
+        # ``email_subject: None``) meant a request that asked for a customer reply produced two
+        # builds and NO email at all. Every piece carries it, so ``assign_email_batches`` below
+        # re-batches them into one reply holding both environments' rows.
+        email_subject = um.parse_email_from_update_body(raw_prompt_body or "") or (
+            _fpms_lark_session_email_subject(session_key) or None
+        )
         segments: list[dict] = []
         for i, (env, svcs) in enumerate(owner.items()):
             lines = [f"environment: {env}"]
@@ -10204,10 +10243,11 @@ def _fpms_maybe_split_run_by_environment(
                 {
                     "env_line": headline,
                     "lines": lines,
-                    "email_subject": None,
+                    "email_subject": email_subject,
                     "same_as_prev": i > 0,
                 }
             )
+        # Re-index safety: batch ids/indices must be computed against THIS list's positions.
         um.assign_email_batches(segments)
         q = um.init_queue(
             segments,
@@ -15112,7 +15152,10 @@ def _fpms_lark_preserve_updatemore_queue(prev: dict | None, sess: dict) -> dict:
             try:
                 import updatemore as um
 
-                um.persist_queue(q)
+                # if_current, not persist_queue: the per-chat store is keyed by chat id alone, so
+                # writing unconditionally from a finishing run buries a newer /updatemore's queue
+                # — and that store is exactly what the reply path falls back to.
+                um.persist_queue_if_current(q)
             except Exception:
                 pass
         em = (prev.get("email_reply_subject") or "").strip()
@@ -15166,11 +15209,15 @@ def _fpms_lark_finish_jenkins_run_session(
             # Stop the declined sequence so a new run doesn't inherit it.
             q["stopped"] = True
             try:
-                um.sync_chat_updatemore_queue(str(q.get("chat_id") or ""), None)
+                # if_current: an unconditional clear here evicted a second /updatemore's live
+                # queue from the chat-keyed store, which then reads as "superseded".
+                um.release_chat_queue(str(q.get("chat_id") or ""), q)
             except Exception:
                 pass
     if keep_q is not None:
-        um.persist_queue(keep_q)
+        # Runs at the END of a segment's Playwright thread — the longest window in which a second
+        # /updatemore can have taken the chat, so this write in particular must not clobber it.
+        um.persist_queue_if_current(keep_q)
         return
     _fpms_lark_clear_session_key(session_key)
 
@@ -15201,6 +15248,95 @@ def _fpms_lark_jenkins_bot_open_id() -> str:
     if not raw:
         raw = "ou_45cc096780a23354f0719c9635765985"
     return raw
+
+
+def _updatemore_queue_superseded(session_key: str, q: dict) -> bool:
+    """True only when a DIFFERENT, actually-present queue now owns this session row.
+
+    Call with ``_fpms_lark_sessions_lock`` held. The distinction matters in both directions:
+    treating a missing row as superseded strands a live run (the row is emptied by
+    ``clear_queue_from_session`` and replaced wholesale by the error paths), while treating a
+    replaced row as ours buries the newer run's email batch.
+    """
+    sess = _fpms_lark_sessions.get(session_key)
+    if isinstance(sess, dict):
+        other = sess.get("updatemore_queue")
+        if other is not None and other is not q:
+            return True
+    # A second /updatemore from a DIFFERENT user lands under a different session key, so the row
+    # above still shows ours. The per-chat store is keyed by chat id alone and init_queue mirrors
+    # into it immediately, so it is the only place that newer run is visible.
+    try:
+        import updatemore as _um
+
+        cid = str(q.get("chat_id") or "").strip()
+        if cid:
+            with _um._chat_updatemore_lock:
+                cur = _um._chat_updatemore_queues.get(cid)
+            if cur is not None and cur is not q:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _updatemore_email_watch_exists(q: dict, seg_idx: int, title: str) -> bool:
+    """
+    True when ``(seg_idx, title)`` is already being watched on this queue.
+
+    Build can be clicked / notified twice for one segment (retry, re-click, resumed session).
+    A second watch is never harmless: ``record_email_build_success`` pops exactly one watch per
+    callback, so the spare one keeps ``queue_has_outstanding_work`` true forever and can bind a
+    later callback to the wrong segment.
+    """
+    import updatemore as _um
+
+    key = _um.normalize_email_key(title)
+    for w in q.get("email_watches") or []:
+        if not isinstance(w, dict):
+            continue
+        try:
+            if int(w.get("seg_idx", -1)) != int(seg_idx):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if _um.normalize_email_key(str(w.get("title") or "")) == key:
+            return True
+    return False
+
+
+def _fpms_lark_warn_email_watch_without_build_number(
+    send, chat_id: str, *, folder_url: str, email: str
+) -> None:
+    """
+    Say out loud that no automatic reply-email will go out, instead of posting a broken command.
+
+    ``/SuccessInformMeTime <url> | <subject>`` **without a build number** is worse than useless:
+    it parses to a build of None, so ``_start_jenkins_watch_from_url`` returns ``no_build_number``
+    (jenkinsbot main.py ~882) before any watcher thread exists. jenkinsbot answers only with its
+    Chinese "请指定构建号" reply — NO watch is armed, NO "Jenkins Finished" card is posted, the
+    duty callback never fires and the customer reply is never sent; on our side nothing logs an
+    error either, so the run just goes silent. That is exactly the reported symptom, so post the
+    manual command as **text** (no ``<at>`` tag, which would only replay the same no-op) and let
+    a human fire it once the real build number is known.
+    """
+    subject = (email or "").strip()
+    print(
+        "[jenkinsupdate] build number unresolved — NOT posting /SuccessInformMeTime "
+        f"(folder={folder_url!r}, email={subject!r}); automatic reply-email skipped.",
+        flush=True,
+    )
+    try:
+        send(
+            chat_id,
+            "⚠️ Build started, but I could not read its **build number** from Jenkins.\n"
+            "**No automatic reply-email will be sent** for this run.\n"
+            "Once the build number is visible on the job page, send this manually:\n"
+            f"`@jenkinsbot /SuccessInformMeTime {folder_url} <BUILD> | {subject}`\n"
+            "(replace `<BUILD>` with the real number — without it jenkinsbot cannot watch it).",
+        )
+    except Exception as ex:
+        print(f"⚠️ could not post missing-build-number notice: {ex!r}", flush=True)
 
 
 def _fpms_lark_notify_jenkins_after_build_click(
@@ -15238,12 +15374,15 @@ def _fpms_lark_notify_jenkins_after_build_click(
             jenkins_oid = ""
         bn = build_number if isinstance(build_number, int) and build_number > 0 else None
         if email and jenkins_oid:
+            if not bn:
+                # No build number => jenkinsbot cannot bind the email to a watch (see helper).
+                _fpms_lark_warn_email_watch_without_build_number(
+                    send, chat_id, folder_url=folder_url, email=email
+                )
+                return
             at = f'<at user_id="{jenkins_oid}">jenkinsbot</at>'
             tail = f" | {email}"
-            if bn:
-                send(chat_id, f"{at} /SuccessInformMeTime {folder_url} {bn}{tail}".strip())
-            else:
-                send(chat_id, f"{at} /SuccessInformMeTime {folder_url}{tail}".strip())
+            send(chat_id, f"{at} /SuccessInformMeTime {folder_url} {bn}{tail}".strip())
             return
         _fpms_lark_send_build_completed_plain_ping(
             send, chat_id, folder_url=folder_url, build_number=build_number
@@ -15278,27 +15417,75 @@ def _fpms_lark_notify_jenkins_after_build_click(
         if email:
             cmd = "/SuccessInformMeTime"
             tail = f" | {email}" if email else ""
-            um.register_email_build_watch(q, seg_idx=seg_idx, email_title=email)
+            # The watch is the only thing that binds jenkinsbot's email-done callback back to THIS
+            # queue (``handle_jenkins_email_done`` now requires it), so it must be mutated under
+            # the lock and written through. Registering it outside the lock and never persisting
+            # meant the per-chat fallback store could miss it: once the session row was gone the
+            # callback was handled as a standalone single update — done card, no batched email.
             with _fpms_lark_sessions_lock:
-                sess_w = _fpms_lark_sessions.get(session_key)
-                if isinstance(sess_w, dict):
-                    sess_w["updatemore_queue"] = q
+                # Write through ONLY while the session still points at this very queue object.
+                # We can sit in send() for hundreds of ms; a second /updatemore in that window
+                # calls init_queue, which mirrors the NEW queue into the per-chat store and
+                # replaces the session row. Persisting our (older, finished) queue on top would
+                # bury the new run's email batch — its customer reply would never be sent.
+                # A row that exists but carries NO queue is NOT a newer owner: reading that as
+                # "superseded" stranded a perfectly live run (the session row is emptied by
+                # clear_queue_from_session and by the error paths that swap in a state-only dict).
+                if not _updatemore_queue_superseded(session_key, q):
+                    if not _updatemore_email_watch_exists(q, seg_idx, email):
+                        um.register_email_build_watch(q, seg_idx=seg_idx, email_title=email)
+                    sess_w = _fpms_lark_sessions.get(session_key)
+                    if isinstance(sess_w, dict):
+                        sess_w["updatemore_queue"] = q
+                    # persist_queue_if_current, not persist_queue: the per-chat store is keyed by
+                    # chat id alone, so a second user's newer /updatemore is invisible to the
+                    # session-keyed test above.
+                    um.persist_queue_if_current(q)
         else:
             cmd = "/SuccessInformMe"
             tail = ""
-        if bn:
+        if email and not bn:
+            # A build-number-less /SuccessInformMeTime is a silent no-op on jenkinsbot's side (see
+            # the helper). The watch above stays armed, so the manual command still completes the
+            # batch whenever someone runs it.
+            _fpms_lark_warn_email_watch_without_build_number(
+                send, chat_id, folder_url=folder_url, email=email
+            )
+        elif bn:
             send(chat_id, f"{at} {cmd} {folder_url} {bn}{tail}".strip())
         else:
             send(chat_id, f"{at} {cmd} {folder_url}{tail}".strip())
 
     if next_same:
         with _fpms_lark_sessions_lock:
-            sess2 = _fpms_lark_sessions.get(session_key)
-            if isinstance(sess2, dict):
-                q2 = sess2.get("updatemore_queue")
-                if isinstance(q2, dict):
-                    q2["waiting_jenkins"] = True
-                    um.persist_queue(q2)
+            # Flag the queue we already hold. The old fresh session lookup could find nothing
+            # (session row cleared by the run that just finished) and then the gate was never
+            # armed at all — segment 2 started on top of segment 1's build. But re-read the row
+            # first: if a second /updatemore has parked a NEWER queue here (init_queue also
+            # mirrors it into the per-chat store), writing ours back would strand that run's
+            # email batch. Only touch the stores while they still hold this exact object.
+            superseded = _updatemore_queue_superseded(session_key, q)
+            if not superseded:
+                q["waiting_jenkins"] = True
+                sess2 = _fpms_lark_sessions.get(session_key)
+                if isinstance(sess2, dict):
+                    sess2["updatemore_queue"] = q
+                um.persist_queue_if_current(q)
+        # Say which of the two actually happened. Posting the ⏳ line unconditionally told the
+        # chat a gate was armed when the superseded branch had just skipped arming it.
+        if superseded:
+            print(
+                f"[jenkinsupdate] same-job gate not armed: a newer /updatemore owns "
+                f"chat={chat_id!r}",
+                flush=True,
+            )
+            send(
+                chat_id,
+                "ℹ️ The next segment of the **previous** `/updatemore` was **not** queued — a "
+                "newer `/updatemore` has taken over this chat. Resend that block if you still "
+                "need it.",
+            )
+            return
         send(
             chat_id,
             "⏳ Same Jenkins job — waiting for this build to finish before the next segment…",
@@ -15309,13 +15496,33 @@ def _fpms_lark_notify_jenkins_after_build_click(
         idx = int(q.get("index") or 0) + 1
         segs = q.get("segments") or []
         if idx < len(segs):
+            # Same anti-clobber rule as the next_same gate above, and for the same reason: the
+            # old code wrote OUR idx onto whatever queue the session happened to hold. If a second
+            # /updatemore parked a newer queue here, that run's index jumped to 1 — its segment 1
+            # was skipped, its email batch never completed and its customer reply never went out.
             with _fpms_lark_sessions_lock:
-                sess3 = _fpms_lark_sessions.get(session_key)
-                if isinstance(sess3, dict):
-                    q3 = sess3.get("updatemore_queue")
-                    if isinstance(q3, dict):
-                        q3["index"] = idx
-                        um.persist_queue(q3)
+                superseded = _updatemore_queue_superseded(session_key, q)
+                if not superseded:
+                    q["index"] = idx
+                    sess3 = _fpms_lark_sessions.get(session_key)
+                    if isinstance(sess3, dict):
+                        sess3["updatemore_queue"] = q
+                    um.persist_queue_if_current(q)
+            if superseded:
+                # A newer run owns this chat now; starting our next segment on top of it is the
+                # wrong action, not a missing one — but say so, because a silent return here is
+                # indistinguishable from the "build succeeded and then nothing happened" report.
+                print(
+                    f"[jenkinsupdate] next-segment dispatch skipped (idx={idx}): a newer "
+                    f"/updatemore owns chat={chat_id!r}",
+                    flush=True,
+                )
+                send(
+                    chat_id,
+                    f"ℹ️ Segment {idx + 1} was **not** started — a newer `/updatemore` has taken "
+                    "over this chat. Resend that block if you still need it.",
+                )
+                return
             send(chat_id, f"▶️ Different environment — starting segment {idx + 1}…")
             try:
                 _dispatch_lark_update_command_body(
@@ -15988,13 +16195,24 @@ def _dispatch_lark_update_command_body(
         email_subj = um.parse_email_from_update_body(body)
     except Exception:
         email_subj = None
-    if email_subj:
-        with _fpms_lark_sessions_lock:
-            prev = _fpms_lark_sessions.get(key)
+    # The sticky subject describes THIS dispatch only. It used to be write-once-never-clear, so a
+    # later /update with no ``Email:`` line inherited the previous run's subject and replied into
+    # an unrelated customer thread. Set it when this body has one, delete it when it does not.
+    with _fpms_lark_sessions_lock:
+        prev = _fpms_lark_sessions.get(key)
+        if email_subj:
             stub = dict(prev) if isinstance(prev, dict) else {}
-            stub["email_reply_subject"] = email_subj.strip()
             _fpms_lark_preserve_updatemore_queue(prev if isinstance(prev, dict) else None, stub)
+            # After ``preserve`` on purpose: preserve copies prev's subject back in, which
+            # used to overwrite the one this body just supplied.
+            stub["email_reply_subject"] = email_subj.strip()
             _fpms_lark_sessions[key] = stub
+        elif isinstance(prev, dict) and prev.get("email_reply_subject"):
+            # Clear IN PLACE. Rebinding the row to a shallow copy on this path would detach every
+            # thread that already closed over ``prev`` — ``_run_jenkins_when_pick_done`` later
+            # writes ``resolved_ids`` / ``pick_index`` onto that dict, and those writes would land
+            # on an orphan no lookup ever sees again.
+            prev.pop("email_reply_subject", None)
 
     if FPMS_PROD_SCRIPT_FLAG_RE.search(body) or _looks_like_fpms_prod_script_paste(body):
         return _fpms_lark_dispatch_fpms_prod_script_parameter_flow(
@@ -16761,6 +16979,11 @@ def handle_lark_jenkins_update_message(
             return True
         # A segment naming services from two Environments of one job is two builds, not one.
         segments = _updatemore_split_segments_by_environment(segments)
+        # The split re-indexes the list, so the batch ids/indices ``parse_updatemore_body``
+        # assigned now point at the wrong positions (surviving siblings kept their old index).
+        # Re-batch against the NEW positions before the queue is built — otherwise multi-env jobs
+        # send one partial Reply-All per piece and the real batch never completes.
+        um.assign_email_batches(segments)
         with _fpms_lark_sessions_lock:
             prev = _fpms_lark_sessions.get(key)
             if isinstance(prev, dict):

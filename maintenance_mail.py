@@ -122,6 +122,15 @@ _JENKINS_REPLY_QUOTE_RETRIES = max(
 _JENKINS_REPLY_QUOTE_RETRY_DELAY = float(
     os.getenv("JENKINS_REPLY_QUOTE_RETRY_DELAY", "").strip() or "2"
 )
+# Wall-clock ceiling on the whole thread walk in _thread_newest_quote. Each member it tries
+# costs a fresh IMAP re-read of up to _JENKINS_REPLY_QUOTE_TIMEOUT, so an unbounded walk down a
+# long thread could outlast the whole reply for a decoration. This started out as a COUNT cap
+# ("try 3 members") and that was the wrong axis: three bounces in a row ended the walk with
+# minutes of budget unspent, and the reply lost a collapsible thread it could easily have had.
+# Bound the thing that actually hurts — time. ~3 worst-case re-reads, many more when fast.
+_JENKINS_REPLY_QUOTE_WALK_BUDGET = max(
+    5.0, float(os.getenv("JENKINS_REPLY_QUOTE_WALK_BUDGET", "").strip() or "90")
+)
 # Inline (cid:) images referenced by the quoted original are re-attached so the reply looks
 # like a manual Reply All instead of showing broken-image placeholders. Caps keep a vendor
 # mail with huge embedded screenshots from turning a working reply into an SMTP 552.
@@ -563,6 +572,36 @@ except Exception as _sm_err:  # noqa: BLE001 — availability is what matters, n
     )
 else:
     _SUBJECT_MATCH_ERROR = ""
+
+_MAIL_PASSWORD_WARNED = False
+
+
+def warn_if_no_mail_password() -> None:
+    """Say it once, at boot, that the mailbox password is missing — never raise.
+
+    Without it every IMAP/SMTP entry point below raises ``MAINTENANCE_MAIL_PASSWORD not set``,
+    but the FIRST place anyone notices is the 6am Jenkins run, when the customer reply silently
+    does not go out and the only trace is one exception on a detached thread. Raising at import
+    is not an option (Jenkins form filling, VPN creation and every card work fine without mail),
+    so this is a banner loud enough to be seen in the boot log instead.
+    """
+    global _MAIL_PASSWORD_WARNED
+    if MAIL_PASSWORD or _MAIL_PASSWORD_WARNED:
+        return
+    _MAIL_PASSWORD_WARNED = True
+    print(
+        "\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        "!!  [maint-mail] MAINTENANCE_MAIL_PASSWORD IS NOT SET.\n"
+        "!!  EVERY Jenkins done-reply email WILL FAIL, and so will the IMAP watcher,\n"
+        "!!  the allemail.json index and /replyupdateemail. Nothing else is affected.\n"
+        f"!!  Fix: set MAINTENANCE_MAIL_PASSWORD (mailbox {MAIL_USER}) in .env, restart.\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+        flush=True,
+    )
+
+
+warn_if_no_mail_password()
 
 
 def _require_subject_match() -> None:
@@ -2162,6 +2201,16 @@ class JenkinsReplyOnlyBouncesError(EmailThreadNotFoundError):
     """Subject matches exist but every candidate was a delivery-failure / bounce notice."""
 
 
+class JenkinsReplyTimeoutError(EmailThreadNotFoundError):
+    """The live IMAP search ran out of its wall-clock budget before it found anything.
+
+    Subclasses EmailThreadNotFoundError on purpose: every caller already handles that, and the
+    outcome is the same — nothing was sent, so re-running is safe. It exists only so the user
+    is told "the search timed out, try again" instead of "this email does not exist", which is
+    a different problem with a different fix.
+    """
+
+
 # Failures that mean the message was NEVER transmitted, so the caller may safely fall back
 # and retry. Resolved once at import: evaluating this inside an ``except`` clause would make a
 # lookup error silently disable the double-send protection.
@@ -2618,6 +2667,13 @@ _JENKINS_REPLY_FIND_RETRIES = max(
 )
 _JENKINS_REPLY_FIND_RETRY_DELAY = max(
     0.0, float(os.getenv("JENKINS_REPLY_FIND_RETRY_DELAY", "").strip() or "8")
+)
+# Wall-clock ceiling on the WHOLE live fallback (every find retry plus the quote walk). Neither
+# had a deadline of its own: one subject search measured ~150s against a 36k-message folder, and
+# the caller is a detached thread behind an HTTP 202, so "still trying" and "hung forever" looked
+# identical from the chat. Floored at 30s so a typo'd env value cannot disable the search itself.
+_JENKINS_REPLY_TOTAL_BUDGET = max(
+    30.0, float(os.getenv("JENKINS_REPLY_TOTAL_BUDGET", "").strip() or "180")
 )
 # #2 Large folders (>500 msgs) with no server subject-hit: tail-scan newest N instead of bailing.
 _JENKINS_REPLY_LARGE_FOLDER_TAILSCAN = (
@@ -5744,7 +5800,8 @@ def _send_jenkins_reply_all(
     orig_message_id: str,
     orig_references: str,
     quote_source: email.message.Message | None = None,
-) -> bool:
+    folder: str = "",
+) -> tuple[bool, dict[str, str]]:
     """Build + send the Reply-All, threading in the original via In-Reply-To.
 
     With ``quote_source`` (the parsed original) the mail goes out as a single
@@ -5753,7 +5810,13 @@ def _send_jenkins_reply_all(
     manual **Reply All**. Without it (or if building the quote fails) it falls back to the
     old plain-text body, so a reply is never lost just because quoting failed.
 
-    Returns True when the sent mail carried the quoted thread.
+    ``folder`` is only carried through to the SMTP log line so a send can be traced back to
+    the thread it answered; it changes nothing about the message.
+
+    Returns ``(quoted, refused)``: whether the sent mail carried the quoted thread, and the
+    recipients the server REJECTED — ``{address: "550 No such user"}``, empty on a clean send.
+    smtplib raises only when EVERY recipient is refused, so a partial refusal used to be
+    dropped on the floor here and the Lark confirmation card listed people who got nothing.
     """
     quoted = False
     msg: email.message.Message | None = None
@@ -5789,28 +5852,135 @@ def _send_jenkins_reply_all(
     ctx = ssl.create_default_context()
     # Serialise before connecting: a MIME/encoding fault here never touched the wire.
     payload = msg.as_string()
+    # smtplib.sendmail() normalises the line endings and ascii-encodes the body BEFORE it opens
+    # the transaction — that is exactly why UnicodeEncodeError counts as pre-delivery above.
+    # smtp.data() only encodes after the server's 354, so do it here instead or the explicit
+    # phases below would re-tag a bad header as "maybe sent" and block the retry that fixes it.
+    wire = re.sub(r"(?:\r\n|\r|\n)", "\r\n", payload).encode("ascii")
+    sent_msgid = (msg.get("Message-ID") or "").strip()
+    _sig = f"subject={reply_subject!r} msgid={sent_msgid} rcpt={len(recipients)}"
     # Only failures that can leave the message mid-transaction may be re-tagged as
     # maybe-delivered — a timeout reading the 250 after DATA still leaves it delivered, and a
     # caller that "recovers" from that sends the same Reply-All to the whole thread twice.
     # Pre-DATA refusals are the opposite case: nothing was transmitted, so they must stay
     # recoverable or a single dead Cc address would permanently block the reply.
     sent_attempted = False
+    raw_refused: dict[str, tuple[int, Any]] = {}
     try:
         with smtplib.SMTP_SSL(
             SMTP_HOST, SMTP_PORT, timeout=IMAP_TIMEOUT, context=ctx
         ) as smtp:
             smtp.login(MAIL_USER, MAIL_PASSWORD)
-            sent_attempted = True
-            smtp.sendmail(MAIL_USER, recipients, payload)
-    except _SMTP_PRE_DELIVERY_ERRORS:
+            if all(callable(getattr(smtp, ph, None)) for ph in ("mail", "rcpt", "data")):
+                # Drive MAIL FROM / RCPT TO / DATA by hand instead of sendmail(). sendmail()
+                # is one opaque call, so the "handed over" flag had to be set before it — and a
+                # disconnect during RCPT TO, strictly before any body byte moved, was then
+                # reported as "it may have gone out, check before re-running". Nothing had gone
+                # out, and that warning is precisely what stopped the retry that would have
+                # worked. Now the flag flips only once the body is actually going.
+                mail_opts = (
+                    [f"size={len(wire)}"]
+                    if getattr(smtp, "does_esmtp", 0) and smtp.has_extn("size")
+                    else []
+                )
+                code, resp = smtp.mail(MAIL_USER, mail_opts)
+                if code != 250:
+                    # 421 means the server is closing the channel: RSET (and the QUIT on
+                    # __exit__) would only trade this refusal for a disconnect error, exactly
+                    # as smtplib.sendmail() closes instead of RSETting here.
+                    if code == 421 and callable(getattr(smtp, "close", None)):
+                        smtp.close()
+                    else:
+                        _smtp_rset_quietly(smtp)
+                    raise smtplib.SMTPSenderRefused(code, resp, MAIL_USER)
+                for rcpt_addr in recipients:
+                    rcode, rresp = smtp.rcpt(rcpt_addr)
+                    if rcode not in (250, 251):
+                        raw_refused[rcpt_addr] = (rcode, rresp)
+                    if rcode == 421:
+                        # smtplib.sendmail() aborts the loop on a 421, and dropping that was a
+                        # real regression: the server has said it is closing, so the NEXT
+                        # rcpt() raises SMTPServerDisconnected — which is NOT in
+                        # _SMTP_PRE_DELIVERY_ERRORS, so an accurate "all recipients refused"
+                        # escaped as a generic failure. Nothing was transmitted either way.
+                        if callable(getattr(smtp, "close", None)):
+                            smtp.close()  # QUIT on __exit__ would mask this
+                        raise smtplib.SMTPRecipientsRefused(raw_refused)
+                if len(raw_refused) == len(recipients):
+                    # Same shape smtplib.sendmail() raises when nobody is left to deliver to:
+                    # pre-DATA, so it stays recoverable.
+                    _smtp_rset_quietly(smtp)
+                    raise smtplib.SMTPRecipientsRefused(raw_refused)
+                sent_attempted = True
+                data_reply = smtp.data(wire) or (250, b"")
+                if data_reply[0] != 250:
+                    # smtp.data() RETURNS the final reply where sendmail() raises on it. Left
+                    # unchecked, a body the server rejected outright (552 too big) would be
+                    # reported as delivered — the exact "card posted, no mail sent" silence
+                    # this whole change is about. SMTPDataError keeps it pre-delivery, so the
+                    # taxonomy above is unchanged.
+                    if data_reply[0] == 421 and callable(getattr(smtp, "close", None)):
+                        smtp.close()  # service closing: QUIT on __exit__ would mask this
+                    else:
+                        _smtp_rset_quietly(smtp)
+                    raise smtplib.SMTPDataError(data_reply[0], data_reply[1])
+            else:
+                # Anything that does not expose the low-level phases (the SMTP stand-in in
+                # tests/test_reply_send_path.py) keeps the original one-shot call, so this path
+                # is never LESS capable than it was.
+                sent_attempted = True
+                raw_refused = smtp.sendmail(MAIL_USER, recipients, payload) or {}
+    except _SMTP_PRE_DELIVERY_ERRORS as ex:
+        print(f"[maint-mail] SMTP FAIL {_sig} folder={folder!r} not-sent err={ex!r}", flush=True)
         raise  # rejected before delivery — nothing on the wire, so a retry is safe
     except Exception as ex:
+        state = "maybe-sent" if sent_attempted else "not-sent"
+        print(f"[maint-mail] SMTP FAIL {_sig} folder={folder!r} {state} err={ex!r}", flush=True)
         if sent_attempted:
             raise JenkinsReplyMaybeSentError(
                 f"SMTP failed after the message was handed to the server: {ex!r}"
             ) from ex
         raise
-    return quoted
+    refused = {
+        addr: f"{code} {_smtp_reply_text(resp)}".strip()
+        for addr, (code, resp) in (raw_refused or {}).items()
+    }
+    # The one step in the whole pipeline that used to produce no log line at all — so "the card
+    # was posted but no mail arrived" had nothing to check against.
+    print(
+        f"[maint-mail] SMTP OK {_sig} refused={len(refused)} folder={folder!r}",
+        flush=True,
+    )
+    if refused:
+        print(
+            f"⚠️ [maint-mail] SMTP accepted the message but REFUSED {len(refused)} of "
+            f"{len(recipients)} recipient(s) — they received nothing: {refused}",
+            flush=True,
+        )
+    return quoted, refused
+
+
+def _smtp_reply_text(resp: Any) -> str:
+    """SMTP replies come back as bytes — decode them so a refusal is printable and JSON-safe.
+
+    The refused map ends up in a result dict that updatemore.py renders into a Lark card;
+    ``b'No such user'`` there would reach the operator as a Python repr.
+    """
+    if isinstance(resp, (bytes, bytearray)):
+        return bytes(resp).decode("utf-8", "replace").strip()
+    return str(resp or "").strip()
+
+
+def _smtp_rset_quietly(smtp: Any) -> None:
+    """RSET after a refusal, exactly as smtplib.sendmail does — and never mask the refusal.
+
+    The real error is the refusal we are about to raise; a socket that also dies on the RSET
+    must not replace it with something unrelated one line before the caller sees it.
+    """
+    try:
+        smtp.rset()
+    except Exception:  # noqa: BLE001 — best-effort cleanup on a connection we are abandoning
+        pass
 
 
 def _resolve_cache_quote_source(
@@ -5970,12 +6140,26 @@ def _thread_newest_quote(
         print(f"[allemail] thread-latest lookup failed: {ex!r}", flush=True)
         return None, None
     skip = _normalize_message_id(message_id)
+    walk_start = time.monotonic()
+    tried = 0
     for m in members:
         mid_n = _normalize_message_id(m.get("message_id") or "")
         if mid_n and mid_n == skip:
             continue
         if float(m.get("date_ts") or 0.0) < not_older_than:
             break  # newest-first: everything below here is older than what we already have
+        _walked = time.monotonic() - walk_start
+        if tried and _walked >= _JENKINS_REPLY_QUOTE_WALK_BUDGET:
+            # Measured over the RE-READS only: the cheap header filters above are free, each
+            # re-read below is another IMAP round trip of up to the quote timeout. ``tried``
+            # keeps the first member unconditional, so a walk can never end without trying one.
+            print(
+                f"[allemail] gave up quoting after {tried} thread member(s) / {_walked:.0f}s — "
+                "replying with whatever the caller already has",
+                flush=True,
+            )
+            break
+        tried += 1
         q_raw = (m.get("message_id") or "").strip()
         msg, route = _resolve_cache_quote_source(
             title=title,
@@ -6130,7 +6314,7 @@ def _reply_jenkins_update_done_email_via_cache(
     target_ts = float(cached.get("date_ts") or 0.0)
     age_days = (time.time() - target_ts) / 86400.0 if target_ts > 0 else -1.0
 
-    quoted = _send_jenkins_reply_all(
+    quoted, refused = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
@@ -6139,6 +6323,7 @@ def _reply_jenkins_update_done_email_via_cache(
         orig_message_id=orig_mid,
         orig_references=orig_refs,
         quote_source=quote_src,
+        folder=cached_folder,
     )
     envs = ", ".join(c[0] for c in completions)
     level = "" if quoted else "⚠️ "
@@ -6158,6 +6343,9 @@ def _reply_jenkins_update_done_email_via_cache(
         "subject": subj,
         "source": "allemail-cache",
         "quoted": quoted,
+        # {address: "550 reason"} for anyone the server rejected while still accepting the
+        # message for the rest — the card must not claim they were replied to.
+        "refused": refused,
         "threaded": bool(orig_mid),
         "quote_route": quote_route,
         "target_subject": cached.get("subject") or "",
@@ -6253,6 +6441,10 @@ def reply_jenkins_update_done_email(
     if no matching mail exists in either.
 
     Returns ``{"to": [...], "cc": [...], "folder": str, "subject": str}``.
+
+    The whole live fallback (find retries + the quote walk) is bounded by
+    ``JENKINS_REPLY_TOTAL_BUDGET`` seconds; running out before anything was found raises
+    :class:`JenkinsReplyTimeoutError` — nothing sent, safe to re-run.
     """
     if not MAIL_PASSWORD:
         raise RuntimeError("MAINTENANCE_MAIL_PASSWORD not set")
@@ -6304,21 +6496,59 @@ def reply_jenkins_update_done_email(
                 f"({ex!r}) — falling back to live IMAP search.",
                 flush=True,
             )
+    # Stamped HERE, after the cache attempt, because the budget is only ever CHECKED below.
+    # Started earlier it would bill the cache path's own IMAP re-reads to the live fallback,
+    # and a slow-but-rejected cache attempt could then make attempt 1 raise
+    # JenkinsReplyTimeoutError without searching at all — losing a reply that used to go out.
+    t_start = time.monotonic()
     orig_found = None
     _attempts = _JENKINS_REPLY_FIND_RETRIES
+    _budget_out = False
     for _attempt in range(1, _attempts + 1):
+        # Never START a search there is no time left to finish. One pass measured ~150s against
+        # a 36k-message folder, so an unchecked third attempt is another two and a half minutes
+        # of a reply that the user has long since given up on.
+        _left = _JENKINS_REPLY_TOTAL_BUDGET - (time.monotonic() - t_start)
+        if _left <= 0:
+            _budget_out = True
+            print(
+                f"[maint-mail] jenkins reply: {_JENKINS_REPLY_TOTAL_BUDGET:.0f}s budget spent "
+                f"before attempt {_attempt}/{_attempts} for {title!r} — giving up",
+                flush=True,
+            )
+            break
         # JenkinsReplyOnlyBouncesError propagates (retrying a bounce-only match won't help).
         orig_found = find_jenkins_reply_message_by_subject_title(title)
         if orig_found is not None:
             break
         if _attempt < _attempts:
+            # Sleeping past the deadline only delays the give-up message.
+            _nap = min(
+                _JENKINS_REPLY_FIND_RETRY_DELAY,
+                max(0.0, _JENKINS_REPLY_TOTAL_BUDGET - (time.monotonic() - t_start)),
+            )
             print(
                 f"[maint-mail] jenkins reply: {title!r} not found "
                 f"(attempt {_attempt}/{_attempts}); retrying in "
-                f"{_JENKINS_REPLY_FIND_RETRY_DELAY:.0f}s (IMAP sync lag / just-arrived mail?)",
+                f"{_nap:.0f}s (IMAP sync lag / just-arrived mail?)",
                 flush=True,
             )
-            time.sleep(_JENKINS_REPLY_FIND_RETRY_DELAY)
+            time.sleep(_nap)
+    if orig_found is None and (
+        _budget_out or (time.monotonic() - t_start) >= _JENKINS_REPLY_TOTAL_BUDGET
+    ):
+        # Raised INSTEAD of the folder-listing diagnostic below — that probe opens yet another
+        # IMAP connection, and we are already over the deadline that got us here. The elapsed
+        # re-check is what catches the LAST attempt overrunning (and every run with
+        # JENKINS_REPLY_FIND_RETRIES=1): the top-of-loop test never runs again, so _budget_out
+        # stays False and control used to fall straight into the probe the timeout exists to
+        # avoid.
+        raise JenkinsReplyTimeoutError(
+            f"Timed out after {_JENKINS_REPLY_TOTAL_BUDGET:.0f}s searching for {title!r} in "
+            f"folder(s): {', '.join(JENKINS_REPLY_IMAP_FOLDERS)}. Nothing was sent — re-run "
+            f"`/replyupdateemail` to try again (raise JENKINS_REPLY_TOTAL_BUDGET if this "
+            f"mailbox is consistently this slow)."
+        )
     if orig_found is None:
         folders = ", ".join(JENKINS_REPLY_IMAP_FOLDERS)
         hint = ""
@@ -6407,25 +6637,38 @@ def reply_jenkins_update_done_email(
     # so the quote block could only ever show ONE message however deep the real thread was.
     # Recipients, the Re: subject and every screen above are untouched: this changes only WHAT
     # IS QUOTED, and what we thread on.
-    newest_src, _newest_entry = _thread_newest_quote(
-        title=title,
-        message_id=(orig.get("Message-ID") or "").strip(),
-        subject=_decode_msg_subject(orig),
-        references=(orig.get("References") or "").strip(),
-        not_older_than=_message_date_ts(orig),
-    )
-    if newest_src is not None:
-        # Thread on what we quote, exactly as the cache path does.
-        anchor, quote_src, quote_note = newest_src, newest_src, "thread-newest"
+    if _JENKINS_REPLY_TOTAL_BUDGET - (time.monotonic() - t_start) <= 0:
+        # Budget gone, but we HAVE a reply target — so send, unquoted. Both branches below
+        # re-read messages over IMAP for the collapsible thread, and that is decoration: the
+        # reply itself is what the customer is waiting for. Same outcome as the existing
+        # quote-failure paths, which also fall back to threading on the original with no quote.
+        print(
+            f"[maint-mail] jenkins reply: {_JENKINS_REPLY_TOTAL_BUDGET:.0f}s budget spent "
+            f"finding {title!r} — sending WITHOUT the collapsible thread",
+            flush=True,
+        )
+        anchor, quote_src, quote_note = orig, None, "skipped-budget"
     else:
-        # Nothing newer indexed (first reply into this thread, or the re-read failed) — keep
-        # the original behaviour, including walking off our own auto-reply to its parent.
-        anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
+        newest_src, _newest_entry = _thread_newest_quote(
+            title=title,
+            message_id=(orig.get("Message-ID") or "").strip(),
+            subject=_decode_msg_subject(orig),
+            references=(orig.get("References") or "").strip(),
+            not_older_than=_message_date_ts(orig),
+        )
+        if newest_src is not None:
+            # Thread on what we quote, exactly as the cache path does.
+            anchor, quote_src, quote_note = newest_src, newest_src, "thread-newest"
+        else:
+            # Nothing newer indexed (first reply into this thread, or the re-read failed) —
+            # keep the original behaviour, including walking off our own auto-reply to its
+            # parent.
+            anchor, quote_src, quote_note = _resolve_live_quote_anchor(orig, orig_folder)
     anchor_mid_raw = (anchor.get("Message-ID") or "").strip()
     # `<>` is degenerate — it would emit an unmatchable `In-Reply-To: <>`. Same guard the
     # cache path applies to its cached id.
     anchor_mid = anchor_mid_raw if _normalize_message_id(anchor_mid_raw) else ""
-    quoted = _send_jenkins_reply_all(
+    quoted, refused = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=to_addrs,
@@ -6434,6 +6677,7 @@ def reply_jenkins_update_done_email(
         orig_message_id=anchor_mid,
         orig_references=(anchor.get("References") or "").strip(),
         quote_source=quote_src if _JENKINS_REPLY_QUOTE_THREAD else None,
+        folder=orig_folder,
     )
     # Index the found original so the NEXT reply to this subject is an instant cache hit —
     # with its UID, so that reply can fetch it directly instead of searching by Message-ID.
@@ -6461,6 +6705,9 @@ def reply_jenkins_update_done_email(
         "subject": subj,
         "source": "live-imap",
         "quoted": quoted,
+        # Same key as the cache path: recipients the server rejected while still accepting the
+        # message for everyone else. Empty dict on a clean send.
+        "refused": refused,
         "threaded": bool(anchor_mid),
         "quote_route": quote_note,
         "target_subject": _decode_msg_subject(orig),
@@ -8210,6 +8457,11 @@ def explain_resolution(res: "subject_match.Res", title: str) -> str:
             "Add something that identifies one: a ticket id, a version, or the date"
         )
     if res.kind == "ambiguous":
+        # A site-code refusal is "ambiguous" with a REASON and often only one group. The generic
+        # sentence then read "matches 1 different threads" and advised adding a version or date,
+        # neither of which can ever clear a CP-vs-CQ conflict — say what actually stopped it.
+        if res.reason:
+            return f"{res.reason} — pick the thread this Done belongs to"
         return (
             f"the title matches {n} different threads and none is a clear best. "
             "Add a ticket id, version or date to single one out"
@@ -8448,7 +8700,7 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
         print(f"Real reply would go to: {', '.join(real[2])}", flush=True)
     print(f"*** TEST SEND — delivering ONLY to: {dest} ***", flush=True)
 
-    quoted = _send_jenkins_reply_all(
+    quoted, refused = _send_jenkins_reply_all(
         reply_subject=subj,
         body=body,
         to_addrs=[dest],
@@ -8457,9 +8709,10 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
         orig_message_id=mid,
         orig_references=cached.get("references") or "",
         quote_source=quote_src,
+        folder=(cached.get("folder") or "").strip(),
     )
     print(
-        f"Sent to {dest} — quoted={quoted} threaded={bool(mid)}.\n"
+        f"Sent to {dest} — quoted={quoted} threaded={bool(mid)} refused={refused or '{}'}.\n"
         "Open it in Lark Mail: the previous email should be folded behind "
         "**Show/Hide email thread**.",
         flush=True,
