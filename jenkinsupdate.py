@@ -8557,6 +8557,28 @@ def _looks_like_fpms_prod_script_paste(body: str) -> bool:
 _cpms_igo_cache_lock = threading.Lock()
 
 
+def _cpms_igo_overlay_from_job_scans(cache: dict) -> dict:
+    """
+    Overlay the per-job scans onto the CPMS/IGO cache.
+
+    Two stores describe the same jobs: this older ``{kind: {env: [...]}}`` file, and the per-job
+    ``jenkins_job_env_services.json`` that ``discover_job_env_services`` keeps current. Reading only
+    the old one meant services present on the live form — ``igo-sw-http-main-apisix-fc-hypergrid``,
+    ``pop-hypergrid-sw-http-main-apisix-pp`` — were reported as "not found in CPMS/IGO UAT".
+    """
+    out = {k: dict(v) for k, v in (cache or {}).items() if isinstance(v, dict)}
+    for kind, url in CPMS_IGO_UAT_URL_BY_KIND.items():
+        learned = job_env_services_for_url(url)
+        if not learned:
+            continue
+        envs = dict(out.get(kind) or {})
+        for env, names in learned.items():
+            if names:
+                envs[env] = list(names)
+        out[kind] = envs
+    return out
+
+
 def _load_cpms_igo_cache() -> dict:
     """Read the persisted ``{kind: {env: [services]}}`` map (``{}`` when missing/corrupt)."""
     with _cpms_igo_cache_lock:
@@ -8576,7 +8598,7 @@ def _load_cpms_igo_cache() -> dict:
             for env, svcs in envs.items()
             if isinstance(svcs, list)
         }
-    return out
+    return _cpms_igo_overlay_from_job_scans(out)
 
 
 def _save_cpms_igo_cache(data: dict) -> None:

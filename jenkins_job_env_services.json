@@ -93,6 +93,7 @@
         "dos-fund-pool-aggregator",
         "dos-fund-pool-app",
         "dos-game-engine",
+        "dos-game-engine-worker",
         "dynamic-jackpot-clickhouse-consumer",
         "dynamic-jackpot-client",
         "dynamic-jackpot-consumer",
@@ -162,6 +163,7 @@
         "igo-sw-http-main-apisix-egs",
         "igo-sw-http-main-apisix-evolive",
         "igo-sw-http-main-apisix-fc",
+        "igo-sw-http-main-apisix-fc-hypergrid",
         "igo-sw-http-main-apisix-ftg",
         "igo-sw-http-main-apisix-gemini",
         "igo-sw-http-main-apisix-hacksaw",
@@ -190,7 +192,7 @@
         "pop-hypergrid-sw-http-main-apisix-pp"
       ]
     },
-    "scanned_at": 1786612673.12902
+    "scanned_at": 1787298412.82597
   },
   "fnt/telesales-uat-update": {
     "envs": {
