@@ -331,7 +331,10 @@ def _looks_like_trailing_chat(line: str) -> bool:
 
 
 def _split_service_tokens(value: str) -> list[str]:
-    parts = re.split(r"[,，;]+|\s{2,}", value or "")
+    # Separators only — never bare runs of whitespace. Splitting on ``\s{2,}`` shattered values
+    # people align with spaces ("PMS  All  service" → ['PMS','All','service']), which destroyed the
+    # single-token form that the update-all check downstream requires.
+    parts = re.split(r"[,，、;；]+", value or "")
     out = []
     for p in parts:
         t = _normalize_colons(p).strip().strip("`*").strip()

@@ -9210,16 +9210,11 @@ def _cpms_igo_route_service(token: str, cache: dict) -> dict:
 
     exact = [r for r in rows if _normalize_service_query_key(r[2]) == qk]
     if exact:
-        # Ambiguous only if the token is a sub-name of OTHER (different) services in a matched env
-        # (e.g. ``cpms`` when ``cpms1`` also exists) — then let the user choose the exact one.
-        siblings: list[tuple[str, str, str]] = []
-        for kind, env, _sid in exact:
-            for s in cache.get(kind, {}).get(env, []):
-                ck = _normalize_service_query_key(s)
-                if qk in ck and ck != qk:
-                    siblings.append((kind, env, s))
-        if siblings:
-            return {"status": "menu", "candidates": exact + siblings}
+        # An exact service id is the answer, even when longer siblings share it as a prefix.
+        # ``igo-sw-http-main-apisix`` is a real service AND the prefix of 28 others; asking the user
+        # to "re-send the exact one" when they already typed it exactly is pure friction — and it
+        # blocked a 30-service request on its first line. Same rule as
+        # ``_resolve_catalog_token_or_menu``, which returns the exact id without a menu.
         return {"status": "targets", "targets": exact}
 
     # Token is a substring/prefix of service name(s).
@@ -9580,16 +9575,34 @@ def _jenkins_update_headline_is_config_like(headline: str) -> bool:
     return bool(re.match(r"^(?:environment|branch|version|services?)\b", t, re.I))
 
 
+def _jenkins_update_alias_literal_index(q: str, a: str) -> int | None:
+    """
+    Where ``a`` appears in ``q`` as whole words, or ``None``.
+
+    A raw ``a in q`` test made the 3-character alias ``pms`` fire on any headline containing
+    **f**pms or **c**pms, scoring 7.0 — above the "< 2.0 ⇒ show a menu" gate — so nine jobs could
+    not be reached by their own name and all of them silently routed to PMS-UAT-UPDATE. Same class
+    of bug put ``ds`` inside "nee**ds**", "buil**ds**" and "recor**ds**".
+
+    ``-``, ``_`` and whitespace are one separator, so a pasted Jenkins job name
+    (``FPMS_UAT_MASTER_UPDATE``) matches the spaced alias (``fpms uat master``).
+    """
+    sep = r"[\s_\-]+"
+    pat = sep.join(re.escape(w) for w in a.split())
+    m = re.search(rf"(?<![a-z0-9]){pat}(?![a-z0-9])", q)
+    return m.start() if m else None
+
+
 def _jenkins_update_job_score(query_text: str, alias: str) -> float:
     q = JENKINS_UPDATE_CMD_RE.sub("", (query_text or ""), count=1).strip().casefold()
     a = (alias or "").strip().casefold()
     if not q or not a:
         return 0.0
-    # ``/update pms`` → hint ``pms`` must not fuzzy-match ``fpms …`` (substring inside ``fpms``).
-    if q == "pms" and a.startswith("fpms"):
-        return 0.0
-    if a in q:
-        return 2.0 + 10.0 / (1.0 + float(q.index(a)))
+    idx = _jenkins_update_alias_literal_index(q, a)
+    if idx is not None:
+        # Earlier is stronger; a longer alias breaks a positional tie, so a specific
+        # ``igo uat script run`` beats the shorter ``igo uat`` at the same offset.
+        return 2.0 + 10.0 / (1.0 + float(idx)) + 0.001 * len(a)
     best = difflib.SequenceMatcher(None, q, a).ratio()
     for chunk in re.split(r"[\s:：,，;+]+", q):
         c = chunk.strip()
@@ -9602,8 +9615,6 @@ def _jenkins_update_job_score(query_text: str, alias: str) -> float:
         if lc < la:
             r *= lc / la
         best = max(best, r)
-        if a in c:
-            best = max(best, 1.3)
     return best
 
 
@@ -11370,7 +11381,13 @@ _FPMS_PROD_SCRIPT_CMD_LABEL_RE = re.compile(
     r"^(?:[>\-\*\u2022]\s*)*(?:`+|\*{1,2})?command(?:`+|\*{1,2})?\s*[:\-–—]\s*(?P<rest>.*)$",
     re.I,
 )
-_FPMS_PROD_SCRIPT_SKIP_LABEL_RE = re.compile(r"^\s*(?:email|cc)\b", re.I)
+# Lines that are parameter labels, not part of a Command. Without branch/version/env here, a
+# command followed by ``Branch: main`` swallowed it as a continuation line and Jenkins received
+# "python a/b.py Branch: main ENV: prod" as the command.
+_FPMS_PROD_SCRIPT_SKIP_LABEL_RE = re.compile(
+    r"(?i)^\s*(?:email|cc|branch|source[_\s]*branch|version|env|environment|service|services|"
+    r"script|scripts|api|apis|repository|repo|deployment[_\s]*file(?:[_\s]*name)?s?)\s*[:=]"
+)
 
 
 def _split_fpms_prod_script_commands(body: str) -> list[str]:
@@ -13589,17 +13606,7 @@ def _cpms_igo_resolve_tokens_in_env(
         qk = _normalize_service_query_key(tok)
         exact = _catalog_exact_service_id(tok, cat)
         if exact is not None:
-            siblings = [
-                s
-                for s in cat
-                if qk in _normalize_service_query_key(s)
-                and _normalize_service_query_key(s) != qk
-            ]
-            if siblings:
-                opts = "\n".join(f"• `{s}`" for s in [exact] + siblings)
-                return [], (
-                    f"`{tok}` matches several services — re-send the exact one:\n{opts}"
-                )
+            # Exact id wins over prefix-siblings — see _cpms_igo_route_service.
             resolved.append(exact)
             continue
         superset = [s for s in cat if qk and qk in _normalize_service_query_key(s)]
@@ -14975,6 +14982,10 @@ def looks_like_natural_jenkins_update(text: str) -> bool:
         return True
     if _looks_like_fpms_prod_script_paste(raw):
         return True
+    if _body_requests_bi_prod_script(raw):
+        # Added to the dispatcher without being added here, so a BI prod-script request was only
+        # recognised when it happened to contain an unrelated politeness phrase ("please help run").
+        return True
     if _body_requests_bi_script_update(raw):
         return True
     if _looks_like_bi_api_update_paste(raw):
@@ -15007,6 +15018,17 @@ def normalize_natural_jenkins_body(text: str) -> str:
     if _looks_like_fpms_prod_script_paste(raw):
         cmds = _split_fpms_prod_script_commands(raw)
         out = "/jenkinsupdate --fpmsprodscript"
+        if len(cmds) == 1:
+            out += f"\nCommand: {cmds[0]}"
+        elif cmds:
+            out += "\n" + "\n".join(cmds)
+        return out
+    if _body_requests_bi_prod_script(raw):
+        # Must precede the BI-SCRIPT branch: that one rewrites the body to ``/update bi`` + ``API:``
+        # and DROPS the ``python …`` Command line and the job name, which flipped the request from
+        # BI-PROD-SCRIPT-RUN (run this script) to BI-SCRIPT-UPDATE (deploy this script file).
+        cmds = _split_fpms_prod_script_commands(raw)
+        out = "/jenkinsupdate bi prod script run"
         if len(cmds) == 1:
             out += f"\nCommand: {cmds[0]}"
         elif cmds:
@@ -15103,6 +15125,11 @@ def agent_route_free_form_body(raw_text: str) -> str | None:
     if _venue_uat_headline_detect(raw_text):
         # BRAZIL/NEWPORT UAT headlines route via the registry; the FPMS-oriented agent would
         # strip the venue headline. Fall back to ``normalize_natural_jenkins_body``.
+        return None
+    if _body_requests_bi_prod_script(raw_text):
+        # BI-PROD-SCRIPT-RUN carries a ``python …`` Command line, which this extraction agent drops
+        # (it only emits Branch / Version / Services / Email). FPMS and IGO prod-script requests are
+        # already routed before the agent runs; BI was the one script-run family left exposed.
         return None
     if _looks_like_bi_api_update_paste(raw_text) or _body_requests_bi_script_update(raw_text):
         # FPMS-oriented agent strips ``repository:`` / ``API:`` / ``env:`` and mis-reads "update this api".
