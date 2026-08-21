@@ -12181,7 +12181,17 @@ def capture_jenkins_services_detail_screenshots(
     Services that are not actually ticked are skipped.
     """
     paths: list[str] = []
-    names = [n.strip() for n in (service_names or []) if (n or "").strip()][:8]
+    all_names = [n.strip() for n in (service_names or []) if (n or "").strip()]
+    # Cap the close-ups, not the ticks. The old hard limit of 8 made a 26-service run report
+    # "Includes 8 ticked-service close-up(s)", which reads as "only 8 were ticked".
+    cap = max(1, int(os.environ.get("JENKINSUPDATE_SVC_SCREENSHOT_MAX", "40")))
+    names = all_names[:cap]
+    if len(all_names) > cap:
+        print(
+            f"→ Ticked {len(all_names)} services; photographing the first {cap} "
+            f"(raise JENKINSUPDATE_SVC_SCREENSHOT_MAX to capture more).",
+            flush=True,
+        )
     if not names:
         return paths
 
@@ -12349,6 +12359,7 @@ def _fpms_lark_send_parameter_screenshots(
     *,
     job_profile: str,
     bot_lark_gate: dict | None = None,
+    services_total: int = 0,
 ) -> None:
     """Upload PNGs to Lark so operators can visually confirm filled Jenkins fields."""
     if not paths:
@@ -12380,11 +12391,18 @@ def _fpms_lark_send_parameter_screenshots(
     if sent == 1:
         send(chat_id, f"📸 **{prof_label}** — Jenkins filled form (1 screenshot).")
     elif sent:
-        extra = (
-            f" Includes **{svc_snaps}** ticked-service close-up(s)."
-            if svc_snaps
-            else ""
-        )
+        # Say how many were TICKED as well as how many were photographed, so a capped
+        # screenshot count is never mistaken for a short service list.
+        n_ticked = int(services_total or 0)
+        if svc_snaps and n_ticked > svc_snaps:
+            extra = (
+                f" **{n_ticked}** services ticked; showing the first "
+                f"**{svc_snaps}** close-up(s)."
+            )
+        elif svc_snaps:
+            extra = f" Includes **{svc_snaps}** ticked-service close-up(s)."
+        else:
+            extra = ""
         send(
             chat_id,
             f"📸 **{prof_label}** — {sent} Jenkins screenshot(s).{extra}",
@@ -12409,6 +12427,7 @@ def _fpms_lark_upload_screenshots_background(
     *,
     job_profile: str,
     bot_lark_gate: dict | None,
+    services_total: int = 0,
 ) -> None:
     """Upload PNGs after the YES/NO card so the user is not blocked on Lark image API latency."""
 
@@ -12420,6 +12439,7 @@ def _fpms_lark_upload_screenshots_background(
                 paths,
                 job_profile=job_profile,
                 bot_lark_gate=bot_lark_gate,
+                services_total=services_total,
             )
         except Exception as ex:
             try:
@@ -18771,6 +18791,7 @@ def run(
                             shot_paths[1:],
                             job_profile=jp,
                             bot_lark_gate=bot_lark_gate,
+                            services_total=len([x for x in (services or []) if str(x).strip()]),
                         )
                     if shot_dir:
                         _fpms_lark_cleanup_screenshot_dir(shot_dir)
