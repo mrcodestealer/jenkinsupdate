@@ -9197,10 +9197,28 @@ def _cpms_igo_typo_should_auto_pick(
     When a typo clearly matches one service (e.g. ``igo-sw-cluster-roue`` → ``igo-sw-cluster-route``),
     return ``(kind, env, service_id)`` for the best row without asking.
     """
+    # Silent substitution is off by default: picking a *different, real* service on the user's
+    # behalf is the one failure mode that produces a wrong deploy with no error. It resolved
+    # ``igo-sw-http-main-apisix-whitecliff`` (which does not exist) to
+    # ``igo-sw-http-main-apisix`` (which does, and was already in the same request), so a
+    # 26-service run silently became 25. Set CPMS_IGO_TYPO_AUTOPICK=1 to restore it.
+    if (os.environ.get("CPMS_IGO_TYPO_AUTOPICK", "0") or "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
     if not ranked:
         return None
     best_sc, kind, env, sid = ranked[0]
     if best_sc < 0.58:
+        return None
+    # Even when enabled, refuse a fix that differs by a whole name segment — that is a different
+    # service, not a slip.
+    tok_key = _normalize_service_query_key(token)
+    sid_key = _normalize_service_query_key(sid)
+    if tok_key.startswith(sid_key + "-") or sid_key.startswith(tok_key + "-"):
         return None
     if len(ranked) == 1:
         return (kind, env, sid)
@@ -13969,7 +13987,7 @@ def _fpms_lark_start_cpms_igo_typo_pick(
     try:
         send(chat_id, card_js, msg_type="interactive")
     except TypeError:
-        lines = [f"Pick service for typo `{typo_token}`:"]
+        lines = [f"`{typo_token}` is not on this job. Pick the one you meant:"]
         for i, (kind, env, sid) in enumerate(candidates, start=1):
             lines.append(f"  {i}. `{sid}` — {kind.upper()} / {env}")
         send(chat_id, "\n".join(lines))
@@ -14072,7 +14090,8 @@ def _cpms_igo_continue_routing_after_typo_pick(
         _fpms_lark_clear_session(cchat, sender)
     if typo_token and picked_sid:
         typo_notes.append(
-            f"Picked `{picked_sid}` for typo `{typo_token}` ({picked_kind.upper()} / `{picked_env}`)."
+            f"Using `{picked_sid}` ({picked_kind.upper()} / `{picked_env}`) — "
+            f"you chose it for `{typo_token}`, which is not on this job."
         )
     groups, order = _cpms_igo_restore_groups_from_sess(sess)
     cache = _load_cpms_igo_cache()
@@ -14124,7 +14143,9 @@ def _cpms_igo_continue_routing_after_typo_pick(
             )
         if route.get("typo_from") and route.get("typo_to"):
             typo_notes.append(
-                f"Using `{route['typo_to']}` for typo `{route['typo_from']}`."
+                f"⚠️ **Substituted** `{route['typo_to']}` because "
+                f"`{route['typo_from']}` is not on this job. "
+                "Cancel if that is not what you meant."
             )
         for kind, env, sid in route.get("targets") or []:
             _cpms_igo_merge_targets_into_groups(groups, order, [(kind, env, sid)])
@@ -14330,7 +14351,9 @@ def _fpms_lark_dispatch_cpms_igo_uat_parameter_flow(
             )
         if route.get("typo_from") and route.get("typo_to"):
             typo_notes.append(
-                f"Using `{route['typo_to']}` for typo `{route['typo_from']}`."
+                f"⚠️ **Substituted** `{route['typo_to']}` because "
+                f"`{route['typo_from']}` is not on this job. "
+                "Cancel if that is not what you meant."
             )
         for kind, env, sid in route.get("targets") or []:
             _cpms_igo_merge_targets_into_groups(groups, order, [(kind, env, sid)])

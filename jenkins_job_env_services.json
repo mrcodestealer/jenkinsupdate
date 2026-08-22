@@ -6,6 +6,7 @@
         "auth-rollout",
         "ccms-rollout",
         "ccms-rust-rollout",
+        "ccms-rust-scheduler",
         "ccms-scheduler",
         "fpms-internal-rollout",
         "journey",
@@ -39,7 +40,7 @@
         "provider-private-rollout"
       ]
     },
-    "scanned_at": 1786609909.623702
+    "scanned_at": 1787365774.738314
   },
   "fpms_nt/fpms_nt_uat_branch_update": {
     "envs": {
@@ -528,5 +529,35 @@
       ]
     },
     "scanned_at": 1787112273.2106938
+  },
+  "fpms/fpms_uat_master_update": {
+    "envs": {
+      "fpms-uat-master": [
+        "client-apiserver",
+        "external-sms-mission",
+        "fg-exrestful-apiserver",
+        "fpmsinternal-rest",
+        "geoip-apiserver",
+        "jackpot-server",
+        "kycapi-apiserver",
+        "lazada-restserver",
+        "livechat-apiserver",
+        "mgnt-apiserver",
+        "mgnt-newskin-webserver",
+        "mgnt-webserver",
+        "micro-fe-fpms",
+        "pagcor-rest-apiserver",
+        "provider-apiserver",
+        "restful-apiserver",
+        "schedule-server",
+        "schedule-server2",
+        "schedule-serverviber",
+        "script-apiserver",
+        "settlement-report",
+        "settlement-schedule",
+        "settlement-server"
+      ]
+    },
+    "scanned_at": 1787365667.335744
   }
 }
