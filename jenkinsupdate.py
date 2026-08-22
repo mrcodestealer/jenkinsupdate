@@ -6828,6 +6828,55 @@ def _jenkins_last_build_state(job_base: str) -> tuple[int, bool] | None:
         return None
 
 
+def _jenkins_build_state(job_base: str, build_number: int) -> tuple[bool, str, bool] | None:
+    """
+    ``(finished, result, exists)`` for **one specific** build, or ``None`` when Jenkins is unreadable.
+
+    ``_jenkins_last_build_state`` answers about the job's *latest* build, which is the wrong question
+    while an ``/updatemore`` same-job gate is armed. Two consecutive segments of a split run build
+    the SAME job, so ``lastBuild`` is the previous, already-finished build until ours starts (→
+    "finished" the instant we look) and flips back to ``building`` as soon as the next one starts (→
+    never "finished"). Both errors are silent. Ask about our own build instead.
+
+    Three states, not two, because the caller must treat them differently:
+
+    * ``exists=False`` — 404. Either the build is still queued, or the number was mispredicted and
+      will never appear. Indistinguishable here, so the caller bounds how long it tolerates it.
+    * ``finished=False`` — ``building``, or present with no ``result`` yet (Jenkins reports a queued
+      run that way). "Not building" alone is **not** done.
+    * ``finished=True`` with ``result`` — terminal.
+    """
+    bn = build_number if isinstance(build_number, int) and build_number > 0 else 0
+    if not bn or not job_base:
+        return None
+    try:
+        user, pw = _credentials()
+        r = requests.get(
+            f"{job_base.rstrip('/')}/{bn}/api/json",
+            params={"tree": "building,result"},
+            auth=(user, pw),
+            timeout=20,
+            verify=_JENKINS_API_VERIFY_TLS,
+        )
+        if r.status_code == 404:
+            return False, "", False
+        if r.status_code != 200:
+            print(
+                f"⚠️ Jenkins API probe {job_base}/{bn}/api/json → HTTP {r.status_code}; "
+                "cannot tell whether that build finished.",
+                flush=True,
+            )
+            return None
+        data = r.json() or {}
+        result = str(data.get("result") or "").strip()
+        if bool(data.get("building")) or not result:
+            return False, result, True
+        return True, result, True
+    except Exception as ex:
+        print(f"⚠️ Jenkins build probe failed ({type(ex).__name__}: {ex}).", flush=True)
+        return None
+
+
 def _wait_for_refresh_build_to_finish(build_url: str, *, since_number: int) -> bool:
     """
     Block until the Refresh-pipeline build we just started has **finished**.
@@ -15431,6 +15480,436 @@ def _fpms_lark_warn_email_watch_without_build_number(
         print(f"⚠️ could not post missing-build-number notice: {ex!r}", flush=True)
 
 
+def _updatemore_tag_jenkinsbot_after_build_done(
+    send,
+    chat_id: str,
+    *,
+    tag_url: str,
+    build_number: int,
+    result: str,
+) -> bool:
+    """
+    Tag jenkinsbot with the **finished** build so jenkinsbot reports back and the queue proceeds.
+
+    Always ``/SuccessInformMe`` — never ``/SuccessInformMeTime``, even when the segment carries an
+    ``Email:``. That restraint is the whole safety story of this function. ``/SuccessInformMeTime``
+    puts jenkinsbot in ``inform_time`` mode, whose SUCCESS path posts ``/replyupdateemail`` and
+    mails the customer. The gate we are re-tagging into is not cleared until *after* the duty bot's
+    25-150s IMAP search and SMTP send, so "still waiting" is indistinguishable from "the reply is
+    being sent right now": re-tagging with the email form there makes jenkinsbot arm a second
+    watcher on the same finished build and post a second ``/replyupdateemail``. The batch's
+    ``already_sent`` guard and ``_reply_dedupe_claim`` do not reliably catch it — the dedupe key
+    includes jenkinsbot's minute-granularity ``when``, recomputed per callback — and in a
+    shared-subject batch the duplicate is recorded as the *other* segment's completion, which mails
+    the customer before that segment has even built. ``/SuccessInformMe`` cannot reach any of that:
+    ``inform`` mode's only output is ``/SuccessProceedNext``.
+
+    Two answers are both fine:
+
+    * jenkinsbot no longer holds a watcher for this build (it restarted, or never received the
+      Build-click tag — the actual reason a queue stalls) → it arms one, reads the finished console
+      immediately and posts ``/SuccessProceedNext``. This is the repair.
+    * jenkinsbot **is** still watching → it replies "已经在监控中" and ignores us (jenkinsbot
+      main.py ~1023/1213: the ``(job, build)`` slot is freed only in the worker's ``finally``). Its
+      own watcher still produces the callback, so nothing is lost — the caller keeps waiting.
+
+    Returns True when a tag was actually posted.
+    """
+    jenkins_oid = _fpms_lark_jenkins_bot_open_id()
+    if jenkins_oid.casefold() in ("0", "false", "no", "off"):
+        jenkins_oid = ""
+    if not jenkins_oid:
+        print(
+            "[jenkinsupdate] build done but jenkinsbot tagging is disabled "
+            "(JENKINS_BOT_OPEN_ID) — cannot ask it to proceed.",
+            flush=True,
+        )
+        return False
+    verdict = (result or "").strip().upper()
+    ok = verdict in ("", "SUCCESS")
+    at = f'<at user_id="{jenkins_oid}">jenkinsbot</at>'
+    try:
+        if ok:
+            send(
+                chat_id,
+                f"✅ Jenkins build **#{build_number}** finished — asking jenkinsbot to confirm it "
+                "and proceed to the next segment…",
+            )
+        else:
+            # Never print ✅ / "proceed to the next segment" for a build that did not succeed: that
+            # message is the only thing most readers see, and it would say the opposite of the truth.
+            send(
+                chat_id,
+                f"❌ Jenkins build **#{build_number}** finished **{verdict}** — asking jenkinsbot "
+                "to confirm it before this `/updatemore` goes any further…",
+            )
+        send(chat_id, f"{at} /SuccessInformMe {tag_url} {build_number}")
+    except Exception as ex:
+        print(
+            f"[jenkinsupdate] could not tag jenkinsbot after build #{build_number}: {ex!r}",
+            flush=True,
+        )
+        return False
+    print(
+        f"[jenkinsupdate] tagged jenkinsbot after build #{build_number} finished "
+        f"({verdict or 'SUCCESS'}): /SuccessInformMe {tag_url} {build_number}",
+        flush=True,
+    )
+    return True
+
+
+def _updatemore_manual_command_hint(url: str, build_number: int, subject: str) -> str:
+    """The ``/SuccessInformMeTime`` an operator should run, rendered so **nothing executes it**.
+
+    This text is posted into the very chat jenkinsbot reads, and jenkinsbot dispatches on
+    ``/SuccessInformMeTime`` found anywhere in a message body — so printing the real command as a
+    "hint" *is* running it, on the spot, with no human involved. jenkinsbot's own ``_advisory_text``
+    exists for exactly this reason; mirror its convention and drop the leading slash.
+
+    The subject goes last and unquoted on purpose: it is the command's final ``|`` field, so any
+    trailing prose would be swallowed into the email subject.
+    """
+    return (
+        f"`SuccessInformMeTime {url} {build_number} | {subject}`\n"
+        "_(shown without its leading `/` so it does not run itself — add the `/` and send it "
+        "yourself when jenkinsbot is back.)_"
+    )
+
+
+def _updatemore_arm_build_watchdog(
+    chat_id: str,
+    session_key: str,
+    q: dict,
+    *,
+    build_url: str,
+    build_number: int | None,
+    send,
+) -> None:
+    """
+    When this segment's build finishes, **tag jenkinsbot** so it drives the proceed.
+
+    Segment N+1 starts only when jenkinsbot posts ``/SuccessProceedNext`` (no ``Email:``) or the
+    ``/replyupdateemail`` email-done line (with ``Email:``) into the chat. Both are external
+    messages with no timeout, so when neither arrives the queue sits at ``waiting_jenkins``
+    forever: the build completes in Jenkins and the next segment never runs, silently. The usual
+    cause is that jenkinsbot is not watching at all — its watch is armed by the tag posted at
+    **Build-click** time, and a jenkinsbot restart (or an undelivered bot→bot group message) drops
+    it with nothing to re-arm it.
+
+    So this thread, in order:
+
+    1. polls Jenkins for **this** build (``_jenkins_build_state``, not ``lastBuild``);
+    2. once it has really finished, posts a fresh ``@jenkinsbot`` tag naming it — see
+       ``_updatemore_tag_jenkinsbot_after_build_done``;
+    3. gives jenkinsbot ``UPDATEMORE_PROCEED_GRACE_SEC`` to answer;
+    4. only if the gate is *still* armed after that, settles the wait locally.
+
+    Step 4 is deliberately narrow. It advances the queue only for a segment with **no**
+    ``Email:``, and stops it on a non-SUCCESS build. A segment *with* an ``Email:`` is never
+    advanced from here: the proceed path in ``updatemore`` does not record an email completion, so
+    self-advancing an email segment retires its batch row and the customer reply is never sent —
+    a silent, worse failure than the visible stall. That case escalates to the chat instead.
+    """
+    if not _updatemore_watchdog_enabled():
+        return
+    base = _jenkins_job_api_base(build_url)
+    bn = build_number if isinstance(build_number, int) and build_number > 0 else None
+    if not base or bn is None:
+        # With no build number there is nothing to poll: ``_jenkins_last_build_state`` would report
+        # the PREVIOUS (already finished) build of this job and the very first poll would "finish"
+        # instantly, advancing while our build is still queued — starting a second build of the
+        # very job this gate exists to serialize. The Build-click path has already told the chat
+        # that no build number could be read.
+        if base and bn is None:
+            print(
+                "[jenkinsupdate] build watchdog not armed: build number unresolved — jenkinsbot's "
+                "callback (or a manual command) is the only way this segment can proceed.",
+                flush=True,
+            )
+        return
+    cap = max(60, _updatemore_env_int("UPDATEMORE_BUILD_WATCH_MAX_SEC", 5400))
+    grace = max(15, _updatemore_env_int("UPDATEMORE_PROCEED_GRACE_SEC", 180))
+
+    seg_email = ""
+    try:
+        import updatemore as _um_seg
+
+        _seg = _um_seg.current_segment(q)
+        if _seg:
+            seg_email = (_seg.get("email_subject") or "").strip()
+    except Exception:
+        seg_email = ""
+
+    def _gate_open() -> bool:
+        """True while this exact queue is still waiting on Jenkins and still owns the chat."""
+        with _fpms_lark_sessions_lock:
+            if not q.get("waiting_jenkins") or q.get("stopped"):
+                return False
+            return not _updatemore_queue_superseded(session_key, q)
+
+    def _settle(um_w, body: str) -> None:
+        """Run the real callback path for ``body``, but only if the gate is *still* open."""
+        with _fpms_lark_sessions_lock:
+            if not q.get("waiting_jenkins") or q.get("stopped"):
+                print(
+                    "[jenkinsupdate] build watchdog: gate closed while we were posting — "
+                    "jenkinsbot got there first, not settling locally.",
+                    flush=True,
+                )
+                return
+            if _updatemore_queue_superseded(session_key, q):
+                return
+        try:
+            # The marker tells the handler this advance is ours, so it books the debt that absorbs
+            # jenkinsbot's late echo for the same build — in the same critical section as the index
+            # bump — instead of paying that debt off itself. It never reaches Lark.
+            um_w.handle_jenkinsbot_callback(
+                chat_id,
+                _fpms_lark_jenkins_bot_open_id() or "watchdog",
+                body,
+                f"{body} {um_w.LOCAL_SETTLE_MARKER}",
+                send,
+                sessions=_fpms_lark_sessions,
+                sessions_lock=_fpms_lark_sessions_lock,
+                session_key_fn=_fpms_lark_session_key,
+                dispatch_update_body=(
+                    lambda cid, sk, b, snd, **kw: _dispatch_lark_update_command_body(
+                        cid, sk, b, snd, **kw
+                    )
+                ),
+            )
+        except Exception as ex:
+            print(f"[jenkinsupdate] build watchdog {body} failed: {ex!r}", flush=True)
+            try:
+                send(
+                    chat_id,
+                    f"❌ Could not settle this `/updatemore` wait automatically: {ex}\n"
+                    "The queue is still parked — resend the next segment manually.",
+                )
+            except Exception:
+                pass
+
+    def _watch_inner(um_w) -> None:
+        deadline = time.monotonic() + cap
+        polls = 0
+        missing = 0
+        while time.monotonic() < deadline:
+            time.sleep(15.0)
+            if not _gate_open():
+                return  # jenkinsbot's callback already advanced us — nothing to do.
+            state = _jenkins_build_state(base, bn)
+            if state is None:
+                continue  # Jenkins unreadable; keep waiting rather than guessing.
+            polls += 1
+            finished, result, exists = state
+            if not exists:
+                # ``bn`` can be a *prediction* (``_resolve_build_number_after_jenkins_build_click``
+                # falls back to history max+1 when the post-click URL never showed a number), and a
+                # queued build takes a moment to exist. But a number that never appears will never
+                # appear, and treating that as "still building" burns the whole cap in silence.
+                missing += 1
+                if missing >= _WATCHDOG_MISSING_BUILD_POLLS:
+                    print(
+                        f"[jenkinsupdate] build watchdog: build #{bn} still does not exist after "
+                        f"{missing} polls — the number was probably mispredicted. Giving up; "
+                        "jenkinsbot's callback is the only way this segment can proceed.",
+                        flush=True,
+                    )
+                    send(
+                        chat_id,
+                        f"⚠️ I cannot find Jenkins build **#{bn}** for this segment, so I cannot "
+                        "tell when it finishes. The `/updatemore` queue stays parked — check the "
+                        "job's Build History and resend the next segment manually if it is done.",
+                    )
+                    return
+                continue
+            missing = 0
+            if not finished:
+                continue
+            if polls == 1:
+                # Our build was queued seconds ago; one that is ALREADY finished the first time we
+                # look is somebody else's build that took this number while the YES/NO gate was
+                # open. Acting on it would advance (or stop) the queue on an unrelated build.
+                print(
+                    f"[jenkinsupdate] build watchdog: build #{bn} was already finished on the "
+                    "first poll — that is not the build we just started. Not acting on it.",
+                    flush=True,
+                )
+                send(
+                    chat_id,
+                    f"⚠️ Jenkins build **#{bn}** was already finished the moment I looked, so it "
+                    "is not the build this segment just started. I will not advance the "
+                    "`/updatemore` queue on it — waiting for jenkinsbot instead.",
+                )
+                return
+
+            verdict = (result or "").strip().upper()
+            print(
+                f"[jenkinsupdate] build watchdog: #{bn} finished {verdict or '?'} — tagging "
+                "jenkinsbot to proceed.",
+                flush=True,
+            )
+            # Re-check immediately before posting: the poll above is a blocking HTTP call with a
+            # 20s timeout, and jenkinsbot's callback can land inside it. Tagging then is not
+            # harmless — for an ``Email:`` segment the gate is still armed while the customer reply
+            # is being sent, and a tag posted into that window is how the customer gets mailed twice.
+            if not _gate_open():
+                print(
+                    "[jenkinsupdate] build watchdog: gate closed during the Jenkins poll — "
+                    "jenkinsbot got there first, not tagging.",
+                    flush=True,
+                )
+                return
+            tagged = _updatemore_tag_jenkinsbot_after_build_done(
+                send,
+                chat_id,
+                tag_url=build_url,
+                build_number=bn,
+                result=verdict,
+            )
+
+            # Let jenkinsbot answer the tag (or let its existing watcher finish its own poll).
+            waited = 0.0
+            while waited < grace:
+                time.sleep(10.0)
+                waited += 10.0
+                if not _gate_open():
+                    print(
+                        f"[jenkinsupdate] build watchdog: jenkinsbot settled build #{bn} after "
+                        f"{waited:.0f}s — normal path took over.",
+                        flush=True,
+                    )
+                    return
+
+            # jenkinsbot never answered. Settle it ourselves, as narrowly as is safe.
+            if verdict and verdict != "SUCCESS":
+                print(
+                    f"[jenkinsupdate] build watchdog: #{bn} was {verdict} and jenkinsbot never "
+                    "posted /FailedStop — stopping the queue locally.",
+                    flush=True,
+                )
+                send(
+                    chat_id,
+                    f"⛔ Jenkins build **#{bn}** finished **{verdict}** and jenkinsbot did not "
+                    f"answer within {grace}s — stopping this `/updatemore` here.",
+                )
+                _settle(um_w, "/FailedStop")
+                return
+
+            if seg_email:
+                # Advancing here would run the ``/SuccessProceedNext`` path, which never calls
+                # record_email_build_success — the batch would stay "pending" for a subject whose
+                # queue we just retired, and the customer reply would never be sent. Stall loudly.
+                print(
+                    f"[jenkinsupdate] build watchdog: #{bn} SUCCESS but jenkinsbot silent and this "
+                    f"segment carries Email: {seg_email!r} — NOT advancing (would lose the "
+                    "customer reply). Escalating to the chat.",
+                    flush=True,
+                )
+                send(
+                    chat_id,
+                    f"⚠️ Jenkins build **#{bn}** finished **SUCCESS**, but jenkinsbot did not "
+                    f"answer within {grace}s"
+                    + (" (I did tag it)" if tagged else "")
+                    + ".\n"
+                    "This segment has an `Email:`, so I am **not** starting the next segment "
+                    "myself — doing that would drop the customer reply for this batch.\n"
+                    "_The `/updatemore` queue stays parked. To finish it, send:_\n"
+                    + _updatemore_manual_command_hint(build_url, bn, seg_email),
+                )
+                return
+
+            send(
+                chat_id,
+                f"✅ Jenkins build **#{bn}** finished **SUCCESS**, but jenkinsbot did not answer "
+                f"within {grace}s — starting the next segment myself.",
+            )
+            _settle(um_w, "/SuccessProceedNext")
+            return
+
+        print(
+            f"[jenkinsupdate] build watchdog gave up after {cap}s; queue still waiting on "
+            f"build #{bn}.",
+            flush=True,
+        )
+        try:
+            send(
+                chat_id,
+                f"⚠️ Gave up waiting for Jenkins build **#{bn}** after {cap // 60} min — the "
+                "`/updatemore` queue is still parked. Resend the next segment manually if that "
+                "build is actually done.",
+            )
+        except Exception:
+            pass
+
+    def _watch() -> None:
+        """Outer guard. Nothing in the loop may kill this thread silently.
+
+        Every ``send`` in ``_watch_inner`` is a blocking Lark HTTP call, and a single 5xx there
+        would otherwise unwind the thread and leave the queue parked with no watcher and no log —
+        the exact silent stall this whole mechanism exists to remove.
+        """
+        try:
+            import updatemore as um_w
+        except Exception as ex:
+            print(f"[jenkinsupdate] build watchdog cannot import updatemore: {ex!r}", flush=True)
+            return
+        try:
+            _watch_inner(um_w)
+        except Exception as ex:
+            import traceback
+
+            print(
+                f"[jenkinsupdate] build watchdog crashed on build #{bn}: {ex!r}",
+                flush=True,
+            )
+            traceback.print_exc()
+            try:
+                send(
+                    chat_id,
+                    f"⚠️ My Jenkins watcher for build **#{bn}** crashed (`{ex}`). The "
+                    "`/updatemore` queue is still parked — resend the next segment manually if "
+                    "that build is done.",
+                )
+            except Exception:
+                pass
+
+    threading.Thread(target=_watch, name="updatemore-build-watchdog", daemon=True).start()
+
+
+# ~1 minute of 15s polls. Long enough for Jenkins to materialise a queued build, short enough
+# that a mispredicted build number does not burn the full 90-minute cap in silence.
+_WATCHDOG_MISSING_BUILD_POLLS = 4
+
+
+def _updatemore_env_int(name: str, default: int) -> int:
+    """``int`` from the environment, falling back on anything unparseable.
+
+    Same shape as the ``JENKINS_POST_BUILD_NUMBER_WAIT_MS`` read at the Build-click site. It matters
+    here because the watchdog is armed from inside that same unguarded call: a typo'd
+    ``UPDATEMORE_PROCEED_GRACE_SEC`` raising ``ValueError`` would abort
+    ``_fpms_lark_notify_jenkins_after_build_click`` *after* Build was clicked, so the build would
+    run with no tag posted and no gate armed at all.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} is not an integer — using {default}.", flush=True)
+        return default
+
+
+def _updatemore_watchdog_enabled() -> bool:
+    return (os.environ.get("UPDATEMORE_BUILD_WATCHDOG", "1") or "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def _fpms_lark_notify_jenkins_after_build_click(
     send,
     chat_id: str,
@@ -15559,6 +16038,10 @@ def _fpms_lark_notify_jenkins_after_build_click(
             superseded = _updatemore_queue_superseded(session_key, q)
             if not superseded:
                 q["waiting_jenkins"] = True
+                # NOTE: deliberately *not* clearing ``proceed_echo_debt`` here. A late proceed that
+                # jenkinsbot still owes us from a locally-settled wait arrives precisely while this
+                # next segment is building, and honouring it would advance past the segment now on
+                # the same Jenkins link. The debt is paid off by the next proceed, whichever it is.
                 sess2 = _fpms_lark_sessions.get(session_key)
                 if isinstance(sess2, dict):
                     sess2["updatemore_queue"] = q
@@ -15581,6 +16064,9 @@ def _fpms_lark_notify_jenkins_after_build_click(
         send(
             chat_id,
             "⏳ Same Jenkins job — waiting for this build to finish before the next segment…",
+        )
+        _updatemore_arm_build_watchdog(
+            chat_id, session_key, q, build_url=folder_url, build_number=bn, send=send
         )
         return
 

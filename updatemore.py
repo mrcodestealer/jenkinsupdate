@@ -1215,6 +1215,77 @@ def _chat_has_open_build_gate(
     return False
 
 
+_PROCEED_ECHO_GUARD_SEC = 900.0
+
+# Written into the text the build watchdog feeds to its own local ``/SuccessProceedNext`` so the
+# handler can tell "the watchdog is settling this wait right now" from "jenkinsbot's callback has
+# arrived". Without it the watchdog's own settle would pay off the debt it is about to book, and
+# the late echo it exists to absorb would sail straight through. It never reaches Lark.
+LOCAL_SETTLE_MARKER = "[local-settle]"
+
+
+def mark_proceed_consumed(
+    q: dict[str, Any] | None, *, seconds: float = _PROCEED_ECHO_GUARD_SEC
+) -> None:
+    """Book one advance that jenkinsbot did **not** cause, so its late echo can be absorbed.
+
+    jenkinsupdate's build watchdog polls Jenkins itself and, when jenkinsbot never answers, settles
+    the wait locally. jenkinsbot's callback for that same build can still turn up much later — it
+    tolerates 900s of consoleText fetch failures before giving up and still reports on the first
+    success — and its proceed is a bare ``/SuccessProceedNext`` with no build number, byte-identical
+    to a genuine one. So the two cannot be told apart, and this is a **counter**, not a filter: one
+    local advance means exactly one incoming proceed must be swallowed, whichever one arrives.
+
+    Biasing to under-advance is deliberate. Swallowing the *genuine* proceed only parks the queue
+    until that segment's own watchdog re-tags and settles it — loud and recoverable. Honouring the
+    *late* one starts a build on top of a running one on the same Jenkins link, which is the exact
+    thing the ``waiting_jenkins`` gate exists to prevent, and it is silent.
+    """
+    if isinstance(q, dict):
+        q["proceed_consumed_until"] = time.time() + max(0.0, seconds)
+        try:
+            q["proceed_echo_debt"] = int(q.get("proceed_echo_debt") or 0) + 1
+        except (TypeError, ValueError):
+            q["proceed_echo_debt"] = 1
+
+
+def clear_proceed_consumed(q: dict[str, Any] | None) -> None:
+    """Forget any outstanding debt — for a finished or abandoned queue only.
+
+    Deliberately *not* called when the next segment arms its own gate. The debt has to outlive that:
+    the late echo it absorbs is precisely the one that arrives while the next segment is building.
+    """
+    if isinstance(q, dict):
+        q.pop("proceed_consumed_until", None)
+        q.pop("proceed_echo_debt", None)
+
+
+def proceed_echo_is_live(q: dict[str, Any] | None) -> bool:
+    """True while this queue still owes an unclaimed proceed inside the guard window."""
+    if not isinstance(q, dict):
+        return False
+    try:
+        if int(q.get("proceed_echo_debt") or 0) <= 0:
+            return False
+        return time.time() < float(q.get("proceed_consumed_until") or 0.0)
+    except (TypeError, ValueError):
+        return False
+
+
+def consume_proceed_echo(q: dict[str, Any] | None, sessions_lock: threading.Lock) -> bool:
+    """Pay one unit of debt. True when this proceed must be dropped instead of advancing."""
+    if not isinstance(q, dict):
+        return False
+    with sessions_lock:
+        if not proceed_echo_is_live(q):
+            return False
+        debt = int(q.get("proceed_echo_debt") or 0) - 1
+        q["proceed_echo_debt"] = max(0, debt)
+        if debt <= 0:
+            q.pop("proceed_consumed_until", None)
+    return True
+
+
 def find_active_queue_for_chat(
     chat_id: str,
     sessions: dict,
@@ -2047,6 +2118,30 @@ def handle_jenkinsbot_callback(
         key, q, sess = find_waiting_queue_for_chat(chat_id, sessions, sessions_lock)
         if (not q or q.get("stopped")) and not _chat_has_open_build_gate(chat_id, sessions, sessions_lock):
             key, q, sess = find_active_queue_for_chat(chat_id, sessions, sessions_lock)
+        # Is this the build watchdog settling a wait itself, or a message from jenkinsbot?
+        local_settle = LOCAL_SETTLE_MARKER in (original_text or "")
+        # A proceed that jenkinsbot owes us from an advance we already made ourselves must be
+        # absorbed, NOT honoured. Checked whatever the wait state is: by the time the late echo
+        # lands the next segment has usually armed its own gate, so gating this on
+        # ``not waiting_jenkins`` would let it through exactly when it does damage — it would
+        # advance past the segment that is building right now, on the same Jenkins link.
+        if (
+            q
+            and not q.get("stopped")
+            and not local_settle
+            and consume_proceed_echo(q, sessions_lock)
+        ):
+            _log(
+                f"decision=proceed-echo-dropped chat={chat_id!r} index={q.get('index')} "
+                f"waiting_jenkins={bool(q.get('waiting_jenkins'))} — this queue already advanced "
+                "once without jenkinsbot, so one proceed is owed and absorbed here"
+            )
+            send(
+                chat_id,
+                "ℹ️ jenkinsbot's **`/SuccessProceedNext`** matches an advance I had already made "
+                "myself — ignoring it so the segment running now is not skipped.",
+            )
+            return True
         if not q or q.get("stopped"):
             send(
                 chat_id,
@@ -2058,6 +2153,10 @@ def handle_jenkinsbot_callback(
         next_body = ""
         with sessions_lock:
             q["waiting_jenkins"] = False
+            if local_settle:
+                # Same critical section as the increment: a jenkinsbot proceed racing this advance
+                # must find the debt already booked, or it would advance a second time.
+                mark_proceed_consumed(q)
             idx = int(q.get("index") or 0) + 1
             q["index"] = idx
             segs = q.get("segments") or []
