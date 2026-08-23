@@ -66,6 +66,135 @@ def _reply_dedupe_release(key: str) -> None:
 
 def _log(msg: str) -> None:
     print(f"[updatemore] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# In-flight builds — "never two builds on one Jenkins job"
+# ---------------------------------------------------------------------------------------------
+#
+# The build-with-parameters page holds ONE Environment at a time, so two builds of one job must
+# never overlap. The gate that enforced this compared only the two ADJACENT segments, so a queue
+# like [RC, SMS, RC] dispatched segment 2 onto RC while segment 0's RC build was still running.
+#
+# This is decided at DISPATCH time, from the URL that was actually clicked — deliberately not from
+# interpreting jenkinsbot's callbacks. Two earlier attempts tried the callback side (identify which
+# build finished, then decide) and both failed the same way: the identity they compared against
+# could go stale, and every failure mode was a silently dropped completion. Here the worst case is
+# running segments one at a time, which is a visible delay, not a lost update.
+INFLIGHT_TTL_SEC = _env_float("UPDATEMORE_INFLIGHT_TTL_SEC", 2 * 3600.0)
+
+
+def normalize_job_key(url_or_base: str) -> str:
+    """Canonical, comparable key for a Jenkins job URL.
+
+    Collapses the shapes in play — ``…/job/X/``, ``…/job/X/build?delay=0sec``, ``…/job/X/412/`` —
+    onto one key, so the URL recorded at Build-click time compares equal to the one a later
+    segment resolves to.
+    """
+    s = (url_or_base or "").strip()
+    if not s:
+        return ""
+    s = s.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    while True:
+        tail = s.rsplit("/", 1)[-1].casefold()
+        if tail in ("build", "buildwithparameters", "console", "consoletext") or tail.isdigit():
+            nxt = s.rsplit("/", 1)[0]
+            if not nxt or nxt == s:
+                break
+            s = nxt
+            continue
+        break
+    return s.casefold().rstrip("/")
+
+
+def mark_segment_in_flight(
+    q: dict[str, Any] | None, *, seg_idx: int, job: str, build: Any = None
+) -> None:
+    """Record that segment ``seg_idx`` has a build running on ``job``. Keyed by segment.
+
+    Keyed by segment and not by build number on purpose: the segment is what we always know for
+    certain, and one entry per segment means a re-clicked Build replaces its own entry instead of
+    accumulating stale ones.
+    """
+    if not isinstance(q, dict):
+        return
+    key = normalize_job_key(job)
+    if not key:
+        return
+    rows = [
+        r
+        for r in (q.get("in_flight") or [])
+        if isinstance(r, dict) and int(r.get("seg_idx", -1)) != int(seg_idx)
+    ]
+    row: dict[str, Any] = {"seg_idx": int(seg_idx), "job": key, "at": time.time()}
+    try:
+        bn = int(build)
+        if bn > 0:
+            row["build"] = bn
+    except (TypeError, ValueError):
+        pass
+    rows.append(row)
+    q["in_flight"] = rows
+
+
+def clear_segment_in_flight(q: dict[str, Any] | None, seg_idx: Any) -> None:
+    """Forget one segment's build — it finished, or the queue moved past it."""
+    if not isinstance(q, dict):
+        return
+    try:
+        want = int(seg_idx)
+    except (TypeError, ValueError):
+        return
+    q["in_flight"] = [
+        r
+        for r in (q.get("in_flight") or [])
+        if isinstance(r, dict) and int(r.get("seg_idx", -1)) != want
+    ]
+
+
+def in_flight_job_keys(q: dict[str, Any] | None, *, exclude_seg: Any = None) -> set[str]:
+    """Job keys with a build believed to be running, pruning entries older than the TTL.
+
+    The TTL matters: a callback that never arrives would otherwise serialise this chat forever.
+    Expiring is safe in the direction that counts — it can only ever let a build start.
+    """
+    if not isinstance(q, dict):
+        return set()
+    try:
+        skip = int(exclude_seg) if exclude_seg is not None else None
+    except (TypeError, ValueError):
+        skip = None
+    now = time.time()
+    kept: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    for r in q.get("in_flight") or []:
+        if not isinstance(r, dict):
+            continue
+        started = r.get("at")
+        if isinstance(started, (int, float)) and INFLIGHT_TTL_SEC > 0:
+            if now - float(started) > INFLIGHT_TTL_SEC:
+                continue
+        kept.append(r)
+        if skip is not None and int(r.get("seg_idx", -1)) == skip:
+            continue
+        k = str(r.get("job") or "")
+        if k:
+            keys.add(k)
+    q["in_flight"] = kept
+    return keys
+
+
+def describe_in_flight(q: dict[str, Any] | None) -> str:
+    """One-line summary for the chat / journal, e.g. ``seg1→…/RC-UAT-UPDATE #315``."""
+    rows = [r for r in (q or {}).get("in_flight") or [] if isinstance(r, dict)]
+    if not rows:
+        return "—"
+    out = []
+    for r in sorted(rows, key=lambda x: int(x.get("seg_idx", -1))):
+        job = str(r.get("job") or "?").rstrip("/").rsplit("/", 1)[-1]
+        bn = r.get("build")
+        out.append(f"seg{r.get('seg_idx')}→{job}" + (f" #{bn}" if bn else ""))
+    return ", ".join(out)
 _SAME_MARKER = "same"
 _NOT_SAME_MARKERS = frozenset({"not same", "notsame"})
 _SEGMENT_MARKERS = frozenset({_SAME_MARKER, *_NOT_SAME_MARKERS})
@@ -1940,6 +2069,7 @@ def handle_jenkins_email_done(
                     return True
                 q["waiting_jenkins"] = False
                 next_idx = int(q.get("index") or 0) + 1
+                clear_segment_in_flight(q, next_idx - 1)
                 q["index"] = next_idx
                 segs = q.get("segments") or []
                 if next_idx >= len(segs):
@@ -2249,6 +2379,8 @@ def handle_jenkinsbot_callback(
                 # must find the debt already booked, or it would advance a second time.
                 mark_proceed_consumed(q)
             idx = int(q.get("index") or 0) + 1
+            # Its build is done, so it no longer blocks a later segment on the same job.
+            clear_segment_in_flight(q, idx - 1)
             q["index"] = idx
             segs = q.get("segments") or []
             if idx >= len(segs):

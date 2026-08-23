@@ -10203,6 +10203,57 @@ def _updatemore_segment_job_url(segment: dict) -> str:
     return ""
 
 
+def _updatemore_next_segment_must_wait(q: dict) -> tuple[bool, str]:
+    """Must the next segment wait instead of starting in parallel? ``(wait, why)``.
+
+    Decided from the set of builds this queue has actually clicked (``in_flight``, recorded from
+    the real folder URL at click time), NOT from interpreting a callback. Two things follow:
+
+      * It is not adjacency-limited. ``_updatemore_next_segment_same_link`` compared only segments
+        N and N+1, so a queue like [RC, SMS, RC] dispatched segment 2 onto RC while segment 0's RC
+        build was still running — two builds on one build-with-parameters page.
+      * It FAILS CLOSED. When the next segment's job cannot be resolved, we serialise. The resolver
+        here does not reproduce the full routing path (which has eight special cases and can stop
+        to ask a human), so "unknown" is common and must never be read as "different job".
+        Over-serialising costs minutes and says so in the chat; under-serialising corrupts a build
+        and is silent.
+    """
+    segs = q.get("segments") or []
+    idx = int(q.get("index") or 0)
+    if idx + 1 >= len(segs):
+        return False, ""
+    try:
+        import updatemore as um
+
+        busy = um.in_flight_job_keys(q)
+    except Exception as ex:
+        print(f"[jenkinsupdate] in-flight lookup failed ({ex!r}) — serialising to be safe", flush=True)
+        return True, "could not read the in-flight set"
+    if not busy:
+        return False, ""
+    # The resolver reads a runtime JSON catalog and can raise on a truncated or unreadable file.
+    # Letting that escape would take down the whole post-build notify, so it also fails closed.
+    try:
+        nxt_url = _updatemore_segment_job_url(segs[idx + 1])
+    except Exception as ex:
+        print(
+            f"[jenkinsupdate] segment job resolve raised ({ex!r}) — serialising to be safe",
+            flush=True,
+        )
+        return True, "the next segment's Jenkins job could not be resolved"
+    if not nxt_url:
+        return True, "the next segment's Jenkins job could not be resolved"
+    try:
+        import updatemore as um
+
+        nxt_key = um.normalize_job_key(nxt_url)
+    except Exception:
+        return True, "the next segment's Jenkins job could not be normalised"
+    if nxt_key and nxt_key in busy:
+        return True, "that Jenkins job already has a build running"
+    return False, ""
+
+
 def _updatemore_next_segment_same_link(q: dict) -> bool:
     """
     True when the next segment targets the **same Jenkins job link** as the one just built.
@@ -16029,9 +16080,25 @@ def _fpms_lark_notify_jenkins_after_build_click(
         # the session-stored subject (set by _dispatch_lark_update_command_body) wins.
         email = _fpms_lark_session_email_subject(session_key)
     seg_idx = int(q.get("index") or 0)
-    # Same headline OR same job link — a shared link must run one build at a time.
-    next_same = um.next_segment_same_env(q) or _updatemore_next_segment_same_link(q)
+    # Record the build we just started, from the URL that was actually clicked. This is the ground
+    # truth the parallel/serial decision below is made from — no resolver, no callback parsing.
+    with _fpms_lark_sessions_lock:
+        um.mark_segment_in_flight(q, seg_idx=seg_idx, job=folder_url, build=build_number)
+        um.persist_queue_if_current(q)
+    # Same headline, same job link, or ANY still-running build of the job the next segment wants.
+    # The first two are adjacency-only; the third is what stops [RC, SMS, RC] from starting a
+    # second RC build while segment 0's is still going.
+    must_wait, wait_why = _updatemore_next_segment_must_wait(q)
+    next_same = (
+        um.next_segment_same_env(q) or _updatemore_next_segment_same_link(q) or must_wait
+    )
     has_next = um.has_next_segment(q)
+    if must_wait:
+        print(
+            f"[jenkinsupdate] serialising next segment: {wait_why} "
+            f"(in flight: {um.describe_in_flight(q)})",
+            flush=True,
+        )
     print(
         f"[jenkinsupdate] notify after build (updatemore): segs="
         f"{len(q.get('segments') or [])} index={q.get('index')} next_same={next_same} "
@@ -16123,7 +16190,12 @@ def _fpms_lark_notify_jenkins_after_build_click(
             return
         send(
             chat_id,
-            "⏳ Same Jenkins job — waiting for this build to finish before the next segment…",
+            (
+                f"⏳ Holding the next segment — {wait_why}.\n"
+                f"_Running now: {um.describe_in_flight(q)}_"
+            )
+            if must_wait
+            else "⏳ Same Jenkins job — waiting for this build to finish before the next segment…",
         )
         _updatemore_arm_build_watchdog(
             chat_id, session_key, q, build_url=folder_url, build_number=bn, send=send
