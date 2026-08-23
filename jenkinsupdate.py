@@ -954,11 +954,23 @@ def _expand_service_exclusion(
     return complement or None
 
 
+# A real service token: one word, the shapes Jenkins service names actually take
+# (``auth-service``, ``update_worker``, ``bo.api``, ``h5-uat-2``). Deliberately allows no spaces —
+# multi-word values are handled by _service_lines_mean_update_all, which owns that question.
+_SERVICE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/]*$")
+
+
 def _looks_like_chat_trailing_line_under_services(line: str) -> bool:
     """
-    Ignore common chat trailing lines accidentally pasted under ``services:``.
+    Ignore chat trailing lines accidentally pasted under ``services:``.
     Examples: ``@CP OM Duty ...``, ``please assist ...``, ``thanks``,
     ``Email: ...`` subject lines, ``cc @Someone``, Lark bullet ``-``.
+
+    Allow-list, not deny-list. Denying only politeness words let any other sentence through as a
+    service name — ``Services: all`` followed by ``also update me once done`` produced
+    ``services=['all', 'also update me once done']`` with ``update_all`` **False**, silently
+    turning "update everything" into two service names that do not exist. Anything that is not a
+    single service-shaped token (or the literal all-services phrase) is chat.
     """
     s = _normalize_config_colons(line).strip()
     if not s:
@@ -973,7 +985,21 @@ def _looks_like_chat_trailing_line_under_services(line: str) -> bool:
         return True
     if re.search(r"\b(?:pls|please|assist|thanks|thank\s*you|tq)\b", s, re.I):
         return True
-    return False
+    # Strip the decoration a pasted list carries so the shape test sees the bare token.
+    bare = s.strip().strip("`*_").strip().rstrip(",;，；").strip()
+    if not bare:
+        return True
+    # ``all`` / ``all services`` / ``PMS All service`` / ``全部服务`` — multi-word but real. This
+    # is the module's own authority on the question and several callers re-check it right after
+    # this filter, so it has to survive rather than being classified as chat here.
+    if _service_lines_mean_update_all([bare]):
+        return False
+    # A comma/、-separated inline list is fine as long as every element is service-shaped.
+    parts = [p.strip().strip("`*_").strip() for p in re.split(r"[,，、;；]+", bare)]
+    parts = [p for p in parts if p]
+    if parts and all(_SERVICE_TOKEN_RE.match(p) for p in parts):
+        return False
+    return True
 
 
 # Default: apply ``_ensure_fast_fill_mode`` at import unless ``FPMS_STABLE_FILL=1`` (conservative pacing).
@@ -12602,6 +12628,13 @@ def _parse_build_number_from_jenkins_post_build_url(url: str) -> int | None:
     return None
 
 
+# Consecutive 250 ms polls with an unchanged URL before we accept it will never carry a build
+# number. 8 ≈ 2 s, comfortably longer than a Jenkins redirect chain and 10× cheaper than 20 s.
+_JENKINS_BUILD_URL_SETTLE_POLLS = int(
+    os.environ.get("JENKINS_BUILD_URL_SETTLE_POLLS", "8") or "8"
+)
+
+
 def _resolve_build_number_after_jenkins_build_click(
     page,
     predicted_next: int | None,
@@ -12611,12 +12644,39 @@ def _resolve_build_number_after_jenkins_build_click(
     """
     Poll the browser URL after clicking **Build** until a ``…/<buildNumber>/`` segment appears,
     else fall back to ``predicted_next`` (from history ``max+1`` before the gate).
+
+    Stops as soon as the URL has **settled**. A parameterized build POSTs to
+    ``…/build?delay=0sec`` and Jenkins redirects to the job index, which can never contain a build
+    number — so the old unconditional poll ran to its full 20 s deadline on every single build,
+    20 s of dead time between "Build clicked" and the ``@jenkinsbot`` watch request (and, for a
+    different-job segment, before the next segment was dispatched). Once the URL has stopped
+    changing there is nothing left to wait for; the full deadline is still honoured while it is
+    still moving, so a job that does redirect to ``…/<n>/`` is unaffected.
     """
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+    settle_needed = max(1, int(_JENKINS_BUILD_URL_SETTLE_POLLS))
+    last_url: str | None = None
+    unchanged = 0
     while time.monotonic() < deadline:
-        n = _parse_build_number_from_jenkins_post_build_url(page.url)
+        try:
+            cur = page.url
+        except Exception:
+            cur = None
+        n = _parse_build_number_from_jenkins_post_build_url(cur)
         if n is not None:
             return n
+        if cur == last_url:
+            unchanged += 1
+            if unchanged >= settle_needed:
+                print(
+                    f"[jenkinsupdate] build URL settled on {cur!r} with no build number — "
+                    f"using predicted #{predicted_next}",
+                    flush=True,
+                )
+                break
+        else:
+            last_url = cur
+            unchanged = 0
         time.sleep(0.25)
     if isinstance(predicted_next, int) and predicted_next > 0:
         return predicted_next
@@ -15222,7 +15282,7 @@ def _looks_like_freeform_update_request(text: str) -> bool:
     return (has_branch or has_version) and (has_svc or has_branch and has_version) and has_update_word
 
 
-def agent_route_free_form_body(raw_text: str) -> str | None:
+def agent_route_free_form_body(raw_text: str, *, warn=None) -> str | None:
     """
     Run the expert extraction agent (:mod:`jenkinsupdateagent`) on a free-form request and
     return a clean canonical command body:
@@ -15254,7 +15314,7 @@ def agent_route_free_form_body(raw_text: str) -> str | None:
         print(f"[jenkinsupdate] jenkinsupdateagent import failed: {ex!r}", flush=True)
         return None
     try:
-        body = agent.agent_route(raw_text)
+        body = agent.agent_route(raw_text, warn=warn)
     except Exception as ex:
         print(f"[jenkinsupdate] agent route error: {ex!r}", flush=True)
         return None
@@ -17534,7 +17594,11 @@ def handle_lark_jenkins_update_message(
         with _fpms_lark_sessions_lock:
             _existing_sess = _fpms_lark_sessions.get(key)
         if not isinstance(_existing_sess, dict):
-            routed_body = agent_route_free_form_body(body_early)
+            # ``warn`` surfaces a headline the agent could not turn into a build. Dropping one
+            # silently meant a job the user explicitly named was never built and never mentioned.
+            routed_body = agent_route_free_form_body(
+                body_early, warn=lambda _m: send(chat_id, _m)
+            )
             if routed_body:
                 clean_text = routed_body
                 original_text = routed_body

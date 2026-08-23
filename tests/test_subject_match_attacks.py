@@ -7,6 +7,15 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# UTF-8 diagnostics (em dashes, arrows) on a cp1252 console raise UnicodeEncodeError mid-print and
+# the run reads as a test failure. Make stdout tolerant rather than requiring PYTHONIOENCODING.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import datetime as dt

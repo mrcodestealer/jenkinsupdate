@@ -23,6 +23,7 @@ WebSocket). Set ``LARK_EVENT_MODE=websocket`` in ``.env`` (default here) and run
 import atexit
 import base64
 import collections
+import queue
 import contextvars
 import hashlib
 import hmac
@@ -2447,13 +2448,75 @@ def _lark_ws_dispatch_payload(payload: dict) -> tuple[int, dict]:
     return int(rv.status_code), body
 
 
+# ---- per-chat message workers -------------------------------------------------------------
+#
+# lark-oapi schedules every frame with ``loop.create_task`` and the frame handler below is
+# synchronous, so ``_lark_ws_dispatch_payload`` used to run the WHOLE webhook — the agent's LLM
+# round trip, the Playwright form fill, and maintenance_mail's 25-150s IMAP search — on the single
+# websocket event-loop thread. For that entire window nothing else was read: not another chat's
+# message, not a Confirm card tap, not the socket's own ping. jenkinsbot hit exactly this and left
+# a comment saying it caused "minutes-long delays".
+#
+# Handing every message to its own thread would fix the starvation but break ordering: "update
+# fpms uat" and the "yes" that confirms it would race, and the confirmation could arrive before
+# the session it answers exists. So messages are queued PER CHAT and drained by one worker each —
+# order within a chat is exactly what it was, while every other chat and the socket run free.
+_LARK_CHAT_WORKER_IDLE_SEC = 300.0
+_lark_chat_queues: dict[str, "queue.Queue"] = {}
+_lark_chat_queues_lock = threading.Lock()
+
+
+def _lark_ws_chat_key(payload: dict) -> str:
+    try:
+        msg = ((payload.get("event") or {}).get("message") or {})
+        return str(msg.get("chat_id") or "").strip() or "-"
+    except Exception:
+        return "-"
+
+
+def _lark_chat_worker(chat_key: str, q: "queue.Queue") -> None:
+    while True:
+        try:
+            payload = q.get(timeout=_LARK_CHAT_WORKER_IDLE_SEC)
+        except queue.Empty:
+            # Retire only while the queue is provably empty AND still the registered one, so a
+            # payload enqueued in the gap cannot be stranded with no worker to drain it.
+            with _lark_chat_queues_lock:
+                if _lark_chat_queues.get(chat_key) is q and q.empty():
+                    _lark_chat_queues.pop(chat_key, None)
+                    return
+            continue
+        try:
+            status, _ = _lark_ws_dispatch_payload(payload)
+            print(
+                f"[lark-ws] im.message.receive_v1 dispatched status={status} chat={chat_key}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[lark-ws] im.message dispatch failed: {exc!r}", flush=True)
+        finally:
+            q.task_done()
+
+
 def _lark_ws_on_message(data) -> None:
     try:
         payload = _lark_ws_to_webhook_payload(data)
-        status, _ = _lark_ws_dispatch_payload(payload)
-        print(f"[lark-ws] im.message.receive_v1 dispatched status={status}", flush=True)
     except Exception as exc:
-        print(f"[lark-ws] im.message dispatch failed: {exc!r}", flush=True)
+        print(f"[lark-ws] im.message payload build failed: {exc!r}", flush=True)
+        return
+    chat_key = _lark_ws_chat_key(payload)
+    with _lark_chat_queues_lock:
+        q = _lark_chat_queues.get(chat_key)
+        if q is None:
+            q = queue.Queue()
+            _lark_chat_queues[chat_key] = q
+            threading.Thread(
+                target=_lark_chat_worker,
+                args=(chat_key, q),
+                daemon=True,
+                name=f"lark-chat-{chat_key[:14]}",
+            ).start()
+        q.put(payload)
 
 
 def _lark_ws_on_card_action(data):
@@ -2753,12 +2816,25 @@ def _run_main_entry() -> int:
         ).start()
 
         # Pre-warm the Jenkins /update browser pool so the first form fill is instant.
-        try:
-            import jenkinsupdate as _boot_ju
+        #
+        # On a background thread, and it must stay there. This call blocks for up to
+        # JENKINS_WARM_STARTUP_WAIT_SEC (default 120s, JENKINS_WARM_STARTUP_BLOCK defaults on),
+        # and Flask + the Lark socket are only started AFTER it returns. Restart the bot while a
+        # build is running and jenkinsbot's POST hits a closed port — one attempt, no retry — and
+        # its Lark fallback hits a socket that has not connected yet. Both channels lost, so the
+        # build finishes SUCCESS and the customer reply is never sent. A cold first form fill is
+        # cheap; being deaf for two minutes is not.
+        def _start_warm_pool() -> None:
+            try:
+                import jenkinsupdate as _boot_ju
 
-            _boot_ju.prewarm_all_jenkins_browsers_on_startup()
-        except Exception as _boot_ju_err:
-            print(f"[warm] startup pre-warm skipped: {_boot_ju_err!r}", flush=True)
+                _boot_ju.prewarm_all_jenkins_browsers_on_startup()
+            except Exception as _boot_ju_err:
+                print(f"[warm] startup pre-warm skipped: {_boot_ju_err!r}", flush=True)
+
+        threading.Thread(
+            target=_start_warm_pool, daemon=True, name="jenkins-warm-boot"
+        ).start()
 
         if _lark_ws_uses_persistent_connection():
             def _flask_bg() -> None:

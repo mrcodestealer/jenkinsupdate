@@ -167,6 +167,11 @@ def _is_update_env_line(line: str) -> bool:
     True when a line is a Jenkins job keyword headline (e.g. ``UPDATE FPMS UAT MASTER``).
 
     Used to split ``/updatemore`` into segments without ``same`` / ``not same``.
+
+    Requires whitespace after the verb. ``\\bupdate\\b`` also matched a SERVICE named
+    ``update-worker``, which cut the ``Services:`` list short, turned the remaining services into
+    a phantom segment, and let that phantom steal the trailing ``Email:`` line. Callers that know
+    they are inside a ``Services:`` value should not call this at all — see ``consume_config``.
     """
     s = (line or "").strip()
     if not s or _is_segment_marker(s):
@@ -181,7 +186,7 @@ def _is_update_env_line(line: str) -> bool:
         return True
     if re.match(r"^\s*[A-Za-z0-9\-]+\s+(?:brazil|newport)\s+uat\b", s, re.I):
         return True
-    return bool(re.match(r"^\s*update\b", s, re.I))
+    return bool(re.match(r"^\s*update\s+\S", s, re.I))
 
 
 def _normalize_updatemore_body(body: str) -> str:
@@ -312,6 +317,11 @@ def parse_updatemore_body(body: str) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
 
     def consume_config(start: int, env: str) -> tuple[list[str], str | None, int]:
+        # A service name can never end this block on its own: ``_is_update_env_line`` now requires
+        # whitespace after the verb, so ``update-worker`` stays a service while a real headline
+        # like ``update cpms uat`` still starts the next segment. That one regex is the whole fix
+        # — tracking an explicit in-services state instead swallowed the next headline whenever
+        # the list was written inline (``Services: all``).
         cfg: list[str] = []
         email_subject: str | None = None
         j = start
@@ -2048,7 +2058,13 @@ def process_updatemore_jenkins_command(
     session_key_fn: Callable[[str, str], str],
     dispatch_update_body: Callable[..., bool],
 ) -> bool:
-    """Direct entry (HTTP from jenkinsbot) — same outcome as Lark ``/FailedStop`` / ``/SuccessProceedNext``."""
+    """Direct entry (HTTP from jenkinsbot) — same outcome as Lark ``/FailedStop`` / ``/SuccessProceedNext``.
+
+    ``from_http=True`` makes an unclaimed command report **failure** instead of swallowing it.
+    jenkinsbot only falls back to its Lark bot→bot send when this route answers a falsey ``ok``,
+    so answering "handled" for a command no queue claimed silently retired the only other channel
+    — the exact reason a callback aimed at the wrong chat left a live queue parked forever.
+    """
     cmd = (command or "").strip()
     if is_failed_stop_message(cmd):
         body = "/FailedStop"
@@ -2066,6 +2082,7 @@ def process_updatemore_jenkins_command(
         sessions_lock=sessions_lock,
         session_key_fn=session_key_fn,
         dispatch_update_body=dispatch_update_body,
+        from_http=True,
     )
 
 
@@ -2081,10 +2098,15 @@ def handle_jenkinsbot_callback(
     session_key_fn: Callable[[str, str], str],
     dispatch_update_body: Callable[..., bool],
     message_content_raw: str = "",
+    from_http: bool = False,
 ) -> bool:
     """
     Handle ``/SuccessProceedNext``, ``/FailedStop``, or email-done lines from jenkinsbot.
     Returns True if consumed.
+
+    ``from_http`` marks the internal POST route. On that path an unclaimed command returns False
+    **without** posting to chat, so jenkinsbot retries over Lark and the warning is posted once by
+    whichever channel finally gives up — not once per channel.
     """
     body = resolve_duty_command_body(
         original_text, clean_text, message_content_raw
@@ -2099,6 +2121,12 @@ def handle_jenkinsbot_callback(
         if not q:
             key, q, sess = find_active_queue_for_chat(chat_id, sessions, sessions_lock)
         if not q:
+            if from_http:
+                _log(
+                    f"decision=failedstop-unclaimed chat={chat_id!r} — no queue here; "
+                    "reporting not-handled so jenkinsbot retries over Lark"
+                )
+                return False
             send(
                 chat_id,
                 "⚠️ **`/FailedStop`** from jenkinsbot — no active **`/updatemore`** queue "
@@ -2190,6 +2218,12 @@ def handle_jenkinsbot_callback(
             )
             return True
         if not q or q.get("stopped"):
+            if from_http:
+                _log(
+                    f"decision=proceed-unclaimed chat={chat_id!r} — no queue here; "
+                    "reporting not-handled so jenkinsbot retries over Lark"
+                )
+                return False
             send(
                 chat_id,
                 "⚠️ **`/SuccessProceedNext`** from jenkinsbot — no active **`/updatemore`** "

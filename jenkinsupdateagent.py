@@ -73,7 +73,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Lazy bridge into jenkinsupdate (so this module is importable even if the heavy
@@ -311,6 +311,12 @@ def _key_line_match(line: str):
     )
 
 
+_SERVICE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/]*$")
+_SERVICE_ALL_PHRASE_RE = re.compile(
+    r"^(?:all|all\s+services?|all\s+svcs?|every\s+service|全部服务|所有服务)$", re.I
+)
+
+
 def _looks_like_trailing_chat(line: str) -> bool:
     ju = _ju()
     if ju is not None:
@@ -327,7 +333,19 @@ def _looks_like_trailing_chat(line: str) -> bool:
         return True
     if re.search(r"\b(?:pls|please|assist|thanks|thank\s*you|tq)\b", s, re.I):
         return True
-    return False
+    # Allow-list on shape, mirroring jenkinsupdate's filter: only a service-shaped token (or the
+    # all-services phrase) survives. A deny-list of politeness words let ordinary sentences
+    # through as service names — see the docstring on the jenkinsupdate twin.
+    bare = s.strip().strip("`*_").strip().rstrip(",;，；").strip()
+    if not bare:
+        return True
+    if _is_all_services([bare]) or _SERVICE_ALL_PHRASE_RE.match(bare):
+        return False
+    parts = [p.strip().strip("`*_").strip() for p in re.split(r"[,，、;；]+", bare)]
+    parts = [p for p in parts if p]
+    if parts and all(_SERVICE_TOKEN_RE.match(p) for p in parts):
+        return False
+    return True
 
 
 def _split_service_tokens(value: str) -> list[str]:
@@ -932,19 +950,143 @@ def agent_normalize(text: str, *, use_llm: bool = True) -> Optional[str]:
 # Multi-segment (multiple UPDATE blocks → /updatemore)
 # ---------------------------------------------------------------------------
 
-_SEG_HEADLINE_RE = re.compile(r"(?i)^\s*(?:please\s+|kindly\s+|help\s+|can\s+help\s+)*(?:update|deploy)\b")
+# ``\s+\S`` and not ``\b``: ``update-worker`` is a SERVICE, not a headline. With ``\b`` it split
+# the segment mid-``Services:`` list and silently dropped every service after it — defect 2 of the
+# d458174 revert message, which removed only the comma splitter and left this twin in place.
+_SEG_HEADLINE_RE = re.compile(
+    r"(?i)^\s*(?:please\s+|kindly\s+|help\s+|can\s+help\s+)*(?:update|deploy)\s+\S"
+)
 _CC_LINE_RE = re.compile(r"(?i)^\s*cc\b")
 _CMD_STRIP_RE = re.compile(r"(?i)/(?:update|jenkinsupdate|updatejenkins|updatemore)(?!\w)")
+# ``1) update …`` / ``2. update …`` / ``(3) update …``. d458174 deleted this along with the
+# splitter it was part of, so a numbered multi-update stopped being recognised as two headlines
+# and collapsed into one segment whose Branch/Version came from the LAST block.
+_SEG_ENUMERATOR_RE = re.compile(r"^\s*[(\[]?\s*\d{1,2}\s*[.)\]]\s*")
+_SERVICES_KEY_RE = re.compile(r"(?i)^\s*services?\s*[:\-–—=]")
+# Joiners that introduce a second update on ONE line: "update A, then update B".
+_SEG_JOINER_RE = re.compile(
+    r"(?i)(?:[,;，；]|\band\b|\bthen\b|\balso\b|\bnext\b|\bafter\s+that\b)\s*"
+    r"(?=(?:please\s+|kindly\s+|help\s+)*(?:update|deploy)\s+\S)"
+)
+# A tail must clear this to be accepted as a real second job. Deliberately far above
+# _ENV_JOB_RESOLVE_MIN_SCORE (0.30): at that floor ordinary prose resolves to something.
+_SEG_SPLIT_MIN_SCORE = float(os.getenv("BOT_JENKINS_AGENT_SEG_MIN_SCORE", "2.0"))
 
 
-def _is_segment_headline(line: str) -> bool:
-    """True when a line starts a new update block, e.g. ``UPDATE FPMS UAT MASTER``."""
+def _strip_list_marker(s: str) -> str:
+    return _SEG_ENUMERATOR_RE.sub("", s or "", count=1)
+
+
+def _headline_names_a_real_job(line: str) -> bool:
+    """True when the text after the update verb resolves to an actual Jenkins job.
+
+    The guard the d458174 revert message asked for: "require the tail to resolve to a real Jenkins
+    job". Without it any sentence opening with "update" becomes a build segment — and when it
+    precedes the parameter block it becomes the *winning* one.
+    """
+    ju = _ju()
+    if ju is None:
+        # Cannot verify — assume the headline is real so behaviour degrades to the old,
+        # over-splitting side rather than silently swallowing a genuine second job.
+        return True
+    s = _strip_list_marker(_normalize_colons(_strip_mentions(line)).strip())
+    tail = re.sub(
+        r"(?i)^\s*(?:please\s+|kindly\s+|help\s+|can\s+help\s+)*(?:update|deploy)\s+", "", s
+    ).strip()
+    tail = _trim_env_phrase(tail)
+    if not tail:
+        return False
+    try:
+        ranked = ju._rank_jenkins_update_job_matches(tail)
+    except Exception:
+        return True
+    return bool(ranked) and float(ranked[0][1]) >= _SEG_SPLIT_MIN_SCORE
+
+
+def _is_segment_headline(line: str, *, strict: bool = False) -> bool:
+    """True when a line starts a new update block, e.g. ``UPDATE FPMS UAT MASTER``.
+
+    ``strict`` additionally requires the headline to name a real Jenkins job. Used for lines
+    inside a ``Services:`` value and for one-line joiner splits, where a false positive costs a
+    dropped service list or a phantom build.
+    """
     s = _normalize_colons(_strip_mentions(line)).strip()
+    s = _strip_list_marker(s)
     if not s:
         return False
     if _key_line_match(line) or _EMAIL_LINE_RE.match(s) or _CC_LINE_RE.match(s):
         return False
-    return bool(_SEG_HEADLINE_RE.match(s))
+    if not _SEG_HEADLINE_RE.match(s):
+        return False
+    if strict and not _headline_names_a_real_job(s):
+        return False
+    return True
+
+
+def _segment_headline_indices(lines: list[str]) -> list[int]:
+    """Indices of the lines that start an update block, aware of ``Services:`` values.
+
+    A ``Services:`` list may legitimately contain a token beginning with ``update``, and a request
+    often ends in prose. Inside a services value a line therefore has to name a real Jenkins job
+    before it is allowed to split the segment.
+    """
+    out: list[int] = []
+    in_services = False
+    for i, ln in enumerate(lines):
+        s = _normalize_colons(_strip_mentions(ln)).strip()
+        if not s:
+            in_services = False
+            continue
+        if _SERVICES_KEY_RE.match(s):
+            in_services = True
+            continue
+        if _is_segment_headline(ln, strict=in_services):
+            out.append(i)
+            in_services = False
+            continue
+        if _key_line_match(ln) or _EMAIL_LINE_RE.match(s) or _CC_LINE_RE.match(s):
+            in_services = False
+    return out
+
+
+def _split_joined_headlines(text: str) -> str:
+    """Put ``update A, then update B`` on two lines — but only when B is a real job.
+
+    c09e283 added a splitter here and d458174 reverted it: that version had no notion of being
+    inside a ``Services:`` value, so ``auth-service, update-worker, billing-service`` was cut
+    after the first service, and any trailing ``also update me once done`` manufactured a second
+    build. Both holes are closed here — the split never runs on a key/Email/CC line, and the tail
+    must resolve to an actual Jenkins job.
+    """
+    out: list[str] = []
+    in_services = False
+    for ln in (text or "").split("\n"):
+        s = _normalize_colons(_strip_mentions(ln)).strip()
+        if not s:
+            in_services = False
+            out.append(ln)
+            continue
+        if _SERVICES_KEY_RE.match(s):
+            in_services = True
+            out.append(ln)
+            continue
+        skip = in_services or bool(
+            _key_line_match(ln) or _EMAIL_LINE_RE.match(s) or _CC_LINE_RE.match(s)
+        )
+        if _key_line_match(ln) or _EMAIL_LINE_RE.match(s) or _CC_LINE_RE.match(s):
+            in_services = False
+        if skip or not _SEG_JOINER_RE.search(ln):
+            out.append(ln)
+            continue
+        pieces = [p.strip() for p in _SEG_JOINER_RE.split(ln) if p and p.strip()]
+        # Every piece after the first has to be a real job headline, or the line is left whole.
+        if len(pieces) < 2 or not all(
+            _is_segment_headline(p, strict=True) for p in pieces[1:]
+        ):
+            out.append(ln)
+            continue
+        out.extend(pieces)
+    return "\n".join(out)
 
 
 @dataclass
@@ -956,6 +1098,21 @@ class JenkinsUpdatePlan:
 
     def usable_segments(self) -> list[JenkinsUpdateExtraction]:
         return [s for s in self.segments if s.is_usable()]
+
+    def dropped_headlines(self) -> list[str]:
+        """Headlines the user named that produced no dispatchable segment.
+
+        These used to vanish inside ``usable_segments()``: the bot built whatever was left and
+        said nothing, so a job the user explicitly asked for was never built and never mentioned.
+        """
+        out: list[str] = []
+        for s in self.segments:
+            if s.is_usable():
+                continue
+            name = (s.job_label or s.environment or s.job_alias or "").strip()
+            if name:
+                out.append(name)
+        return out
 
     def kind(self) -> Optional[str]:
         n = len(self.usable_segments())
@@ -992,6 +1149,42 @@ def _apply_shared_email(segments: list[JenkinsUpdateExtraction]) -> None:
         s.email_subject = subj
 
 
+def _apply_shared_config(segments: list[JenkinsUpdateExtraction]) -> None:
+    """Let a single shared parameter block serve every headline above it.
+
+    The common shape is two headlines with ONE Branch/Version/Services block underneath::
+
+        update fpms uat master
+        update nt uat master
+        Branch: release-2.4 / Version: 2.4.0 / Services: all
+
+    The block lands in the last segment only, so the earlier ones fail ``is_usable()`` and used to
+    be discarded silently by ``usable_segments()`` — the bot built the LAST job named and never
+    mentioned the first. Inheriting the one populated block is what the user plainly meant.
+
+    Only runs when exactly one segment carries a payload; two or more real blocks mean the user
+    gave per-segment parameters and nothing should be copied.
+    """
+    if len(segments) < 2:
+        return
+    donors = [s for s in segments if s.is_usable()]
+    if len(donors) != 1:
+        return
+    src = donors[0]
+    for seg in segments:
+        if seg is src or seg.is_usable():
+            continue
+        if not seg.environment and not seg.job_alias:
+            # No job of its own — this was never a real segment.
+            continue
+        seg.branch = seg.branch or src.branch
+        seg.version = seg.version or src.version
+        if not seg.services and not seg.update_all:
+            seg.services = list(src.services)
+            seg.update_all = src.update_all
+        seg.warnings.append("branch/version/services inherited from the shared block")
+
+
 def extract_segments(text: str, *, use_llm: bool = True) -> JenkinsUpdatePlan:
     """
     Split a free-form request into 1..N update segments.
@@ -1001,9 +1194,10 @@ def extract_segments(text: str, *, use_llm: bool = True) -> JenkinsUpdatePlan:
     """
     raw = (text or "").replace("\r\n", "\n")
     raw = _CMD_STRIP_RE.sub(" ", raw)
+    raw = _split_joined_headlines(raw)
     raw = _split_inline_key_segments(raw)
     lines = raw.split("\n")
-    headline_idx = [i for i, ln in enumerate(lines) if _is_segment_headline(ln)]
+    headline_idx = _segment_headline_indices(lines)
 
     if len(headline_idx) < 2:
         ext = extract(text, use_llm=use_llm)
@@ -1013,11 +1207,15 @@ def extract_segments(text: str, *, use_llm: bool = True) -> JenkinsUpdatePlan:
     sources: set[str] = set()
     for k, start in enumerate(headline_idx):
         end = headline_idx[k + 1] if k + 1 < len(headline_idx) else len(lines)
-        block = "\n".join(lines[start:end])
-        ext = extract(block, use_llm=use_llm)
+        block_lines = list(lines[start:end])
+        # The headline itself may still carry ``1)`` / ``2.``; the extractor reads it as part of
+        # the environment phrase and the job then fails to resolve.
+        block_lines[0] = _strip_list_marker(block_lines[0])
+        ext = extract("\n".join(block_lines), use_llm=use_llm)
         sources.add(ext.source)
         segments.append(ext)
 
+    _apply_shared_config(segments)
     _apply_shared_email(segments)
     src = "llm+rules" if any("llm" in s for s in sources) else "rules"
     return JenkinsUpdatePlan(segments=segments, source=src)
@@ -1060,7 +1258,9 @@ def build_command_body(plan: JenkinsUpdatePlan) -> Optional[str]:
     return "\n".join(parts)
 
 
-def agent_route(text: str, *, use_llm: bool = True) -> Optional[str]:
+def agent_route(
+    text: str, *, use_llm: bool = True, warn: Optional[Callable[[str], Any]] = None
+) -> Optional[str]:
     """
     One-shot router for free-form requests: returns a ``/update`` body (1 environment),
     a ``/updatemore`` body (N environments), or ``None`` when extraction fails.
@@ -1082,7 +1282,22 @@ def agent_route(text: str, *, use_llm: bool = True) -> Optional[str]:
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[jenkinsupdateagent] route error: {exc!r}", flush=True)
         return None
-    return build_command_body(plan)
+    body = build_command_body(plan)
+    dropped = plan.dropped_headlines()
+    if body and dropped:
+        note = (
+            "⚠️ I could not build a request for "
+            + ", ".join(f"**{d}**" for d in dropped)
+            + " — no Branch / Version / Services found for it, so it was **not** queued.\n"
+            "The rest is proceeding. Resend that job with its parameters if you still need it."
+        )
+        print(f"[jenkinsupdateagent] dropped headline(s): {dropped!r}", flush=True)
+        if warn is not None:
+            try:
+                warn(note)
+            except Exception as werr:  # pragma: no cover - defensive
+                print(f"[jenkinsupdateagent] drop warning failed: {werr!r}", flush=True)
+    return body
 
 
 def explain_plan(plan: JenkinsUpdatePlan) -> str:
