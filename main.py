@@ -1809,6 +1809,17 @@ def lark_webhook():
     # ---- card.action.trigger (Confirm / Cancel / job pick / VPN submit) ----
     card_resolved = _lark_resolve_card_action(data)
     if card_resolved is not None:
+        # This branch returns before the stale filter and before the message-id dedupe below, so
+        # a Lark redelivery (or a WS reconnect replaying the frame) used to run the whole card
+        # worker twice. Every card handler downstream is a check-then-act — read the session,
+        # release the lock, then dispatch — so two workers both see "not busy" and BOTH trigger a
+        # Jenkins build. The resolver already carries the event id; use it.
+        _card_eid = card_resolved[3] if len(card_resolved) > 3 else ""
+        if _card_eid.startswith("ws-synth-"):
+            _card_eid = ""  # locally minted, carries no redelivery identity
+        if _card_eid and _remember_processed_message_id(f"card:{_card_eid}"):
+            print(f"[lark] duplicate card callback {_card_eid!r} — ACK without re-running", flush=True)
+            return _lark_http_card_callback_ok()
         threading.Thread(
             target=_run_card_callback_worker, args=(data, card_resolved), daemon=True
         ).start()
@@ -2163,6 +2174,66 @@ def internal_reply_update_email():
     return jsonify({"ok": True, "message": "accepted", "accepted": True, "cid": cid}), 202
 
 
+# jenkinsbot has POSTed ``/SuccessProceedNext`` / ``/FailedStop`` here since it was written
+# (``_duty_updatemore_callback_url``), but the route never existed on this side — every call
+# 404'd and jenkinsbot silently fell back to a Lark bot→bot message, the one channel both repos
+# document as lossy. That is why a dropped Lark message parked the whole ``/updatemore`` queue
+# until the build watchdog's grace expired. ``process_updatemore_jenkins_command`` was written
+# for this route and had no caller until now.
+@app.route("/internal/updatemore-jenkins-callback", methods=["POST"])
+def internal_updatemore_jenkins_callback():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    if not _internal_auth_ok():
+        print(
+            "[updatemore-callback] REJECT status=403 reason=unauthorized "
+            f"from {request.remote_addr or '?'}",
+            flush=True,
+        )
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+    chat_id = (str(payload.get("chat_id") or "").strip()) or (DUTY_CHAT_ID or "")
+    command = str(payload.get("command") or "").strip()
+    print(
+        f"[updatemore-callback] POST from {request.remote_addr or '?'} "
+        f"chat={chat_id!r} command={command!r}",
+        flush=True,
+    )
+    if not chat_id or not command:
+        return jsonify({"ok": False, "error": "missing chat_id or command"}), 400
+
+    ju = _get_jenkinsupdate()
+    if ju is None:
+        print("[updatemore-callback] REJECT status=503 reason=jenkinsupdate-unavailable", flush=True)
+        return jsonify({"ok": False, "error": "jenkinsupdate unavailable"}), 503
+
+    try:
+        import updatemore as um
+
+        handled = um.process_updatemore_jenkins_command(
+            chat_id,
+            command,
+            send_message,
+            sessions=ju._fpms_lark_sessions,
+            sessions_lock=ju._fpms_lark_sessions_lock,
+            session_key_fn=ju._fpms_lark_session_key,
+            dispatch_update_body=lambda cid, sk, body, snd, **kw: ju._dispatch_lark_update_command_body(
+                cid, sk, body, snd, **kw
+            ),
+        )
+    except Exception as ex:
+        # Answer with a non-ok body rather than a 500 HTML page: jenkinsbot only falls back to
+        # its Lark send when ``ok`` is falsey, and that fallback is exactly what we want here.
+        print(f"[updatemore-callback] ERROR {ex!r}", flush=True)
+        return jsonify({"ok": False, "error": str(ex)}), 500
+
+    # ``handled`` False means the command was not a proceed/stop at all, or no queue claimed it.
+    # Reporting ok=False lets jenkinsbot retry over Lark, where a human can see what happened.
+    print(f"[updatemore-callback] handled={handled}", flush=True)
+    return jsonify({"ok": bool(handled)}), (200 if handled else 409)
+
+
 @app.route("/internal/status", methods=["GET"])
 def internal_status():
     """
@@ -2305,7 +2376,11 @@ def _lark_ws_ensure_card_webhook_payload(payload: dict) -> dict:
     out.setdefault("schema", "2.0")
     hdr = dict(out.get("header") or {})
     hdr.setdefault("event_type", "card.action.trigger")
-    hdr.setdefault("event_id", hdr.get("event_id") or str(uuid.uuid4()))
+    # A minted id is tagged so the duplicate-card guard in ``lark_webhook`` can tell it apart from
+    # one Lark actually assigned. Lark reuses the real event_id when it redelivers, which is the
+    # only case that guard can safely act on; deduping on a fresh uuid would be a no-op, and
+    # deduping on a payload digest would swallow a deliberate second tap.
+    hdr.setdefault("event_id", hdr.get("event_id") or f"ws-synth-{uuid.uuid4()}")
     if VERIFICATION_TOKEN and not str(hdr.get("token") or "").strip():
         hdr["token"] = VERIFICATION_TOKEN
     out["header"] = hdr

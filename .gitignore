@@ -4,6 +4,10 @@
 
 # Runtime state written by the bot
 jenkinsupdate.json
+# Jenkins job/env/service catalogues learned at runtime - never commit these,
+# a tracked copy makes `git pull` abort on the server and breaks /deploy.
+jenkins_job_env_services.json
+cpms_igo_uat_services.json
 # Reply-email engine (maintenance_mail.py) runtime state
 maintenance.json
 allemail.json
@@ -32,5 +36,3 @@ __MACOSX/
 .idea/
 .vscode/
 tests/__pycache__/
-allemail.json
-jenkins_job_env_services.json

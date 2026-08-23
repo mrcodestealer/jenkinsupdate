@@ -867,6 +867,23 @@ _EMAIL_DONE_LEGACY_RE = re.compile(
     r"^(?P<title>.+?)\s+(?P<env>\S+)\s+(?P<time>\d{1,2}:\d{2}\s*[AP]M)\s*$",
     re.I,
 )
+# The legacy form above is "<email subject> <env> <h:mm AM/PM>" — it matches ANY line ending in a
+# clock time, which swallowed real update requests. "update fpms prod script by 5:00 PM" parsed as
+# title="update fpms prod script", env="by", time="5:00 PM": no build ever ran, and the bot went
+# off to Reply-All a customer thread instead. An update request is never a done-notification, so
+# an opening update verb disqualifies the line before the legacy branch sees it.
+_LEGACY_NOT_A_DONE_NOTICE_RE = re.compile(
+    r"^\s*(?:please\s+|kindly\s+|help\s+|pls\s+|can\s+(?:you\s+)?(?:help\s+)?)*"
+    r"(?:update|deploy|rebuild|redeploy|release|rollout|trigger|run|build)\b",
+    re.I,
+)
+
+
+def _legacy_done_notice_match(cleaned: str):
+    """``_EMAIL_DONE_LEGACY_RE`` minus the update-request false positives."""
+    if _LEGACY_NOT_A_DONE_NOTICE_RE.match(cleaned or ""):
+        return None
+    return _EMAIL_DONE_LEGACY_RE.match(cleaned or "")
 
 
 def is_reply_update_email_text(text: str) -> bool:
@@ -1167,7 +1184,7 @@ def parse_email_done_message(text: str) -> tuple[str, str, str] | None:
             return parts[0], parts[1], parts[2]
         return None
 
-    m = _EMAIL_DONE_LEGACY_RE.match(raw)
+    m = _legacy_done_notice_match(raw)
     if not m:
         return None
     return m.group("title").strip(), m.group("env").strip(), m.group("time").strip()
@@ -1358,7 +1375,7 @@ def is_jenkinsbot_duty_command(text: str) -> bool:
     if _SUCCESS_PROCEED_RE.search(raw) or _FAILED_STOP_RE.search(raw):
         return True
     cleaned = _strip_lark_mentions(raw)
-    return bool(_EMAIL_DONE_LEGACY_RE.match(cleaned))
+    return bool(_legacy_done_notice_match(cleaned))
 
 
 def _lark_json_text_field(part: str) -> str:
@@ -1442,7 +1459,7 @@ def resolve_duty_command_body(*parts: str | None) -> str:
             continue
         if _REPLY_UPDATE_EMAIL_RE.search(cand) or _SUCCESS_PROCEED_RE.search(cand) or _FAILED_STOP_RE.search(cand):
             return cand
-        if _EMAIL_DONE_LEGACY_RE.match(cand):
+        if _legacy_done_notice_match(cand):
             return cand
     blob = " ".join(candidates)
     m = re.search(
@@ -1881,6 +1898,17 @@ def handle_jenkins_email_done(
             pending_hold = False
             next_body = ""
             with sessions_lock:
+                # Re-read the gate INSIDE the critical section. The test above ran unlocked, so
+                # two completions arriving together both passed it and both bumped the index —
+                # one segment never built and its customer reply never went out. jenkinsbot
+                # produces two genuinely distinct messages on a routine timeout (HTTP first, then
+                # the Lark fallback), so this is not a rare interleaving.
+                if not q.get("waiting_jenkins") or q.get("stopped"):
+                    _log(
+                        f"decision=advance-lost-race chat={chat_id!r} index={q.get('index')} "
+                        "— another delivery already advanced this queue; not advancing again"
+                    )
+                    return True
                 q["waiting_jenkins"] = False
                 next_idx = int(q.get("index") or 0) + 1
                 q["index"] = next_idx
@@ -2152,6 +2180,16 @@ def handle_jenkinsbot_callback(
         finished = False
         next_body = ""
         with sessions_lock:
+            # ``find_waiting_queue_for_chat`` tested ``waiting_jenkins`` under the lock and then
+            # released it, so two proceeds racing here both reached this point and each bumped
+            # the index — skipping a whole segment. Re-test now that we hold the lock for the
+            # write. A queue that is no longer waiting has already been advanced by whoever won.
+            if not q.get("waiting_jenkins"):
+                _log(
+                    f"decision=proceed-lost-race chat={chat_id!r} index={q.get('index')} "
+                    "— another proceed already advanced this queue; dropping this one"
+                )
+                return True
             q["waiting_jenkins"] = False
             if local_settle:
                 # Same critical section as the increment: a jenkinsbot proceed racing this advance
