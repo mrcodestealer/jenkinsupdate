@@ -1341,6 +1341,66 @@ def _sender_may_use_stale_duty_exemption(sender_id: Optional[str]) -> bool:
     return sender_id == known
 
 
+def _warm_status_card(report: str) -> dict:
+    """Render :func:`jenkinsupdate.jenkins_warm_pool_status_report` as a Lark card.
+
+    The report is plain text: unindented section headers, two-space-indented detail lines that
+    already carry their own ✅ / 💤 / ❌ marker, and a blank line between the JU pool and the VPN
+    browser. Markdown collapses the indentation, so the structure is rebuilt with bold headers and
+    a rule between sections rather than relying on leading whitespace surviving.
+
+    Header colour is the at-a-glance signal, which the flat text never gave: red when a browser
+    that should be hot is down, orange when a pool is off or was never started, green otherwise.
+    """
+    down = "hot but DOWN" in report or "hot but down" in report
+    degraded = "⚠️" in report
+    template = "red" if down else ("orange" if degraded else "green")
+
+    elements: list[dict] = []
+    for chunk in report.split("\n\n"):
+        lines = [ln for ln in chunk.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        rendered: list[str] = []
+        for ln in lines:
+            body = ln.strip()
+            # Section headers are unindented; the live-count summary is the one indented line
+            # that deserves the same weight.
+            if not ln.startswith(" ") or "live browser(s)" in body:
+                rendered.append(f"**{body}**")
+            else:
+                rendered.append(body)
+        if elements:
+            elements.append({"tag": "hr"})
+        elements.append(
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(rendered)}}
+        )
+
+    elements.append(
+        {
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": (
+                        "Hot browsers are pre-warmed and never released. Lazy ones launch on "
+                        "first use (~20s) and are released after the idle window. "
+                        "Tune with JU_WARM_HOT_URLS."
+                    ),
+                }
+            ],
+        }
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": "🌡️ Jenkins warm browser status"},
+        },
+        "elements": elements,
+    }
+
+
 def _run_jenkins_warm_status_check(chat_id: str) -> None:
     try:
         ju = _get_jenkinsupdate()
@@ -1351,6 +1411,13 @@ def _run_jenkins_warm_status_check(chat_id: str) -> None:
     except Exception as exc:
         send_message(chat_id, f"❌ warm status check failed: {exc!r}")
         return
+    # Card first, plain text if Lark rejects it. The status is the whole point of the command, so
+    # a card-rendering problem must never be the reason it goes unanswered.
+    try:
+        send_message(chat_id, _warm_status_card(report), msg_type="interactive")
+        return
+    except Exception as exc:
+        print(f"[lark] warm status card failed ({exc!r}) — falling back to text", flush=True)
     send_message(chat_id, f"🌡️ **Jenkins warm browser status**\n{report}")
 
 
