@@ -936,27 +936,6 @@ _SEG_HEADLINE_RE = re.compile(r"(?i)^\s*(?:please\s+|kindly\s+|help\s+|can\s+hel
 _CC_LINE_RE = re.compile(r"(?i)^\s*cc\b")
 _CMD_STRIP_RE = re.compile(r"(?i)/(?:update|jenkinsupdate|updatejenkins|updatemore)(?!\w)")
 
-# Users write several updates in one message far more loosely than one-headline-per-line:
-# "update cpms prod, then update fpms prod script", or a numbered list. Both used to collapse into
-# a SINGLE segment — and worse, the second block's ``Branch:``/``Version:`` overwrote the first's
-# while its headline became a bogus service token, so one job built with another job's parameters.
-# These two rules put a newline in front of every genuine second headline before splitting.
-_SEG_JOINER_RE = re.compile(
-    r"(?i)\s*[,;、]?\s*\b(?:then|and\s+then|after\s+that|afterwards|also|next|followed\s+by)\s+"
-    r"(?=(?:please\s+|kindly\s+|help\s+|can\s+help\s+)*(?:update|deploy)\b)"
-)
-_SEG_COMMA_RE = re.compile(
-    r"(?i)(?<=\S)\s*[,;]\s+(?=(?:please\s+|kindly\s+|help\s+|can\s+help\s+)*(?:update|deploy)\b)"
-)
-# A leading list marker ("1.", "2)", "-", "*") hides the update verb from _SEG_HEADLINE_RE.
-_SEG_ENUMERATOR_RE = re.compile(r"^\s*(?:\d{1,2}\s*[.)\]]|[-*•])\s*")
-
-
-def _split_segment_joiners(raw: str) -> str:
-    """Put each ``… then update X`` / ``…, update X`` continuation on its own line."""
-    out = _SEG_JOINER_RE.sub("\n", raw or "")
-    return _SEG_COMMA_RE.sub("\n", out)
-
 
 def _is_segment_headline(line: str) -> bool:
     """True when a line starts a new update block, e.g. ``UPDATE FPMS UAT MASTER``."""
@@ -965,7 +944,7 @@ def _is_segment_headline(line: str) -> bool:
         return False
     if _key_line_match(line) or _EMAIL_LINE_RE.match(s) or _CC_LINE_RE.match(s):
         return False
-    return bool(_SEG_HEADLINE_RE.match(_SEG_ENUMERATOR_RE.sub("", s)))
+    return bool(_SEG_HEADLINE_RE.match(s))
 
 
 @dataclass
@@ -1023,14 +1002,10 @@ def extract_segments(text: str, *, use_llm: bool = True) -> JenkinsUpdatePlan:
     raw = (text or "").replace("\r\n", "\n")
     raw = _CMD_STRIP_RE.sub(" ", raw)
     raw = _split_inline_key_segments(raw)
-    raw = _split_segment_joiners(raw)
     lines = raw.split("\n")
     headline_idx = [i for i, ln in enumerate(lines) if _is_segment_headline(ln)]
 
     if len(headline_idx) < 2:
-        # Re-extract from ``raw`` rather than ``text`` when the joiner split changed nothing but
-        # the inline-key split did — ``extract`` does its own normalisation, so passing the
-        # original is correct here and keeps the single-segment path byte-identical to before.
         ext = extract(text, use_llm=use_llm)
         return JenkinsUpdatePlan(segments=[ext], source=ext.source)
 
@@ -1038,10 +1013,7 @@ def extract_segments(text: str, *, use_llm: bool = True) -> JenkinsUpdatePlan:
     sources: set[str] = set()
     for k, start in enumerate(headline_idx):
         end = headline_idx[k + 1] if k + 1 < len(headline_idx) else len(lines)
-        block_lines = list(lines[start:end])
-        # Drop the list marker so "1. update fpms uat" resolves the same as "update fpms uat".
-        block_lines[0] = _SEG_ENUMERATOR_RE.sub("", block_lines[0])
-        block = "\n".join(block_lines)
+        block = "\n".join(lines[start:end])
         ext = extract(block, use_llm=use_llm)
         sources.add(ext.source)
         segments.append(ext)

@@ -1814,7 +1814,10 @@ def lark_webhook():
         # worker twice. Every card handler downstream is a check-then-act — read the session,
         # release the lock, then dispatch — so two workers both see "not busy" and BOTH trigger a
         # Jenkins build. The resolver already carries the event id; use it.
-        _card_eid = card_resolved[3] if len(card_resolved) > 3 else ""
+        # str() the id before touching it: _lark_resolve_card_action returns None when the payload
+        # carries no event_id in either position, and calling .startswith on that turned a card tap
+        # into an HTTP 500 — losing the tap outright instead of merely failing to dedupe it.
+        _card_eid = str(card_resolved[3] or "") if len(card_resolved) > 3 else ""
         if _card_eid.startswith("ws-synth-"):
             _card_eid = ""  # locally minted, carries no redelivery identity
         if _card_eid and _remember_processed_message_id(f"card:{_card_eid}"):
