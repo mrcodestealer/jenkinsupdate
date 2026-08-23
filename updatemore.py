@@ -233,6 +233,41 @@ def normalize_email_key(title: str) -> str:
     return re.sub(r"\s+", " ", (title or "").strip().casefold())
 
 
+def hoist_single_email_to_all_segments(segments: list[dict[str, Any]]) -> bool:
+    """One ``Email:`` line written once covers the WHOLE run, not just the segment it sits in.
+
+    People write the subject once, at the bottom, meaning "reply to this thread when everything
+    above is done". The parser attached it to whichever segment contained the line, and
+    ``assign_email_batches`` refuses to batch a single index — so that lone subject became a
+    one-segment batch and ``record_email_build_success`` returned "sent" the moment THAT segment
+    finished. Written mid-run, the customer was told the work was done while later updates had
+    not started; written last it only looked right, because different-environment segments are
+    dispatched in parallel and the last one can finish first.
+
+    Copying the subject onto every segment turns it into a real N-segment batch, so the reply
+    waits for all N. Only done when the run carries exactly ONE distinct subject: two different
+    subjects are two deliberate threads and are left to ``assign_email_batches`` as before.
+
+    Returns True when it changed anything.
+    """
+    if len(segments) < 2:
+        return False
+    by_key: dict[str, str] = {}
+    for seg in segments:
+        email = (seg.get("email_subject") or "").strip()
+        if email:
+            by_key.setdefault(normalize_email_key(email), email)
+    if len(by_key) != 1:
+        return False
+    canonical = next(iter(by_key.values()))
+    missing = [seg for seg in segments if not (seg.get("email_subject") or "").strip()]
+    if not missing:
+        return False
+    for seg in missing:
+        seg["email_subject"] = canonical
+    return True
+
+
 def assign_email_batches(segments: list[dict[str, Any]]) -> None:
     """
     Batch email replies by **exact same** ``Email:`` subject (any segment order).
@@ -532,6 +567,7 @@ def parse_updatemore_body(body: str) -> list[dict[str, Any]]:
                 f"Expected another `UPDATE …` job line, `same`, or `not same`, got: {lines[i - 1]!r}"
             )
 
+    hoist_single_email_to_all_segments(segments)
     assign_email_batches(segments)
     return segments
 
@@ -566,7 +602,22 @@ def queue_summary(segments: list[dict[str, Any]]) -> str:
     )
     lines: list[str] = []
     if has_shared_email:
-        lines.append("Same emails detected will send together.")
+        # Say how many builds the reply is waiting on. "Same emails detected" did not tell the
+        # operator whether the subject they wrote once had actually been applied to every segment.
+        shared = max(len(seg.get("email_batch_indices") or []) for seg in segments)
+        subject = next(
+            (
+                (seg.get("email_batch_title") or "").strip()
+                for seg in segments
+                if (seg.get("email_batch_title") or "").strip()
+            ),
+            "",
+        )
+        lines.append(
+            f"📧 One **Reply-All** for `{subject}` after **all {shared}** update(s) succeed."
+            if subject
+            else f"📧 One **Reply-All** after **all {shared}** update(s) succeed."
+        )
     else:
         lines.append(f"📋 **/updatemore** — {len(segments)} segment(s):")
     for n, seg in enumerate(segments, 1):
