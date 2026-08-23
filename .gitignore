@@ -8,6 +8,9 @@ jenkinsupdate.json
 # a tracked copy makes `git pull` abort on the server and breaks /deploy.
 jenkins_job_env_services.json
 cpms_igo_uat_services.json
+bi_script_deployment_files.json
+# Debug output from `maintenance_mail.py jenkins-reply-preview`
+reply_preview.html
 # Reply-email engine (maintenance_mail.py) runtime state
 maintenance.json
 allemail.json

@@ -870,20 +870,39 @@ _EMAIL_DONE_LEGACY_RE = re.compile(
 # The legacy form above is "<email subject> <env> <h:mm AM/PM>" — it matches ANY line ending in a
 # clock time, which swallowed real update requests. "update fpms prod script by 5:00 PM" parsed as
 # title="update fpms prod script", env="by", time="5:00 PM": no build ever ran, and the bot went
-# off to Reply-All a customer thread instead. An update request is never a done-notification, so
-# an opening update verb disqualifies the line before the legacy branch sees it.
-_LEGACY_NOT_A_DONE_NOTICE_RE = re.compile(
+# off to Reply-All a customer thread instead. "meeting moved to 3:30 PM" matched too, and because
+# the same matcher widens the group @mention gate, that fired with no @mention at all.
+#
+# What separates the two is the <env> slot. A real notice carries an environment there ("rc-uat",
+# "fpms-uat"); a request carries an English preposition ("by", "at", "before").
+#
+# Testing the OPENING WORD instead is not safe and must not be reintroduced: real customer
+# subjects begin with the word UPDATE — "UPDATE PRODUCTION Livechat v1.0.27 - CP" is used as a
+# fixture in three test files — so disqualifying every line that opens with an update verb drops
+# the notification for those threads and the customer reply is never sent. The opener rule is
+# therefore applied only when the verb is NOT followed by an environment word, which is what makes
+# a subject line beginning "UPDATE PRODUCTION …" distinguishable from a request "update fpms …".
+_LEGACY_ENV_IS_FILLER_RE = re.compile(
+    r"^(?:by|at|on|to|in|before|after|around|till|until|from|for|due|eta|about)$", re.I
+)
+_LEGACY_REQUEST_OPENER_RE = re.compile(
     r"^\s*(?:please\s+|kindly\s+|help\s+|pls\s+|can\s+(?:you\s+)?(?:help\s+)?)*"
-    r"(?:update|deploy|rebuild|redeploy|release|rollout|trigger|run|build)\b",
+    r"(?:update|deploy|rebuild|redeploy|release|rollout|trigger|run)\s+"
+    r"(?!(?:production|prod|uat|staging|stg|sit|dev|test)\b)",
     re.I,
 )
 
 
 def _legacy_done_notice_match(cleaned: str):
-    """``_EMAIL_DONE_LEGACY_RE`` minus the update-request false positives."""
-    if _LEGACY_NOT_A_DONE_NOTICE_RE.match(cleaned or ""):
+    """``_EMAIL_DONE_LEGACY_RE`` minus the update-request and small-talk false positives."""
+    m = _EMAIL_DONE_LEGACY_RE.match(cleaned or "")
+    if not m:
         return None
-    return _EMAIL_DONE_LEGACY_RE.match(cleaned or "")
+    if _LEGACY_ENV_IS_FILLER_RE.match((m.group("env") or "").strip()):
+        return None
+    if _LEGACY_REQUEST_OPENER_RE.match(cleaned or ""):
+        return None
+    return m
 
 
 def is_reply_update_email_text(text: str) -> bool:
