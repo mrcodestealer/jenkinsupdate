@@ -644,6 +644,74 @@ _NL_JENKINS_UPDATE_RE = re.compile(
     r"|(?:帮我|请).{0,12}更新"
     r")"
 )
+# ``/testing`` — run the whole update as a DRY RUN: fill the Jenkins form, verify it, photograph
+# it, report what the ``Email:`` line would do, then stop. It never clicks **Build** and never
+# sends mail. This pair is only how an operator ASKS for that; what makes it a guarantee is the
+# refusal inside :func:`_click_jenkins_build_button`, which no code path can talk its way past.
+#
+# Why the token is only ever recognised at the START of one of the first two lines, and never by a
+# bare ``in`` test. Both directions of mistake are live here and both are bad:
+#
+#   * miss it, and an operator who asked for a dry run gets a real production build;
+#   * find it where it was not meant, and a REAL production update silently becomes a no-op.
+#
+# The second is the one that bites quietly, and the realistic way to cause it is a ``/testing``
+# sitting inside a value — ``Service: /testing-svc``, or an ``Email:`` subject naming a testing
+# harness. Anchoring at line start makes those structurally unable to match, because a
+# ``Key: value`` line never begins with the token. Two lines, not one, because Lark leaves a blank
+# line after the @mention often enough to matter.
+JENKINS_DRY_RUN_CMD_RE = re.compile(r"^/testing\b", re.I)
+_DRY_RUN_MENTION_JUNK_RE = re.compile(r"(?:@_user_\d+|<[^>]*>)")
+
+
+def _dry_run_candidate_lines(text: str) -> list[str]:
+    """The first two non-empty lines, with leftover @mention placeholders removed."""
+    raw = (text or "").replace("\r\n", "\n")
+    out: list[str] = []
+    for ln in raw.split("\n"):
+        s = _DRY_RUN_MENTION_JUNK_RE.sub("", ln or "").strip()
+        if not s:
+            continue
+        out.append(s)
+        if len(out) == 2:
+            break
+    return out
+
+
+def jenkins_dry_run_requested(text: str) -> bool:
+    """True when this message asks for a dry run (``/testing`` leading one of its first 2 lines)."""
+    return any(JENKINS_DRY_RUN_CMD_RE.match(s) for s in _dry_run_candidate_lines(text))
+
+
+def strip_jenkins_dry_run_token(text: str) -> str:
+    """Remove the ``/testing`` token so the rest of the message parses as an ordinary request.
+
+    The token must be gone before ANY parser sees the body: the headline ranker treats the first
+    non-empty line as the job name, so a surviving ``/testing`` line either loses the real
+    headline or gets ranked against the job registry as if it were one.
+
+    A body that never asked for a dry run comes back unchanged — this must be safe to call
+    speculatively.
+    """
+    raw = (text or "").replace("\r\n", "\n")
+    out: list[str] = []
+    seen_nonempty = 0
+    for ln in raw.split("\n"):
+        probe = _DRY_RUN_MENTION_JUNK_RE.sub("", ln or "").strip()
+        if probe:
+            seen_nonempty += 1
+        if probe and seen_nonempty <= 2 and JENKINS_DRY_RUN_CMD_RE.match(probe):
+            rest = JENKINS_DRY_RUN_CMD_RE.sub("", probe, count=1).strip()
+            if rest:
+                # ``/testing UPDATE FPMS UAT MASTER`` — keep the headline, drop the token.
+                out.append(rest)
+            continue  # the token owned the whole line: drop the line with it
+        out.append(ln)
+    while out and not out[0].strip():
+        out.pop(0)
+    return "\n".join(out).strip()
+
+
 # VPN creation triggers: slash command ``/createvpn`` and natural phrases like "create vpn" / "build vpn".
 VPN_CREATE_CMD_RE = re.compile(r"/create\s*vpn\b", re.I)
 _NL_VPN_CREATE_RE = re.compile(
@@ -8136,6 +8204,98 @@ def wait_review(seconds: float, *, build_was_clicked: bool = False) -> None:
 _fpms_lark_sessions_lock = threading.Lock()
 _fpms_lark_sessions: dict[str, dict] = {}
 
+# ``/testing``: which session keys have asked for their NEXT run to be a dry run.
+#
+# Why a registry and not the session row. The dry-run flag has to be set before ANY routing
+# happens, and the free-form agent router only runs when the session has NO row at all
+# (``if not isinstance(_existing_sess, dict)``) — the exact path a multi-block ``/testing``
+# message takes. Seeding a row to carry the flag would therefore switch off the very router the
+# feature needs. Keying it here perturbs no state machine.
+#
+# Why this cannot leak into a real build the way a global or a thread-local would: it is keyed by
+# chat+sender, EVERY ordinary message from that key disarms it (see
+# ``handle_lark_jenkins_update_message``), a finished run disarms it, and an arm nobody dispatches
+# expires. The run-scoped value stays a plain local inside ``run()`` — see the note at
+# ``_ju_dry_run``.
+_JU_DRY_RUN_ARM_TTL_SEC = 6 * 3600.0
+_ju_dry_run_armed: dict[str, float] = {}
+
+
+def _ju_arm_dry_run(session_key: str) -> None:
+    sk = (session_key or "").strip()
+    if not sk:
+        return
+    with _fpms_lark_sessions_lock:
+        _ju_dry_run_armed[sk] = time.time()
+
+
+def _ju_disarm_dry_run(session_key: str) -> None:
+    sk = (session_key or "").strip()
+    if not sk:
+        return
+    with _fpms_lark_sessions_lock:
+        _ju_dry_run_armed.pop(sk, None)
+
+
+def _ju_active_run_blocking_dry_run(session_key: str) -> str:
+    """Why a dry run must not start for ``session_key`` right now, or ``""`` if it may.
+
+    A dry run shares its ``chat_id:sender_id`` key with any real run the same operator already has
+    going, and the things that drive a real multi-segment run onward — a jenkinsbot callback, a
+    card tap — are not operator messages, so they never clear a dry-run arm. Letting the two
+    overlap is how a real segment ends up inheriting the arm and refusing to build.
+    """
+    with _fpms_lark_sessions_lock:
+        sess = _fpms_lark_sessions.get(session_key)
+        state = str((sess or {}).get("state") or "") if isinstance(sess, dict) else ""
+        q = (sess or {}).get("updatemore_queue") if isinstance(sess, dict) else None
+        q_dry = bool(q.get("dry_run")) if isinstance(q, dict) else False
+        q_live = isinstance(q, dict) and not q.get("stopped")
+    if q_live and not q_dry:
+        return "a real multi-environment update is still running in this chat."
+    if state == "jenkins_wait_build":
+        return "this chat is already waiting on a **Build** confirmation."
+    return ""
+
+
+def _jenkins_message_starts_a_fresh_request(clean_text: str, body_early: str) -> bool:
+    """True when this message is a NEW update request rather than a reply inside a running one.
+
+    Used only to decide whether to clear a dry-run arm. Answers to a picker ("1"), ``yes`` / ``no``
+    and card-tap re-entries deliberately return False: they belong to the request already in
+    flight, and treating them as new requests is what silently turned dry runs into real ones.
+    """
+    try:
+        if JENKINS_UPDATE_CMD_RE.search(clean_text or ""):
+            return True
+        try:
+            import updatemore as _um_fresh
+
+            if _um_fresh.UPDATEMORE_CMD_RE.search(body_early or ""):
+                return True
+        except Exception:
+            pass
+        if _jenkins_message_has_config_block(body_early or ""):
+            return True
+        return bool(_looks_like_freeform_update_request(body_early or ""))
+    except Exception:
+        # Never let this decide "fresh" by accident: a wrong True disarms a live dry run.
+        return False
+
+
+def _ju_dry_run_armed_for(session_key: str) -> bool:
+    """True when ``session_key`` asked for a dry run recently enough to still mean it."""
+    sk = (session_key or "").strip()
+    if not sk:
+        return False
+    now = time.time()
+    with _fpms_lark_sessions_lock:
+        for k, ts in list(_ju_dry_run_armed.items()):
+            if now - float(ts or 0.0) > _JU_DRY_RUN_ARM_TTL_SEC:
+                _ju_dry_run_armed.pop(k, None)
+        return sk in _ju_dry_run_armed
+
+
 # Job-picker interactive cards: bind button taps to the session row even when ``card.action`` ``operator``
 # ids do not match the keys used for ``im.message.receive_v1`` (common in groups / mixed open_id vs union_id).
 _fpms_lark_picker_sid_lock = threading.Lock()
@@ -10464,6 +10624,9 @@ def _fpms_maybe_split_run_by_environment(
             chat_id=chat_id,
             sender_id=session_key.split(":", 1)[-1],
             skip_build=False,
+            # Seed from the arm: this builder has no message in hand, so without it a
+            # multi-segment /testing run created here would carry no dry-run flag at all.
+            dry_run=_ju_dry_run_armed_for(session_key),
         )
     except Exception as ex:
         print(f"[fpms] post-pick env split skipped: {ex!r}", flush=True)
@@ -12154,8 +12317,15 @@ def _fpms_lark_verification_card_json(
     job_profile: str = "fpms",
     next_build_number: int | None = None,
     screenshot_img_key: str = "",
+    dry_run: bool = False,
 ) -> str:
-    """Lark ``msg_type=interactive`` payload: Link / Env / Branch + optional screenshot."""
+    """Lark ``msg_type=interactive`` payload: Link / Env / Branch + optional screenshot.
+
+    On a ``dry_run`` the YES/NO buttons are left off entirely. They would not merely be useless:
+    the gate is already closed by the time this card lands (a dry run waits 0s), the session is
+    torn down moments later, and a tap would write ``approve_build`` onto a dead — or worse,
+    recycled — session row. A button that cannot do what it says is a bug, not decoration.
+    """
     link = (build_url or "").strip()
     env = (filled_env or "—").strip() or "—"
     branch = (filled_branch or "—").strip() or "—"
@@ -12177,7 +12347,20 @@ def _fpms_lark_verification_card_json(
     # people check the bot picked the right job, so a wrong title reads as a wrong job.
     title_text = _jenkins_job_profile_display(jp)
     if isinstance(next_build_number, int) and next_build_number > 0:
-        title_text = f"{title_text} #{next_build_number}"
+        # Bare "#N" on a dry-run card reads as a queued build. The number is only a max+1
+        # prediction, and on a dry run no build will ever claim it — say so.
+        title_text = (
+            f"{title_text} — would be #{next_build_number}"
+            if dry_run
+            else f"{title_text} #{next_build_number}"
+        )
+    if dry_run:
+        # A three-block dry run posts three cards whose profile display name is identical; the
+        # environment is the only thing that distinguishes them at a glance. Scoped to dry runs so
+        # real-run card titles are untouched.
+        title_text = f"🧪 TESTING — {title_text}"
+        if env and env != "—" and env.casefold() not in title_text.casefold():
+            title_text = f"{title_text} · {env}"
 
     yes_btn = _fpms_lark_v2_callback_button(
         "YES — Build",
@@ -12203,8 +12386,22 @@ def _fpms_lark_verification_card_json(
                 "alt": {"tag": "plain_text", "content": "Jenkins form"},
             }
         )
-    body_elements.extend([yes_btn, no_btn])
-    if jp == "vpn_creation":
+    if dry_run:
+        body_elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        "🧪 **Dry run (`/testing`)** — **Build** was **not** clicked and no "
+                        "email was sent. Nothing here changed Jenkins."
+                    ),
+                },
+            }
+        )
+    else:
+        body_elements.extend([yes_btn, no_btn])
+    if jp == "vpn_creation" and not dry_run:
         # Explicit Cancel for VPN: skip Build and return the warm browser to ready.
         body_elements.append(
             _fpms_lark_v2_callback_button(
@@ -12218,7 +12415,9 @@ def _fpms_lark_verification_card_json(
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "fill"},
         "header": {
-            "template": "green" if ok_all else "orange",
+            # Turquoise, not green, for a dry run: green is the colour this chat has learned to
+            # read as "that went out".
+            "template": ("turquoise" if dry_run else "green") if ok_all else "orange",
             "title": {
                 "tag": "plain_text",
                 "content": title_text,
@@ -12239,6 +12438,7 @@ def _fpms_lark_verification_plain_fallback(
     build_url: str,
     job_profile: str = "fpms",
     next_build_number: int | None = None,
+    dry_run: bool = False,
 ) -> str:
     jp = (job_profile or "fpms").strip()
     # One mapping for every profile — these chains had no ``pms_uat``/``frontend`` case, so a PMS
@@ -12246,7 +12446,13 @@ def _fpms_lark_verification_plain_fallback(
     # people check the bot picked the right job, so a wrong title reads as a wrong job.
     head = _jenkins_job_profile_display(jp)
     if isinstance(next_build_number, int) and next_build_number > 0:
-        head = f"{head} #{next_build_number}"
+        head = (
+            f"{head} — would be #{next_build_number}"
+            if dry_run
+            else f"{head} #{next_build_number}"
+        )
+    if dry_run:
+        head = f"TESTING — {head}"
     link = (build_url or "").strip()
     env = (filled_env or "—").strip() or "—"
     branch = (filled_branch or "—").strip() or "—"
@@ -12268,7 +12474,13 @@ def _fpms_lark_verification_plain_fallback(
             f"**Branch:** `{branch}`",
             "",
         ]
-    if ok_all:
+    if dry_run:
+        lines.append(
+            "🧪 **Dry run (`/testing`)** — **Build** was **not** clicked and no email was sent."
+        )
+        if not ok_all:
+            lines.append("⚠️ Form check has ❌ — the values above did not verify.")
+    elif ok_all:
         lines.append("Reply **yes** to click **Build**, or **no** to skip.")
     else:
         lines.append(
@@ -12280,6 +12492,12 @@ def _fpms_lark_verification_plain_fallback(
 def _jenkins_form_screenshot_enabled(bot_lark_gate: dict | None) -> bool:
     if not bot_lark_gate:
         return False
+    if bool((bot_lark_gate or {}).get("dry_run")):
+        # A dry run has no other output: it never builds, so the photographed form IS the result.
+        # An early return, never a rewrite of the env reads below — an operator who exported
+        # JENKINSUPDATE_FORM_SCREENSHOT=0 (headless host, rate-limited Lark image API) must keep
+        # that kill switch for every REAL run.
+        return True
     jp = str((bot_lark_gate or {}).get("job_profile") or "").strip()
     if jp == "vpn_creation":
         raw_vpn = os.environ.get("JENKINSUPDATE_VPN_FORM_SCREENSHOT", "1").strip().lower()
@@ -12645,6 +12863,7 @@ def _fpms_lark_send_verification_summary(
     job_profile: str = "fpms",
     next_build_number: int | None = None,
     screenshot_img_key: str = "",
+    dry_run: bool = False,
 ) -> None:
     card = _fpms_lark_verification_card_json(
         filled_env=filled_env,
@@ -12654,6 +12873,7 @@ def _fpms_lark_send_verification_summary(
         job_profile=job_profile,
         next_build_number=next_build_number,
         screenshot_img_key=screenshot_img_key,
+        dry_run=dry_run,
     )
     try:
         send(chat_id, card, msg_type="interactive")
@@ -12667,7 +12887,320 @@ def _fpms_lark_send_verification_summary(
                 build_url=build_url,
                 job_profile=job_profile,
                 next_build_number=next_build_number,
+                dry_run=dry_run,
             ),
+        )
+
+
+def _fpms_lark_dry_run_email_subjects(session_key: str, q: dict | None) -> list[str]:
+    """Every DISTINCT ``Email:`` subject the run would reply to, in order.
+
+    Not just the session's last one. ``hoist_single_email_to_all_segments`` only spreads a subject
+    across segments when the run carries exactly one; two different subjects are two deliberate
+    threads and a real run sends a reply for each. Reporting only the last would under-report a
+    whole customer email, and a final block with no ``Email:`` line would make the card claim the
+    run mails nobody.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for seg in (q or {}).get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        s = str(seg.get("email_batch_title") or seg.get("email_subject") or "").strip()
+        if s and s.casefold() not in seen:
+            seen.add(s.casefold())
+            out.append(s)
+    if not out:
+        s = _fpms_lark_session_email_subject(session_key)
+        if s:
+            out.append(s)
+    return out
+
+
+def _fpms_lark_dry_run_email_lines(session_key: str, q: dict | None = None) -> list[str]:
+    """``Email:`` recipient counts for a dry run — resolved locally, never sent.
+
+    Answers the one question a dry run cannot answer from Jenkins alone: if this had been real,
+    who would the done-reply have gone to? It calls the offline resolver in
+    :mod:`maintenance_mail`, which has no SMTP call in it, so there is no path from here to a
+    customer's inbox.
+    """
+    subjects = _fpms_lark_dry_run_email_subjects(session_key, q)
+    if not subjects:
+        return ["**Email:** none on this request — a real run would send no reply."]
+    if len(subjects) == 1:
+        return _fpms_lark_dry_run_email_lines_for(subjects[0])
+    out = [f"**Email:** {len(subjects)} separate replies would go out — one per subject."]
+    for i, s in enumerate(subjects, 1):
+        out.append("")
+        out.append(f"*Reply {i} of {len(subjects)}*")
+        out.extend(_fpms_lark_dry_run_email_lines_for(s))
+    return out
+
+
+def _fpms_lark_dry_run_email_lines_for(subject: str) -> list[str]:
+    """The recipient report for ONE ``Email:`` subject."""
+    if not subject:
+        return ["**Email:** none on this request — a real run would send no reply."]
+    try:
+        import maintenance_mail as mm
+
+        res = mm.jenkins_reply_recipient_preview(subject)
+    except Exception as ex:
+        return [
+            f"**Email:** `{subject}`",
+            f"⚠️ Could not resolve recipients: {ex}",
+        ]
+    lines = [f"**Email:** `{subject}`"]
+    if not res.get("ok"):
+        lines.append(f"⚠️ Would **not** resolve to a thread — {res.get('reason')}")
+        lines.append("A real run would fall back to a live IMAP search, which cannot be previewed.")
+        return lines
+    to_n = int(res.get("to") or 0)
+    cc_n = int(res.get("cc") or 0)
+    env_n = int(res.get("envelope") or 0)
+    lines.append(
+        f"Would send to **{to_n} recipient(s)** and **{cc_n} Cc** "
+        f"— {env_n} address(es) on the envelope after de-duplication."
+    )
+    # Subjects come off the wire RFC 2047-folded, so they carry embedded CRLF+space. Left alone,
+    # the fold breaks the card line in half and reads as a truncated subject.
+    matched = re.sub(r"\s+", " ", str(res.get("target_subject") or "")).strip()
+    lines.append(
+        f"Matched thread: `{matched[:90]}` "
+        f"({res.get('thread_members')} message(s), {res.get('target_age_days')} day(s) old)"
+    )
+    if res.get("stale"):
+        lines.append("⚠️ That thread is older than the reply age limit — a real run would warn.")
+    lines.append("_Nothing was sent. Refusals can only be known after a real send._")
+    return lines
+
+
+def _fpms_lark_dry_run_finish(
+    send,
+    chat_id: str,
+    session_key: str,
+    *,
+    job_profile: str,
+    build_url: str,
+    filled_env: str,
+    filled_branch: str,
+    version: str = "",
+    services: list[str] | None = None,
+    update_all_services: bool = False,
+    ok_all: bool = False,
+    next_build_number: int | None = None,
+    run_token: str | None = None,
+) -> None:
+    """Close out one ``/testing`` block: report it, then start the next block or wrap the run up.
+
+    This is the dry-run counterpart of everything that normally happens AFTER the Build click —
+    and it deliberately reuses none of it. The real path posts ``/SuccessInformMeTime`` to
+    jenkinsbot, arms a build watchdog, marks the segment in flight and registers an email watch.
+    Every one of those either fabricates a build that does not exist or leaves state on the queue
+    that a later genuine batch would consume.
+
+    The "done" time is simply now. There is no build to time, so a real duration cannot exist; it
+    is labelled as simulated rather than dressed up as measured. It is also written so it can
+    never be re-read as a real completion notice — the duty bot's legacy matcher keys on a line
+    that ENDS in ``h:mm AM/PM``, so the time here never sits at the end of its line.
+
+    ``run_token`` is this run's identity. Everything below that MUTATES shared state re-checks, in
+    the same lock as the mutation, that the session is still ours and that the queue it holds is
+    still the object we started from and is still marked ``dry_run``. Without those checks this
+    function trusted whatever queue the row happened to hold — and the row is keyed by chat+sender,
+    so a real ``/updatemore`` the same operator started mid-dry-run would be advanced a segment and
+    then stopped by the dry run's own clean-up.
+    """
+    jp = (job_profile or "fpms").strip() or "fpms"
+    label = _jenkins_job_profile_display(jp)
+    folder = _jenkins_job_folder_url(build_url)
+    when = time.strftime("%I:%M %p").lstrip("0")
+    svc = [str(x).strip() for x in (services or []) if str(x).strip()]
+    svc_txt = "ALL services" if update_all_services else (", ".join(svc) or "—")
+
+    body = [
+        f"**Link:** [{folder}]({folder})",
+        f"**Env:** `{(filled_env or '—').strip() or '—'}`",
+        f"**Branch:** `{(filled_branch or '—').strip() or '—'}`",
+    ]
+    if (version or "").strip():
+        body.append(f"**Version:** `{version.strip()}`")
+    body.append(f"**Services:** `{svc_txt}`")
+    body.append(
+        f"**Form verified:** {'✅ all values match' if ok_all else '❌ mismatch — see the card above'}"
+    )
+    body.append(f"**Done (simulated):** {when} — no build was started.")
+    if isinstance(next_build_number, int) and next_build_number > 0:
+        # On a failed verification the REAL path refuses the click and queues nothing. Printing
+        # "would have queued #N" there tells the operator the opposite of what they ran /testing
+        # to find out.
+        body.append(
+            f"A real run would have queued **#{next_build_number}**."
+            if ok_all
+            else f"A real run would have **refused** to click Build here — **#{next_build_number}** "
+            "would not have been queued."
+        )
+
+    # Work out whether this is the last block BEFORE reporting, so the Email: summary lands once,
+    # at the bottom of the run, exactly as it does for a real multi-segment update.
+    q = None
+    has_next = False
+    try:
+        import updatemore as um
+
+        with _fpms_lark_sessions_lock:
+            _s = _fpms_lark_sessions.get(session_key)
+            _mine = (
+                not run_token
+                or not isinstance(_s, dict)
+                or not str(_s.get("_run_token") or "")
+                or str(_s.get("_run_token")) == str(run_token)
+            )
+            _q0 = um.get_queue(_s if isinstance(_s, dict) else None)
+            # Only ever act on a queue that is OURS: still this run's session, and still flagged
+            # dry. A queue without dry_run belongs to a real update that has taken this chat.
+            q = _q0 if (_mine and isinstance(_q0, dict) and _q0.get("dry_run")) else None
+        if _q0 is not None and q is None:
+            print(
+                "[jenkinsupdate] dry run: the session's queue is not ours (newer run took the "
+                "chat) — reporting this block only, touching no queue state.",
+                flush=True,
+            )
+        has_next = bool(q) and um.has_next_segment(q)
+    except Exception as ex:
+        print(f"[jenkinsupdate] dry run: queue lookup failed: {ex!r}", flush=True)
+
+    if q is not None:
+        idx = int(q.get("index") or 0)
+        total = len(q.get("segments") or [])
+        body.insert(0, f"**Block {idx + 1} of {total}**")
+        if not ok_all:
+            # Remembered on the queue so the closing line can say the run was not clean. Without
+            # it a run whose middle block failed still signed off as if everything verified.
+            fails = q.setdefault("dry_run_failed_blocks", [])
+            if isinstance(fails, list) and (idx + 1) not in fails:
+                fails.append(idx + 1)
+
+    if not has_next:
+        body.append("")
+        body.extend(_fpms_lark_dry_run_email_lines(session_key, q))
+
+    header = "turquoise" if ok_all else "orange"
+    # The profile display name is the same string for FPMS, FPMS NT and NT auth/player, so a
+    # three-block run would post three identically titled cards. The environment is what actually
+    # tells them apart, and the screenshots arrive as separate messages that reference this title.
+    env_for_title = (filled_env or "").strip()
+    title = f"🧪 TESTING — {label}"
+    if env_for_title and env_for_title.casefold() not in title.casefold():
+        title = f"{title} · {env_for_title}"
+    card = {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {
+            "template": header,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(body)}}
+            ]
+        },
+    }
+    try:
+        send(chat_id, json.dumps(card, ensure_ascii=False), msg_type="interactive")
+    except TypeError:
+        send(chat_id, f"🧪 **{title}**\n\n" + "\n".join(body))
+    except Exception as ex:
+        print(f"[jenkinsupdate] dry run report failed: {ex!r}", flush=True)
+
+    if not has_next:
+        # Retire the queue explicitly. Left parked, a dead chat-keyed queue later swallowed a real
+        # /SuccessInformMeTime into a spent batch and no customer email went out.
+        try:
+            import updatemore as um
+
+            with _fpms_lark_sessions_lock:
+                _s2 = _fpms_lark_sessions.get(session_key)
+                # Identity, re-checked inside the mutating lock. Between the read above and here
+                # this thread did an allemail.json resolution and a blocking Lark send — easily
+                # long enough for a real /updatemore to claim the row.
+                if isinstance(_s2, dict) and _s2.get("updatemore_queue") is q and q is not None:
+                    um.clear_queue_from_session(_s2, chat_id)
+            if q is not None:
+                # Already identity-guarded internally: it only drops the queue while the per-chat
+                # store still holds THIS object.
+                um.release_chat_queue(str(q.get("chat_id") or chat_id), q)
+        except Exception as ex:
+            print(f"[jenkinsupdate] dry run: queue retire failed: {ex!r}", flush=True)
+        _ju_disarm_dry_run(session_key)
+        failed = [b for b in ((q or {}).get("dry_run_failed_blocks") or [])]
+        if not ok_all and not failed:
+            failed = [1]
+        if failed:
+            send(
+                chat_id,
+                "🧪 Dry run finished — no **Build** was clicked and no email was sent. "
+                f"⚠️ Verification failed on block(s) **{', '.join(str(b) for b in failed)}**, so "
+                "a real run would have refused to build there. Fix the job in Jenkins and "
+                "dry-run it again.",
+            )
+        else:
+            send(
+                chat_id,
+                "🧪 Dry run finished. No **Build** was clicked and no email was sent — "
+                "everything above is what a real run would have done.",
+            )
+        return
+
+    # Advance to the next block ourselves. Nothing else will: the real advance is driven by a
+    # jenkinsbot callback for a build that, by design, never happened.
+    try:
+        import updatemore as um
+
+        idx = int(q.get("index") or 0) + 1
+        segs = q.get("segments") or []
+        if idx >= len(segs):
+            return
+        with _fpms_lark_sessions_lock:
+            _s3 = _fpms_lark_sessions.get(session_key)
+            # ``_updatemore_queue_superseded`` compares against the row, so on its own it cannot
+            # see a swap when ``q`` came FROM that row. The identity check is what catches it.
+            superseded = _updatemore_queue_superseded(session_key, q) or not (
+                isinstance(_s3, dict) and _s3.get("updatemore_queue") is q
+            )
+            if not superseded:
+                q["index"] = idx
+                # Make the queue self-carrying. Queues built by the prod-script / cpms-igo /
+                # env-split paths never pass dry_run to init_queue, so without this the next
+                # block's only carrier would be the arm.
+                q["dry_run"] = True
+                _s3["updatemore_queue"] = q
+                _s3["ju_dry_run"] = True
+                um.persist_queue_if_current(q)
+        if superseded:
+            send(
+                chat_id,
+                f"ℹ️ Dry-run block {idx + 1} was **not** started — a newer request has taken "
+                "over this chat.",
+            )
+            return
+        send(chat_id, f"▶️ Dry run — starting block {idx + 1} of {len(segs)}…")
+        # No mark_segment_in_flight: with nothing in flight the next-segment wait is skipped, and
+        # a dry run has no build for anything to wait on anyway.
+        _dispatch_lark_update_command_body(
+            chat_id,
+            session_key,
+            um.segment_to_update_body(segs[idx]),
+            send,
+            from_updatemore=True,
+        )
+    except Exception as ex:
+        print(f"[jenkinsupdate] dry run: next-block dispatch failed: {ex!r}", flush=True)
+        send(
+            chat_id,
+            f"❌ Dry run could not start the next block automatically: {ex}\n"
+            "Send that block on its own with `/testing` if you still need it.",
         )
 
 
@@ -13020,12 +13553,18 @@ def _fpms_lark_begin_jenkins_run(
     lark_message_id: str | None = None,
     auto_build: bool = False,
     thread_root_id: str | None = None,
+    dry_run: bool = False,
 ) -> None:
     """Install ``jenkins_wait_build`` gate, react **Got It** on the trigger message, spawn Playwright.
 
     ``auto_build`` pre-approves the YES/NO gate so the run clicks **Build** automatically once the
     page verification passes (used by *rebuild without confirmation*). Verification mismatches still
     block the click, so it never builds a wrong form.
+
+    ``dry_run`` (``/testing``) is resolved HERE because this is the one funnel every non-VPN run
+    passes through — all 21 call sites and all ten ``_fpms_lark_dispatch_*_parameter_flow``
+    branches end up here. Resolving once beats threading a bool through every one of them, where a
+    single missed branch would mean a REAL build on a run the operator asked to be a dry run.
     """
     jp = (job_profile or "fpms").strip() or "fpms"
     if jp == "fnt_rc":
@@ -13061,12 +13600,38 @@ def _fpms_lark_begin_jenkins_run(
         pass
     with _fpms_lark_sessions_lock:
         prev_sess = _fpms_lark_sessions.get(session_key)
+    # Three sources, OR-ed, because a dry run reaches this point three different ways: an explicit
+    # caller argument, the arm placed by ``/testing`` on this chat+sender, and the queue flag that
+    # carries a multi-block ``/testing`` into segments 2..N (whose dispatch no longer has the
+    # original message in hand).
+    try:
+        import updatemore as _um_dry
+
+        _q_dry = _um_dry.get_queue(prev_sess if isinstance(prev_sess, dict) else None)
+    except Exception:
+        _q_dry = None
+    dry = (
+        bool(dry_run)
+        or _ju_dry_run_armed_for(session_key)
+        or bool((_q_dry or {}).get("dry_run"))
+        # The session row is what carries the flag across a picker detour, where the run pauses on
+        # a "pick" state and resumes from a later message. Without this read the stamp written
+        # below was never an input to anything, and a dry run that had to ask which service the
+        # operator meant came back as a real, buildable run.
+        or bool((prev_sess or {}).get("ju_dry_run"))
+    )
+    if dry and auto_build:
+        # ``auto_build`` pre-sets the gate so run() goes straight to the Build click, where the
+        # dry-run refusal raises and the chat gets a traceback instead of a report. A dry run must
+        # take the wait(0) path, so drop the pre-approval rather than fight it downstream.
+        auto_build = False
     wait_sess = {
         "state": "jenkins_wait_build",
         "build_gate_event": ev,
         "approve_build": True if auto_build else None,
         "lark_cancel": False,
         "lark_trigger_message_id": trigger_mid,
+        "ju_dry_run": dry,
     }
     _fpms_lark_preserve_updatemore_queue(
         prev_sess if isinstance(prev_sess, dict) else None, wait_sess
@@ -13113,6 +13678,7 @@ def _fpms_lark_begin_jenkins_run(
         update_all_services=update_all,
         headless=bot_headless,
         lark_message_id=trigger_mid,
+        dry_run=dry,
     )
 
 
@@ -13159,8 +13725,14 @@ def _fpms_lark_spawn_run(
     update_all_services: bool = False,
     headless: bool = True,
     lark_message_id: str | None = None,
+    dry_run: bool = False,
 ) -> None:
-    """``session_key`` must already hold ``jenkins_wait_build`` with ``build_gate_event``."""
+    """``session_key`` must already hold ``jenkins_wait_build`` with ``build_gate_event``.
+
+    ``dry_run`` rides into the run on ``bot_lark_gate``, which ``run()`` reads once into a plain
+    local. Deliberately not a global or a thread-local: warm-pool workers are long-lived and
+    reused, so a leaked ``True`` would stop a REAL update from building.
+    """
 
     ju = (jenkins_build_url or BUILD_URL).strip()
     jp = (job_profile or "fpms").strip() or "fpms"
@@ -13216,10 +13788,28 @@ def _fpms_lark_spawn_run(
                         "upload_image": upload_image_fn,
                         "send_image": send_image_fn,
                         "lark_message_id": trigger_mid,
+                        "dry_run": bool(dry_run),
+                        # So the dry-run report can prove the session is still ITS session before
+                        # it advances or retires a queue. Without it, a real /updatemore that took
+                        # the chat mid-dry-run would be advanced and then stopped by this run.
+                        "run_token": run_token,
                     },
                     "jenkins_build_url": ju,
                     "job_profile": jp,
                 }
+            )
+        except JenkinsDryRunBuildBlocked as ex:
+            # The dry-run refusal firing is a SUCCESS of the guarantee, not a crash. It reaches
+            # here from the Services-not-found recovery, which clicks a real Build ~2.4k lines
+            # before the gate. Reporting it as "automation failed" with a traceback would read as
+            # a bug in /testing rather than the one thing /testing promises.
+            prof_lbl = _jenkins_job_profile_display(jp)
+            print(f"[jenkinsupdate bot] dry run stopped before a build: {ex!r}", flush=True)
+            _notify_chat_resilient(
+                send,
+                chat_id,
+                f"🧪 **{prof_lbl}** dry run stopped before it could build — no **Build** was "
+                f"clicked and nothing was sent.\nReason: {ex}",
             )
         except Exception as ex:
             prof_lbl = _jenkins_job_profile_display(jp)
@@ -13328,7 +13918,11 @@ def _fpms_lark_start_prod_script_sequence(
         )
     um.assign_email_batches(segments)
     q = um.init_queue(
-        segments, chat_id=chat_id, sender_id=sender_id, skip_build=False
+        segments,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        skip_build=False,
+        dry_run=_ju_dry_run_armed_for(session_key),
     )
     with _fpms_lark_sessions_lock:
         prev = _fpms_lark_sessions.get(session_key)
@@ -14604,7 +15198,13 @@ def _fpms_lark_start_cpms_igo_sequence(
             }
         )
     um.assign_email_batches(segments)
-    q = um.init_queue(segments, chat_id=chat_id, sender_id=sender_id, skip_build=False)
+    q = um.init_queue(
+        segments,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        skip_build=False,
+        dry_run=_ju_dry_run_armed_for(session_key),
+    )
     with _fpms_lark_sessions_lock:
         prev = _fpms_lark_sessions.get(session_key)
         if isinstance(prev, dict):
@@ -15446,6 +16046,10 @@ def _fpms_lark_preserve_updatemore_queue(prev: dict | None, sess: dict) -> dict:
         em = (prev.get("email_reply_subject") or "").strip()
         if em:
             sess["email_reply_subject"] = em
+        if prev.get("ju_dry_run") and "ju_dry_run" not in sess:
+            # A ``/testing`` run that detours through a picker replaces its session row; without
+            # this the resumed half comes back as a REAL run and clicks Build.
+            sess["ju_dry_run"] = True
     return sess
 
 
@@ -15488,6 +16092,8 @@ def _fpms_lark_finish_jenkins_run_session(
                 em = (sess.get("email_reply_subject") or "").strip()
                 if em:
                     stub["email_reply_subject"] = em
+                if sess.get("ju_dry_run") or q.get("dry_run"):
+                    stub["ju_dry_run"] = True
             _fpms_lark_sessions[session_key] = stub
             keep_q = q
         elif declined and isinstance(q, dict):
@@ -15499,6 +16105,13 @@ def _fpms_lark_finish_jenkins_run_session(
                 um.release_chat_queue(str(q.get("chat_id") or ""), q)
             except Exception:
                 pass
+    # Every run must give the dry-run arm back, not just the ones that leave nothing behind. A
+    # dry run that dies early (Jenkins login timeout, the Services-recovery refusal) still leaves
+    # its queue parked, so an arm cleared only on the no-queue path below would sit for its whole
+    # 6h TTL and make the operator's next REAL update refuse to build. The one case that keeps the
+    # arm is a surviving queue that is itself dry: its remaining blocks still need it.
+    if not (isinstance(keep_q, dict) and keep_q.get("dry_run")):
+        _ju_disarm_dry_run(session_key)
     if keep_q is not None:
         # Runs at the END of a segment's Playwright thread — the longest window in which a second
         # /updatemore can have taken the chat, so this write in particular must not clobber it.
@@ -16307,8 +16920,15 @@ def _vpn_lark_auto_build_after_verify(
     next_build_number: int | None,
     ok_all: bool,
     session_key: str | None = None,
+    dry_run: bool = False,
 ) -> bool:
-    """VPN_CREATION: verification passed → click **Build** immediately (no YES/NO card)."""
+    """VPN_CREATION: verification passed → click **Build** immediately (no YES/NO card).
+
+    ``dry_run`` is defence in depth, not the main guard. ``/testing`` refuses VPN requests up
+    front, because the warm-browser VPN path calls this function without ever building a
+    ``bot_lark_gate`` — so the flag a dry run rides on cannot reach it. This forwards the flag on
+    the cold path, where it CAN arrive, so the two paths cannot disagree about what a dry run means.
+    """
     if not ok_all:
         send(
             chat_id,
@@ -16316,7 +16936,7 @@ def _vpn_lark_auto_build_after_verify(
             "Fix the job in Jenkins if needed.",
         )
         return False
-    _click_jenkins_build_button(page)
+    _click_jenkins_build_button(page, dry_run=dry_run)
     print("→ **Build** clicked (VPN, auto).", flush=True)
     send(chat_id, "Creating VPN file. Kindly wait...")
     if session_key:
@@ -17481,6 +18101,7 @@ def handle_lark_jenkins_update_message(
     lark_sender_union_id: str | None = None,
     lark_message_id: str | None = None,
     lark_thread_root_id: str | None = None,
+    _dry_run_hint: bool = False,
 ) -> bool:
     """
     Lark ``/jenkinsupdate``: match a registered Jenkins job from keywords (or ask 1–N),
@@ -17497,8 +18118,95 @@ def handle_lark_jenkins_update_message(
     """
     key = _fpms_lark_session_key(chat_id, sender_id)
     send = _fpms_lark_wrap_thread_send(chat_id, key, send)
+
+    # ``/testing`` is read and stripped FIRST, before ``low`` and before every parser and router
+    # below. Two reasons it cannot wait: the headline ranker reads the first non-empty line as the
+    # job name, and the free-form agent route rewrites the body wholesale — after either one, the
+    # token is either gone or has already done damage.
+    # ``_dry_run_hint`` carries the answer across this function's own recursive re-entries. Those
+    # re-enter with the locals below ALREADY stripped, so a second parse would conclude "not a dry
+    # run" and hand the operator a live Build gate on the very run it just promised not to build.
+    _dry_run = bool(_dry_run_hint) or jenkins_dry_run_requested(
+        original_text or clean_text or ""
+    ) or jenkins_dry_run_requested(clean_text or "")
+    if _dry_run:
+        clean_text = strip_jenkins_dry_run_token(clean_text or "")
+        original_text = strip_jenkins_dry_run_token(original_text or "")
+
     low = (clean_text or "").strip().casefold()
     body_early = (original_text or clean_text or "").replace("\r\n", "\n").strip()
+
+    if _dry_run:
+        if VPN_CREATE_CMD_RE.search(body_early) or _NL_VPN_CREATE_RE.search(body_early):
+            # VPN is the one family a dry run cannot make safe. Its warm-browser path fills and
+            # verifies the form and then clicks **Build** from ``_VpnWarmBrowser._run_job``, which
+            # never builds a ``bot_lark_gate`` at all — so the flag the whole dry run rides on
+            # structurally cannot reach that click. Refusing is honest; pretending is not.
+            send(
+                chat_id,
+                "❌ `/testing` does not cover VPN creation — that flow clicks **Build** on a "
+                "warm browser that never sees the dry-run flag, so a dry run there would build "
+                "for real. Run VPN creation normally, or dry-run a Jenkins update instead.",
+            )
+            return True
+        if not body_early:
+            send(
+                chat_id,
+                "`/testing` on its own has nothing to dry-run. Send it with the update blocks "
+                "underneath it, exactly as you would for a real update.",
+            )
+            return True
+        try:
+            import updatemore as _um_dr
+
+            _skip_build_too = bool(
+                _um_dr.updatemore_skip_build_requested(body_early)
+                or _um_dr.updatemore_skip_build_requested(
+                    _um_dr._normalize_updatemore_body(body_early)
+                )
+            )
+        except Exception:
+            _um_dr = None
+            _skip_build_too = False
+        if _skip_build_too:
+            # ``skip build`` blocks the Build click but STILL sends the real customer Reply-All —
+            # it is a mail test. Accepting both would mean promising "no email will be sent" and
+            # then handing over the instructions that send one. Silently dropping the skip-build
+            # half would be the mirror-image lie, so refuse and let the operator choose.
+            send(
+                chat_id,
+                "❌ `/testing` and `skip build` are opposites. `skip build` skips the **Build** "
+                "click but still sends the **real** customer Reply-All; `/testing` sends nothing "
+                "at all. Pick one.",
+            )
+            return True
+        if not _dry_run_hint:
+            _busy = _ju_active_run_blocking_dry_run(key)
+            if _busy:
+                # Arming while a real run is mid-flight is how a dry run ends up colouring
+                # somebody else's segment: the callbacks that drive segments 2..N are not
+                # operator messages, so they never disarm.
+                send(
+                    chat_id,
+                    f"⏸️ Not starting a dry run — {_busy} Finish or cancel it first "
+                    "(`@Duty Bot cancel updatemore`), then send `/testing` again.",
+                )
+                return True
+        _ju_arm_dry_run(key)
+        if not _dry_run_hint:
+            send(
+                chat_id,
+                "🧪 **`/testing` — dry run.** I'll fill and verify every Jenkins form and send "
+                "you the screenshots, then stop. **Build** will not be clicked and no email will "
+                "be sent; I'll tell you how many people the `Email:` line would have reached.",
+            )
+    elif _jenkins_message_starts_a_fresh_request(clean_text, body_early):
+        # A previous ``/testing`` must never colour a later REAL update, so a genuinely new
+        # request disarms. It has to be THIS narrow, though: a bare "1" answering a service or
+        # job picker, a "yes"/"no", or a card tap re-entering with an index are all part of the
+        # dry run already in progress. Disarming on those (the first version of this did) handed
+        # the operator a live Build gate on a run the bot had just promised not to build.
+        _ju_disarm_dry_run(key)
 
     # Diagnostic: session state on every jenkins-related message (helps debug "cancel then new run
     # just reacts"). Shows leftover state/queue that would swallow or block a fresh run.
@@ -17740,6 +18448,7 @@ def handle_lark_jenkins_update_message(
                 chat_id=chat_id,
                 sender_id=sender_id,
                 skip_build=skip_build,
+                dry_run=_dry_run,
             )
             _fpms_lark_sessions[key] = {"updatemore_queue": q}
         _fpms_lark_begin_update_thread(
@@ -17989,6 +18698,7 @@ def handle_lark_jenkins_update_message(
                 lark_sender_union_id=lark_sender_union_id,
                 lark_message_id=lark_message_id,
                 lark_thread_root_id=lark_thread_root_id,
+                _dry_run_hint=_dry_run,
             )
 
         if st == "pick":
@@ -18176,6 +18886,7 @@ def handle_lark_jenkins_update_message(
                     lark_sender_union_id=lark_sender_union_id,
                     lark_message_id=lark_message_id,
                     lark_thread_root_id=lark_thread_root_id,
+                    _dry_run_hint=_dry_run,
                 )
 
         # A leftover session with no recognised state is our bookkeeping problem, not the user's.
@@ -19413,6 +20124,7 @@ def run(
                         next_build_number=next_build_number,
                         ok_all=ok_all,
                         session_key=sk,
+                        dry_run=_ju_dry_run,
                     )
                 else:
                     filled_env, filled_branch = _jenkins_filled_env_branch_for_display(
@@ -19465,6 +20177,7 @@ def run(
                         job_profile=jp,
                         next_build_number=next_build_number,
                         screenshot_img_key=screenshot_img_key,
+                        dry_run=_ju_dry_run,
                     )
                     # After the whole-form YES/NO card, also send one close-up per ticked service.
                     if (
@@ -19494,6 +20207,21 @@ def run(
                                 "→ dry run: form filled and verified, **Build** deliberately not "
                                 "clicked.",
                                 flush=True,
+                            )
+                            _fpms_lark_dry_run_finish(
+                                send,
+                                cid,
+                                sk,
+                                job_profile=jp,
+                                build_url=build_url,
+                                filled_env=filled_env,
+                                filled_branch=filled_branch,
+                                version=version or "",
+                                services=list(services or []),
+                                update_all_services=update_all_services,
+                                ok_all=ok_all,
+                                next_build_number=next_build_number,
+                                run_token=str(bot_lark_gate.get("run_token") or ""),
                             )
                         else:
                             send(

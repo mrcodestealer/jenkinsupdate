@@ -4,7 +4,8 @@ Standalone **Jenkins Update** Lark bot.
 This is a self-contained bot that ONLY does the Jenkins ``/update`` / ``/jenkinsupdate``
 flow (paste an update request -> log into Jenkins -> fill the FPMS form -> screenshot ->
 **Confirm / Cancel** buttons -> trigger the build), plus ``rebuild`` / ``list`` and the
-VPN-creation card, and ``/warmstatus``.
+VPN-creation card, ``/warmstatus``, and ``/testing`` (dry run: fill, verify and screenshot
+every form, then stop -- never builds, never mails).
 
 The heavy lifting lives in the sibling modules that were mirrored from ``osedutybot``:
   - ``jenkinsupdate.py``        the engine (Playwright form-fill, warm pool, sessions, cards)
@@ -550,7 +551,7 @@ def update_thread_summary(body: str) -> str:
         if not s or s.lower().startswith("email:"):
             continue
         s = re.sub(
-            r"^/?(?:update|jenkinsupdate|updatejenkins|updatemore)\b\s*",
+            r"^/?(?:update|jenkinsupdate|updatejenkins|updatemore|testing)\b\s*",
             "",
             s,
             count=1,
@@ -1835,7 +1836,9 @@ def _handle_jenkins_message(
             send_message(
                 chat_id,
                 "🔧 I'm the **Jenkins update** bot. Paste a `/jenkinsupdate` request "
-                "(environment + Branch / Version / Services), or `rebuild` / `/warmstatus`.",
+                "(environment + Branch / Version / Services), or `rebuild` / `/warmstatus`.\n"
+                "Add `/testing` on the first line to dry-run it: I fill, verify and "
+                "screenshot every form, then stop without building or mailing.",
             )
 
 

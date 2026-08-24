@@ -73,6 +73,63 @@ On startup you should see:
 - `rebuild` / `rebuild again` — re-run the last update.
 - `/warmstatus` — warm browser pool status: how many browsers are live, which are hot vs
   on-demand, and the idle-release window. See [Warm browser pool](#warm-browser-pool).
+- `/testing` — **dry run**. Put it on the first line, above the update blocks, and the bot does
+  everything a real run does *up to* the build: logs in, fills the form, verifies every value and
+  sends you the screenshots — then stops. See [Dry runs](#dry-runs).
+
+<a id="dry-runs"></a>
+### Dry runs (`/testing`)
+
+  ```
+  /testing
+  UPDATE FPMS UAT MASTER
+  Branch: master
+  Service: 3000,9000
+  Version: v3.2.261
+
+  UPDATE FPMS NT UAT MASTER
+  Branch: master
+  Service: admin-rollout
+  Version: v4.2.65
+  Email: FPMS v3.2.261 | NT v4.2.65 UPDATE PRODUCTION - CP (2026-08-21)
+  ```
+
+Every block is filled, verified and photographed in turn, and each gets a `🧪 TESTING` card with
+its link, environment, branch, version, services, the verification verdict, and a **simulated**
+done time. Multi-block runs advance on their own — there is no build to wait for.
+
+What it will **not** do:
+
+- **Never clicks Build.** Not "is asked not to" — the click itself refuses when the run is dry, so
+  every path into Jenkins is closed, including the recovery that re-clicks Build to reload a stale
+  Services list. The YES/NO buttons are left off the card entirely, because the gate they answer
+  is already closed by then.
+- **Never sends the email.** Instead the last card reports how many **To** and **Cc** addresses the
+  `Email:` reply *would* have reached, plus the de-duplicated envelope count, resolved from the
+  local `allemail.json` — no IMAP, no SMTP, no credentials needed. Refusal counts are not shown:
+  they cannot be known without actually sending.
+- **Never tells jenkinsbot a build happened**, arms a watchdog, or leaves email-batch state on the
+  queue that a later real run could consume.
+
+Notes:
+
+- Screenshots are forced on for a dry run even if `JENKINSUPDATE_FORM_SCREENSHOT=0`; they are the
+  only output it has. Real runs still honour that switch.
+- A predicted build number is shown as *"would be #N"* — it is a `max+1` guess and no build will
+  ever claim it.
+- If a block fails verification, the card says a real run would have **refused** to build it, and
+  the closing line names the blocks that failed. Later blocks still dry-run.
+- Two combinations are **refused** rather than half-honoured:
+  - **VPN creation.** That flow clicks Build from a warm browser that never sees the dry-run flag,
+    so a dry run there could not be made safe.
+  - **`/testing` together with `skip build`.** They are opposites: `skip build` skips the Build
+    click but still sends the real customer Reply-All.
+- `/testing` will not start while a real update is still running in the same chat. The callbacks
+  that drive a real multi-block run forward are not operator messages, so an overlapping dry run
+  could colour a segment that belongs to the real run. Finish or cancel it first.
+- A dry run occupies the same warm browser as a real update for the same job, so it will delay a
+  genuine update running against that job.
+
 <a id="warm-browser-pool"></a>
 ### Warm browser pool
 

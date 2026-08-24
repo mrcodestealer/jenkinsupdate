@@ -715,7 +715,23 @@ def init_queue(
     chat_id: str,
     sender_id: str,
     skip_build: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
+    """``dry_run`` marks a ``/testing`` queue: every segment fills and photographs its Jenkins
+    form and then stops, so no segment ever builds and no email is ever sent.
+
+    It deliberately does NOT share a branch with ``skip_build``. ``skip build`` is a mail test —
+    it blocks the Build click but still sends a REAL customer Reply-All, which is why it arms the
+    email batch watches below. A dry run must arm nothing: an armed watch outlives the dry run on
+    the queue and would later be consumed by a genuine batch, mis-counting it.
+
+    A dry queue also gets an EMPTY ``email_batches``. :func:`queue_owns_email` claims a callback on
+    an unfinished ``email_batches`` entry just as readily as on a watch, so a populated tracker
+    makes a dry queue advertise ownership of its ``Email:`` subject — and a real in-flight run's
+    ``/SuccessInformMeTime`` for that same subject would then be absorbed into a batch that can
+    never complete, so the customer reply would never be sent. A dry run records no completions,
+    so it has no use for the tracker.
+    """
     q: dict[str, Any] = {
         "segments": segments,
         "index": 0,
@@ -723,12 +739,13 @@ def init_queue(
         "chat_id": chat_id,
         "sender_id": sender_id,
         "stopped": False,
-        "email_batches": build_email_batch_state(segments),
+        "email_batches": {} if dry_run else build_email_batch_state(segments),
         "email_watches": [],
         "skip_build": bool(skip_build),
+        "dry_run": bool(dry_run),
         "created_at": time.time(),
     }
-    if skip_build:
+    if skip_build and not dry_run:
         register_email_batch_watches(q, segments)
     sync_chat_updatemore_queue(chat_id, q)
     return q

@@ -9819,6 +9819,89 @@ def debug_jenkins_reply_send_test(title: str, *, to: str = "") -> int:
     return 0 if quoted else 2
 
 
+def jenkins_reply_recipient_preview(title: str) -> dict[str, Any]:
+    """How many people the done-reply for ``title`` WOULD reach. Resolves; never sends.
+
+    Written for the bot's ``/testing`` dry run, which has to answer "who would get this mail?"
+    without a single packet leaving the box. Three properties make that safe by construction
+    rather than by care:
+
+    * it cannot send — there is no SMTP call in here, and it never enters
+      :func:`reply_jenkins_update_done_email` or :func:`_send_jenkins_reply_all`, which are the
+      only two functions that can;
+    * it cannot reach the network at all — :func:`resolve_reply_target` reads the on-disk
+      ``allemail.json`` view, and unlike :func:`_allemail_reply_lookup`'s callers it does not
+      gate on :func:`_allemail_enabled`, so it needs no ``MAINTENANCE_MAIL_PASSWORD``;
+    * it cannot start an IMAP top-up — :func:`resolve_reply_target_with_topup` would, so this
+      deliberately calls the plain resolver.
+
+    The counts come from :func:`_allemail_thread_reply_all_pairs` with the single-entry formula as
+    fallback — the SAME pair, in the same order, that a real send uses. Counting any other way
+    under-reports: that exact shortcut is why the "the reply reached fewer people than Reply All"
+    bug needed an investigation (see :func:`debug_jenkins_reply_preview`).
+
+    Returns a dict with ``ok``; when ok: ``to``/``cc``/``envelope`` counts, ``to_addrs``,
+    ``cc_addrs``, ``subject``, ``target_subject``, ``target_age_days``, ``stale``, ``formula``.
+    When not ok: ``reason`` — a sentence fit to show a human.
+
+    ``refused`` counts are absent on purpose: an address is only known to be refused once an SMTP
+    server has rejected it, so no dry run can honestly predict them.
+    """
+    t = (title or "").strip()
+    if not t:
+        return {"ok": False, "reason": "no email subject was given"}
+    try:
+        res = resolve_reply_target(t)
+    except Exception as ex:
+        return {"ok": False, "reason": f"could not read the email cache ({ex})"}
+    if res.kind not in ("ok", "ok_stale"):
+        return {"ok": False, "reason": explain_resolution(res, t), "kind": res.kind}
+
+    cached = res.target or {}
+    prov: dict[str, Any] = {}
+    pairs = _allemail_thread_reply_all_pairs(cached, provenance=prov)
+    formula = "thread (anchor placement + widened Cc)"
+    if pairs is None:
+        # Same fallback, same guard, as the live send path — copied rather than reinvented.
+        try:
+            pairs = _jenkins_reply_all_pairs(
+                _allemail_entry_stub(cached), exclude=_sending_mailbox_identities()
+            )
+            formula = "single-entry fallback (thread formula returned nothing)"
+        except ValueError:
+            pairs = None
+    if pairs is None:
+        return {
+            "ok": False,
+            "reason": (
+                "the matched thread has no usable Reply-All recipients — every address on it is "
+                "one of ours, so a real run would send to nobody"
+            ),
+        }
+    to_pairs, cc_pairs, envelope = pairs
+    to_addrs = [format_address_pair(n, a) for n, a in to_pairs]
+    cc_addrs = [format_address_pair(n, a) for n, a in cc_pairs]
+    try:
+        age_days = max(0.0, (time.time() - float(cached.get("date_ts") or 0.0)) / 86400.0)
+    except Exception:
+        age_days = 0.0
+    return {
+        "ok": True,
+        "subject": t,
+        "to": len(to_addrs),
+        "cc": len(cc_addrs),
+        # The envelope is its own de-duplicated list, so it is NOT len(to)+len(cc).
+        "envelope": len(envelope or []),
+        "to_addrs": to_addrs,
+        "cc_addrs": cc_addrs,
+        "target_subject": (cached.get("subject") or "").strip(),
+        "target_age_days": round(age_days, 1),
+        "stale": res.kind == "ok_stale",
+        "thread_members": int(prov.get("member_count") or 1),
+        "formula": formula,
+    }
+
+
 def debug_jenkins_reply_preview(title: str, *, out_path: str = "") -> int:
     """Dry-run the Jenkins done-reply: resolve, build, and dump it — **without sending**.
 
