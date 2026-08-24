@@ -6779,8 +6779,20 @@ def _tick_update_all_services_checkbox(page) -> bool:
     return False
 
 
-def _click_jenkins_build_button(page) -> None:
-    """Primary **Build** on the parameterized job form (Jenkins 2.x)."""
+def _click_jenkins_build_button(page, *, dry_run: bool = False) -> None:
+    """Primary **Build** on the parameterized job form (Jenkins 2.x).
+
+    ``dry_run`` refuses outright. This is the single choke point for triggering a build — all eight
+    call sites are in this module and nothing here POSTs to Jenkins directly — so a refusal here is
+    what makes ``/testing``'s "never builds" contract total rather than best-effort. It is an
+    explicit argument rather than ambient state on purpose: a thread-local or contextvar would
+    outlive the run on a reused warm-pool worker and could silently stop a REAL update from
+    building.
+    """
+    if dry_run:
+        raise JenkinsDryRunBuildBlocked(
+            "refusing to click Build: this run is a dry run (/testing)."
+        )
     print("→ Clicking Jenkins **Build**…")
     sticky = page.locator("#bottom-sticker")
     if sticky.count() > 0:
@@ -6951,8 +6963,17 @@ def _wait_for_refresh_build_to_finish(build_url: str, *, since_number: int) -> b
     return False
 
 
+class JenkinsDryRunBuildBlocked(RuntimeError):
+    """Raised instead of clicking **Build** while a dry run (``/testing``) is in progress.
+
+    ``_click_jenkins_build_button`` is the ONLY way this module triggers a Jenkins build — its eight
+    call sites are all in this file, and the only ``requests.post`` calls go to jenkinsbot's internal
+    API, never to Jenkins. So refusing here is a complete guarantee, not a partial one.
+    """
+
+
 def _recover_services_not_found_sequence(
-    page, username: str, password: str, *, build_url: str | None = None
+    page, username: str, password: str, *, build_url: str | None = None, dry_run: bool = False
 ) -> None:
     """
     Services missing (same browser tab):
@@ -6962,7 +6983,19 @@ def _recover_services_not_found_sequence(
     3. Wait ``FPMS_POST_BUILD_RECOVER_WAIT_MS`` (default 10 s).
     4. Open build URL again → login → settle ``FPMS_MS_POST_LOGIN_BEFORE_FORM`` — caller then
        retries Environment, Services, Branch, Version.
+
+    ``dry_run`` refuses the whole sequence. Step 2 clicks a REAL Build to make Jenkins republish its
+    parameter definitions, and this runs roughly 2,400 lines above the YES/NO gate — so a flag
+    checked at the gate would not stop it. A ``/testing`` run whose Services list fails to load must
+    abort the segment instead, or the one command whose entire contract is "never builds" would
+    build on exactly the flaky runs it exists to diagnose.
     """
+    if dry_run:
+        raise JenkinsDryRunBuildBlocked(
+            "Services did not load and the recovery for it clicks a real Build — refusing during "
+            "a dry run. Re-run this segment as a normal update, or retry once Jenkins has "
+            "republished its parameter list."
+        )
     w_ms = max(0, _MS_POST_BUILD_RECOVER_WAIT_MS)
     w_sec = w_ms / 1000.0
     print(
@@ -18724,6 +18757,11 @@ def run(
     if not jp_g and bot_lark_gate:
         jp_g = str(bot_lark_gate.get("job_profile") or "").strip()
     jp = jp_g or "fpms"
+    # /testing: fill the form, verify it, screenshot it — then stop. Read once here and passed
+    # explicitly to the only two places that can reach a Build click from this path (the Services
+    # recovery, ~2.4k lines below, and the post-gate click). A plain local, not ambient state, so it
+    # cannot survive into the next run on a reused warm-pool worker.
+    _ju_dry_run = bool((bot_lark_gate or {}).get("dry_run"))
     skip_env = jp in ("fnt_rc", "sms_uat")
     is_prod_script = jp == "fpms_prod_script"
     is_bi_api_update = jp == "bi_api_update"
@@ -19154,7 +19192,9 @@ def run(
                         "in-tab recovery: goto build URL → re-login → Refresh pipeline → Build → "
                         f"wait {_MS_POST_BUILD_RECOVER_WAIT_MS/1000:g}s → goto build URL → re-login → refill…"
                     )
-                    _recover_services_not_found_sequence(page, user, pw, build_url=ju)
+                    _recover_services_not_found_sequence(
+                        page, user, pw, build_url=ju, dry_run=_ju_dry_run
+                    )
                     try:
                         if skip_env:
                             _apply_services_or_update_all_phase()
@@ -19357,7 +19397,10 @@ def run(
                 sk = str(bot_lark_gate["session_key"])
                 cid = str(bot_lark_gate["chat_id"])
                 send = bot_lark_gate["send"]
-                to = float(bot_lark_gate.get("timeout_sec", 7200))
+                # A dry run never waits on a human: nobody is going to tap YES, and the point is
+                # to stop right after the screenshots. wait(0) falls into the "Build skipped"
+                # branch below, which is the only exit that does not click.
+                to = 0.0 if _ju_dry_run else float(bot_lark_gate.get("timeout_sec", 7200))
                 build_url = str(bot_lark_gate.get("build_url") or BUILD_URL)
                 next_build_number = _predict_next_build_number_from_history(page)
                 if is_vpn:
@@ -19446,14 +19489,24 @@ def run(
                     if not isinstance(ev, threading.Event):
                         raise RuntimeError("Lost Lark build gate event (session_key).")
                     if not ev.wait(timeout=to):
-                        send(cid, "Timed out waiting for **yes** / **no**. **Build** skipped.")
+                        if _ju_dry_run:
+                            print(
+                                "→ dry run: form filled and verified, **Build** deliberately not "
+                                "clicked.",
+                                flush=True,
+                            )
+                        else:
+                            send(
+                                cid,
+                                "Timed out waiting for **yes** / **no**. **Build** skipped.",
+                            )
                         build_clicked = False
                     else:
                         with _fpms_lark_sessions_lock:
                             approved = _fpms_lark_sessions.get(sk, {}).get("approve_build")
                         if approved is True:
                             if ok_all:
-                                _click_jenkins_build_button(page)
+                                _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                                 build_clicked = True
                                 print("→ **Build** clicked (Lark-approved).")
                                 # Persist to jenkinsupdate.json ONLY now that Build was actually clicked.
@@ -19526,14 +19579,14 @@ def run(
                 )
             elif is_bi_api_update:
                 if prompt_yes_to_click_build_bi_api_update(page, repository, environment, branch):
-                    _click_jenkins_build_button(page)
+                    _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                     build_clicked = True
                     print("→ **Build** clicked (parameters submitted to Jenkins).")
                 else:
                     print("→ **Build** skipped (you answered **no**).")
             elif is_qrqm_update:
                 if prompt_yes_to_click_build_qrqm_update(page, environment, branch):
-                    _click_jenkins_build_button(page)
+                    _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                     build_clicked = True
                     print("→ **Build** clicked (parameters submitted to Jenkins).")
                 else:
@@ -19547,14 +19600,14 @@ def run(
                 )
                 ans = prompt_text("Click Build now? (yes/no)").strip().casefold()
                 if ans in ("y", "yes", "ok", "go"):
-                    _click_jenkins_build_button(page)
+                    _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                     build_clicked = True
                     print("→ **Build** clicked (parameters submitted to Jenkins).")
                 else:
                     print("→ **Build** skipped (you answered **no**).")
             elif is_prod_script:
                 if prompt_yes_to_click_build_prod_script(page, environment, command):
-                    _click_jenkins_build_button(page)
+                    _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                     build_clicked = True
                     print("→ **Build** clicked (parameters submitted to Jenkins).")
                 else:
@@ -19567,7 +19620,7 @@ def run(
                 version,
                 update_all_services=update_all_services,
             ):
-                _click_jenkins_build_button(page)
+                _click_jenkins_build_button(page, dry_run=_ju_dry_run)
                 build_clicked = True
                 print("→ **Build** clicked (parameters submitted to Jenkins).")
             else:
