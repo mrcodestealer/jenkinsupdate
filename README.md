@@ -126,6 +126,13 @@ Notes:
   If it happens often, set `FPMS_STABLE_FILL=1` -- fast-fill mode clamps the
   `FPMS_SERVICES_APPEAR_MS` wait to 10s, and raising that variable on its own does nothing while
   the clamp is active.
+- Because of that clamp, a dry run waits `FPMS_DRY_RUN_SERVICES_APPEAR_MS` (default **90s**) for
+  the Services list instead of the live 10s. UnoChoice has been measured taking 24-31s to mount on
+  FPMS_NT, and a dry run has no build queued behind it, so patience is free. The override can only
+  lengthen the wait, never shorten it.
+- If the list still never appears, `/testing` says so and names the fix: run **that one segment as
+  a normal update once**. Only a real build republishes a job's parameter list, and a dry run
+  cannot do it by definition.
 - Two combinations are **refused** rather than half-honoured:
   - **VPN creation.** That flow clicks Build from a warm browser that never sees the dry-run flag,
     so a dry run there could not be made safe.

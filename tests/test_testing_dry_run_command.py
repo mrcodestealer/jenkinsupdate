@@ -880,6 +880,70 @@ def test_the_dry_run_never_waits_on_another_segment():
         )
 
 
+def test_a_dry_run_waits_longer_for_the_services_list_than_a_real_run():
+    """The failure that made /testing look broken on FPMS_NT.
+
+    ``_ensure_fast_fill_mode`` runs at import unless FPMS_STABLE_FILL=1 and clamps the
+    Services-appear wait from its 32s default to 10s. UnoChoice has been measured taking 24-31s
+    to mount on FPMS_NT, so a dry run gave up before the list could possibly appear — and unlike
+    a real run it cannot fall back to the Refresh-pipeline Build. Nothing is queued behind a dry
+    run, so patience is free and giving up early costs the whole command.
+    """
+    check(
+        ju._MS_DRY_RUN_SERVICES_APPEAR > ju._MS_SERVICES_APPEAR,
+        f"the dry-run window ({ju._MS_DRY_RUN_SERVICES_APPEAR}ms) must exceed the live one "
+        f"({ju._MS_SERVICES_APPEAR}ms), or /testing fails where a real run would recover",
+    )
+    check(
+        ju._MS_DRY_RUN_SERVICES_APPEAR >= 32_000,
+        "it must clear the 24-31s UnoChoice mount time measured on FPMS_NT",
+    )
+    import inspect
+
+    sig = inspect.signature(ju.select_environment)
+    check("appear_ms" in sig.parameters, "select_environment must accept the override")
+    check(
+        sig.parameters["appear_ms"].default is None,
+        "and default to None so every existing caller is unaffected",
+    )
+    wait_src = inspect.getsource(ju._wait_services_after_environment)
+    check(
+        "max(int(appear_ms or 0), _MS_SERVICES_APPEAR)" in wait_src,
+        "the override must only ever LENGTHEN the wait — a caller must not be able to make the "
+        "live path give up faster than its configured window",
+    )
+
+
+def test_only_a_dry_run_gets_the_longer_window():
+    src = _ju_source()
+    check(
+        "_appear_dry = _MS_DRY_RUN_SERVICES_APPEAR if _ju_dry_run else None" in src,
+        "run() must pass the longer window only when the run is dry",
+    )
+    check(
+        src.count("appear_ms=_appear_dry") == 2,
+        "both the first attempt and the post-recovery retry need it — the retry is the one that "
+        "actually has to outlast a slow UnoChoice mount",
+    )
+
+
+def test_the_dry_run_services_failure_does_not_claim_a_build_ran():
+    src = _ju_source()
+    i = src.find("Services did not load, and a dry run cannot run the")
+    check(i > 0, "there must be a dry-run-specific message for this failure")
+    guard = src.rfind("if _ju_dry_run:", 0, i)
+    check(
+        guard > 0 and (i - guard) < 800,
+        "it must be selected by the dry-run flag, not shown to real runs",
+    )
+    window = src[i : i + 700]
+    check(
+        "run this one segment as a NORMAL" in window,
+        "it must name the one thing that fixes it — a single real build republishes the "
+        "parameter list — instead of leaving the operator to guess",
+    )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in tests:

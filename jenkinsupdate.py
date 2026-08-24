@@ -857,6 +857,14 @@ _MS_BEFORE_FIRST_SERVICE = int(os.environ.get("FPMS_MS_BEFORE_FIRST_SERVICE", "7
 _MS_AFTER_FIRST_SERVICE = int(os.environ.get("FPMS_MS_AFTER_FIRST_SERVICE", "1650"))
 # After Environment: wait this long for the first Services checkbox; if still 0 → new browser session.
 _MS_SERVICES_APPEAR = int(os.environ.get("FPMS_SERVICES_APPEAR_MS", "32000"))
+# A dry run (``/testing``) waits far longer for the Services list. Nothing is queued behind it: it
+# never builds, so being slow costs only the operator's patience, while giving up early costs the
+# whole point of the command. This matters because ``_ensure_fast_fill_mode`` (applied at import
+# unless FPMS_STABLE_FILL=1) clamps the value above to 10s, which is under the 24-31s that
+# UnoChoice has been measured taking to mount on FPMS_NT.
+_MS_DRY_RUN_SERVICES_APPEAR = int(
+    os.environ.get("FPMS_DRY_RUN_SERVICES_APPEAR_MS", "90000")
+)
 # If Services stay empty, re-apply Environment: briefly select another branch then restore (CascadeChoice).
 _ENV_SERVICES_NUDGE_TRIES = int(os.environ.get("FPMS_ENV_SERVICES_NUDGE_TRIES", "3"))
 _MS_ENV_NUDGE_DWELL = int(os.environ.get("FPMS_MS_ENV_NUDGE_DWELL", "800"))
@@ -5587,7 +5595,7 @@ def _wait_services_checkbox_reattached_after_env(page, timeout_ms: int) -> None:
     ).first.wait_for(state="attached", timeout=timeout_ms)
 
 
-def _wait_services_after_environment(page) -> None:
+def _wait_services_after_environment(page, *, appear_ms: int | None = None) -> None:
     """
     After Environment is applied:
 
@@ -5599,7 +5607,10 @@ def _wait_services_after_environment(page) -> None:
     has time to mount; lower that env var for faster failure when Services will never appear.
     """
     t0 = time.time()
-    appear_deadline = t0 + _MS_SERVICES_APPEAR / 1000.0
+    # Never shorter than the configured wait — an override is only ever permission to be MORE
+    # patient, so a caller cannot accidentally make the live path fail faster.
+    _appear = max(int(appear_ms or 0), _MS_SERVICES_APPEAR)
+    appear_deadline = t0 + _appear / 1000.0
     last_log = t0
     while time.time() < appear_deadline:
         if _services_checkbox_count(page) > 0:
@@ -5610,20 +5621,21 @@ def _wait_services_after_environment(page) -> None:
             rem = max(0, int(appear_deadline - now))
             print(
                 f"→ Waiting for first Services checkbox… ~{rem}s left "
-                f"(FPMS_SERVICES_APPEAR_MS={_MS_SERVICES_APPEAR})",
+                f"(waiting up to {_appear}ms)",
                 flush=True,
             )
             last_log = now
         _safe_page_wait(page, 150)
     if _services_checkbox_count(page) == 0:
         raise ServicesListGoneError(
-            f"No Services checkboxes after Environment within {_MS_SERVICES_APPEAR}ms "
-            f"(FPMS_SERVICES_APPEAR_MS) — new browser session will retry with the same answers."
+            f"No Services checkboxes after Environment within {_appear}ms "
+            f"(FPMS_SERVICES_APPEAR_MS={_MS_SERVICES_APPEAR}) — new browser session will retry "
+            "with the same answers."
         )
     _wait_services_list_stable(page, timeout_ms=_MS_SERVICES_STABLE)
 
 
-def select_environment(page, env_value: str) -> None:
+def select_environment(page, env_value: str, *, appear_ms: int | None = None) -> None:
     row = _form_row(page, "Environment")
     row.wait_for(state="visible", timeout=30_000)
     srv_row = _form_row(page, "Services")
@@ -5698,7 +5710,7 @@ def select_environment(page, env_value: str) -> None:
         _wait_unochoice_services_ready(srv_row, page)
 
         try:
-            _wait_services_after_environment(page)
+            _wait_services_after_environment(page, appear_ms=appear_ms)
         except ServicesListGoneError:
             if nudge >= _ENV_SERVICES_NUDGE_TRIES:
                 raise
@@ -19917,9 +19929,13 @@ def run(
                             flush=True,
                         )
             else:
+                # A dry run may wait much longer for UnoChoice to mount the Services list: it has
+                # no build queued behind it, and giving up early is what turned /testing into a
+                # dead end on the slower jobs.
+                _appear_dry = _MS_DRY_RUN_SERVICES_APPEAR if _ju_dry_run else None
                 try:
                     if not skip_env:
-                        select_environment(page, environment)
+                        select_environment(page, environment, appear_ms=_appear_dry)
                     environment_tick_done = True
                     _apply_services_or_update_all_phase()
                     services_tick_done = True
@@ -19953,7 +19969,9 @@ def run(
                             services_tick_done = True
                         else:
                             if not skip_env:
-                                select_environment(page, environment)
+                                select_environment(
+                                    page, environment, appear_ms=_appear_dry
+                                )
                                 environment_tick_done = True
                             _apply_services_or_update_all_phase()
                             services_tick_done = True
@@ -19963,10 +19981,25 @@ def run(
                         PlaywrightTimeout,
                         PlaywrightError,
                     ) as e2:
-                        msg = (
-                            "Services 找不到：recovery（Refresh pipeline + Build + 再登录）后重新填表仍失败。\n"
-                            "Services still not found after recovery and refill."
-                        )
+                        if _ju_dry_run:
+                            # Do NOT claim the Refresh-pipeline Build ran — a dry run skips it by
+                            # design. Naming the skipped half, and the one thing that fixes it,
+                            # is the difference between "the recovery is broken" and "this job
+                            # needs one real build to republish its parameter list".
+                            msg = (
+                                "Services did not load, and a dry run cannot run the "
+                                "**Refresh pipeline → Build** step that republishes them "
+                                f"(waited up to {_MS_DRY_RUN_SERVICES_APPEAR}ms, reloaded, "
+                                "re-logged in and retried).\n"
+                                "If this job keeps doing it, run this one segment as a NORMAL "
+                                "update once — that build republishes the parameter list — and "
+                                "`/testing` will work again afterwards."
+                            )
+                        else:
+                            msg = (
+                                "Services 找不到：recovery（Refresh pipeline + Build + 再登录）后重新填表仍失败。\n"
+                                "Services still not found after recovery and refill."
+                            )
                         print(f"❌ {msg}", file=sys.stderr)
                         raise RuntimeError(msg) from e2
 
