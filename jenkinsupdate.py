@@ -5398,6 +5398,32 @@ def _services_apply_batch_js(page, names: list[str]) -> list[str]:
     return list(still)
 
 
+def _services_checkbox_names(page, limit: int = 60) -> list[str]:
+    """The service names Jenkins is actually offering, read off the page. Read-only, never raises.
+
+    Diagnostic only, and it exists because two very different failures used to look identical in
+    chat: "the Services list never rendered" (needs a real Refresh-pipeline build) and "the list
+    rendered fine but the name you asked for is not on it" (a typo, or a service that lives on a
+    different job). Checkboxes are matched by ``value``/``json``, so those are the names to report.
+    """
+    try:
+        got = page.evaluate(
+            "() => {"
+            + _SERVICES_UNOCHOICE_JS_FN
+            + r"""
+            const root = __fpmsServicesCheckboxRoot();
+            if (!root) return [];
+            return Array.from(root.querySelectorAll('input[type="checkbox"]'))
+                .map(cb => (cb.getAttribute('value') || cb.getAttribute('json') || '').trim())
+                .filter(Boolean);
+        }"""
+        )
+        out = [str(x) for x in (got or []) if str(x).strip()]
+        return out[: max(1, int(limit))]
+    except Exception:
+        return []
+
+
 def _services_checkbox_count(page) -> int:
     """Count checkboxes in the Services parameter row (survives DOM swap if re-queried in JS)."""
     return page.evaluate(
@@ -19981,24 +20007,48 @@ def run(
                         PlaywrightTimeout,
                         PlaywrightError,
                     ) as e2:
-                        if _ju_dry_run:
+                        # Read what Jenkins is actually offering BEFORE composing the message.
+                        # These two failures are caught by the same `except` and used to read
+                        # identically in chat, which sent debugging the wrong way: an empty list
+                        # needs a real Refresh-pipeline build, whereas a populated list means the
+                        # requested name simply is not on this job.
+                        _avail = _services_checkbox_names(page)
+                        _asked = [str(x).strip() for x in (services or []) if str(x).strip()]
+                        if _ju_dry_run and _avail:
+                            _missing = [
+                                a for a in _asked
+                                if a.casefold() not in {v.casefold() for v in _avail}
+                            ]
+                            msg = (
+                                f"Jenkins **did** load its Services list ({len(_avail)} "
+                                "service(s)), so this is not a dry-run limitation — the "
+                                "name(s) asked for are not on THIS job.\n"
+                                f"Requested: `{', '.join(_asked) or '—'}`\n"
+                                f"Not on this job: `{', '.join(_missing) or '—'}`\n"
+                                f"Available here: `{', '.join(_avail)}`\n"
+                                "Fix the Service line (or send that block to the job that hosts "
+                                "it) and run `/testing` again."
+                            )
+                        elif _ju_dry_run:
                             # Do NOT claim the Refresh-pipeline Build ran — a dry run skips it by
                             # design. Naming the skipped half, and the one thing that fixes it,
                             # is the difference between "the recovery is broken" and "this job
                             # needs one real build to republish its parameter list".
                             msg = (
-                                "Services did not load, and a dry run cannot run the "
-                                "**Refresh pipeline → Build** step that republishes them "
+                                "Services never rendered (0 checkboxes), and a dry run cannot run "
+                                "the **Refresh pipeline → Build** step that republishes them "
                                 f"(waited up to {_MS_DRY_RUN_SERVICES_APPEAR}ms, reloaded, "
                                 "re-logged in and retried).\n"
-                                "If this job keeps doing it, run this one segment as a NORMAL "
-                                "update once — that build republishes the parameter list — and "
-                                "`/testing` will work again afterwards."
+                                "Run this one segment as a NORMAL update once — that build "
+                                "republishes the parameter list — and `/testing` will work "
+                                "afterwards.\n"
+                                f"Underlying error: {e2}"
                             )
                         else:
                             msg = (
                                 "Services 找不到：recovery（Refresh pipeline + Build + 再登录）后重新填表仍失败。\n"
-                                "Services still not found after recovery and refill."
+                                "Services still not found after recovery and refill.\n"
+                                f"Underlying error: {e2}"
                             )
                         print(f"❌ {msg}", file=sys.stderr)
                         raise RuntimeError(msg) from e2

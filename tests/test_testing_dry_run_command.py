@@ -929,18 +929,54 @@ def test_only_a_dry_run_gets_the_longer_window():
 
 def test_the_dry_run_services_failure_does_not_claim_a_build_ran():
     src = _ju_source()
-    i = src.find("Services did not load, and a dry run cannot run the")
-    check(i > 0, "there must be a dry-run-specific message for this failure")
-    guard = src.rfind("if _ju_dry_run:", 0, i)
+    i = src.find("Services never rendered (0 checkboxes)")
+    check(i > 0, "there must be a dry-run-specific message for the empty-list failure")
+    guard = src.rfind("_ju_dry_run", 0, i)
     check(
-        guard > 0 and (i - guard) < 800,
+        guard > 0 and (i - guard) < 900,
         "it must be selected by the dry-run flag, not shown to real runs",
     )
     window = src[i : i + 700]
     check(
-        "run this one segment as a NORMAL" in window,
+        "run this one segment as a NORMAL" in window.replace("Run this", "run this"),
         "it must name the one thing that fixes it — a single real build republishes the "
         "parameter list — instead of leaving the operator to guess",
+    )
+    check(
+        "Underlying error:" in window,
+        "and it must carry the real exception: the message used to swallow it entirely, so the "
+        "only way to tell these failures apart was to read the journal on the box",
+    )
+
+
+def test_an_empty_services_list_is_reported_differently_from_a_missing_service():
+    """Two failures share one `except`, and they need opposite actions from the operator.
+
+    ServicesListGoneError = the list never rendered -> only a real build republishes it.
+    ServiceNotDetectedError = the list rendered but this name is not on it -> fix the name.
+    Reporting both as "Services did not load" sent debugging at the wrong one.
+    """
+    src = _ju_source()
+    check(
+        "def _services_checkbox_names(" in src,
+        "there must be a probe for what Jenkins is actually offering",
+    )
+    probe = _function_code(src, "_services_checkbox_names")
+    check("except Exception:" in probe, "the probe is diagnostic — it must never raise")
+    check("return []" in probe, "and must degrade to an empty list")
+    i = src.find("Jenkins **did** load its Services list")
+    check(i > 0, "there must be a distinct message for a populated list")
+    window = src[i : i + 800]
+    check(
+        "not a dry-run limitation" in window,
+        "it must say plainly that this is NOT /testing's fault, or the operator retries forever",
+    )
+    for expected in ("Requested:", "Not on this job:", "Available here:"):
+        check(expected in window, f"it must report {expected!r} to make the fix obvious")
+    # The empty-list branch must be the fallback, so a populated list is never described as absent.
+    check(
+        src.find("_avail = _services_checkbox_names(page)") < i,
+        "the availability probe must run before the message is composed",
     )
 
 
