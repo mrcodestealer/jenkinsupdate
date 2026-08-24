@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import threading
 import traceback
 
 for _s in (sys.stdout, sys.stderr):
@@ -804,6 +805,79 @@ def test_the_card_does_not_claim_a_build_would_have_been_queued_when_verificatio
         "Verification failed" in blob or "verification failed" in blob.lower(),
         "the closing line must not sign the run off as clean",
     )
+
+
+def test_block_one_does_not_block_block_two_with_its_own_build_gate():
+    """A multi-block /testing must walk straight through. It used to stop dead after block 1.
+
+    The advance happens from inside ``run()``, so the spawn's ``finally`` — which normally retires
+    the session — has not run yet, and the row still reads ``state="jenkins_wait_build"`` from the
+    block that just finished. The dispatch flows refuse on exactly that state ("A Jenkins Build
+    confirmation is already waiting for you in this chat"), so block 1's own gate turned a 3-block
+    dry run into a 1-block one. Nothing waits on a dry run, so the gate must be retired before the
+    hand-off.
+    """
+    sk = "oc_adv2:ou_adv2"
+    subj = "FPMS v3.2.261 UPDATE PRODUCTION - CP (2026-08-21)"
+    segs = [
+        {"env_line": "update FPMS UAT MASTER",
+         "lines": ["Branch: master", "Version: v3.2.261", "Services:", "admin-rollout"],
+         "email_subject": subj},
+        {"env_line": "update FPMS NT UAT MASTER",
+         "lines": ["Branch: master", "Version: v4.2.65", "Services:", "admin-rollout"],
+         "email_subject": subj},
+    ]
+    um.assign_email_batches(segs)
+    q = um.init_queue(segs, chat_id="oc_adv2", sender_id="ou_adv2", dry_run=True)
+    dispatched: list[str] = []
+    msgs: list[str] = []
+    orig_dispatch = ju._dispatch_lark_update_command_body
+    try:
+        ju._dispatch_lark_update_command_body = (
+            lambda c, k, b, s, **kw: dispatched.append((b or "").splitlines()[0]) or True
+        )
+        ju._fpms_lark_sessions[sk] = {
+            "state": "jenkins_wait_build",
+            "build_gate_event": threading.Event(),
+            "approve_build": None,
+            "updatemore_queue": q,
+            "ju_dry_run": True,
+            "_run_token": "BLOCK1",
+        }
+        ju._fpms_lark_dry_run_finish(
+            lambda cid, t, msg_type=None, **k: (msgs.append(str(t)), {"code": 0})[1],
+            "oc_adv2", sk, job_profile="fpms",
+            build_url="https://jenkins.invalid/job/FPMS/build",
+            filled_env="fpms-uat-master", filled_branch="master", version="v3.2.261",
+            services=["admin-rollout"], ok_all=True, next_build_number=411,
+            run_token="BLOCK1",
+        )
+        row = ju._fpms_lark_sessions.get(sk) or {}
+    finally:
+        ju._dispatch_lark_update_command_body = orig_dispatch
+        ju._fpms_lark_sessions.pop(sk, None)
+    check(len(dispatched) == 1, f"block 2 must be dispatched, got {dispatched!r}")
+    check(
+        row.get("state") != "jenkins_wait_build",
+        "the finished block's gate must be retired before the hand-off, or the next block's "
+        "dispatch refuses with 'a Build confirmation is already waiting'",
+    )
+    check(row.get("ju_dry_run") is True, "the replacement row must still say this run is dry")
+    check(
+        row.get("updatemore_queue") is q,
+        "and must still carry the same queue object, or the next block loses its place",
+    )
+    check(int(q.get("index") or 0) == 1, f"index must advance to 1, got {q.get('index')!r}")
+
+
+def test_the_dry_run_never_waits_on_another_segment():
+    """'Straight through' also means it must not take the real path's same-job wait."""
+    body = _function_code(_ju_source(), "_fpms_lark_dry_run_finish")
+    for forbidden in ("_updatemore_next_segment_must_wait", "wait_for_build", "ev.wait"):
+        check(
+            f"{forbidden}(" not in body,
+            f"a dry run must not consult {forbidden} — there is no build for anything to wait on",
+        )
 
 
 def main() -> int:

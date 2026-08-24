@@ -13193,8 +13193,21 @@ def _fpms_lark_dry_run_finish(
                 # env-split paths never pass dry_run to init_queue, so without this the next
                 # block's only carrier would be the arm.
                 q["dry_run"] = True
-                _s3["updatemore_queue"] = q
-                _s3["ju_dry_run"] = True
+                # Retire THIS block's gate before handing over. We are still inside run(), so the
+                # spawn's `finally` (which normally does this) has not run yet — the row still says
+                # state="jenkins_wait_build" from our own block. Leaving it makes the next block's
+                # dispatch refuse with "A Jenkins Build confirmation is already waiting for you in
+                # this chat", so a multi-block /testing silently stopped after block 1.
+                stub: dict = {"updatemore_queue": q, "ju_dry_run": True}
+                _em3 = str(_s3.get("email_reply_subject") or "").strip()
+                if _em3:
+                    stub["email_reply_subject"] = _em3
+                # Replace EVERY alias of the old row, not just this key: sessions are stored under
+                # both chat:open_id and chat:union_id pointing at one dict, so overwriting one
+                # alias would leave the other still advertising an open gate.
+                for _k, _v in list(_fpms_lark_sessions.items()):
+                    if _v is _s3:
+                        _fpms_lark_sessions[_k] = stub
                 um.persist_queue_if_current(q)
         if superseded:
             send(
