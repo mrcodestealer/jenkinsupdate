@@ -55,6 +55,27 @@ class ExplodingPage:
         )
 
 
+class RecordingPage:
+    """A page that tolerates navigation, for the paths a dry run is ALLOWED to walk.
+
+    ``ExplodingPage`` is still the right stub for ``_click_jenkins_build_button``, which must
+    refuse before it looks at anything. The Services recovery is different: a dry run is expected
+    to reload and re-login, so a page that dies on first touch cannot express what is being
+    tested. What matters here is only whether Build gets clicked.
+    """
+
+    def is_closed(self):
+        # Must be explicit and False: a catch-all returning ``self`` is truthy, and
+        # ``_safe_page_wait`` reads that as "the operator closed the browser" and aborts long
+        # before the Build click this test is trying to observe.
+        return False
+
+    def __getattr__(self, name):
+        def _anything(*a, **k):
+            return self
+        return _anything
+
+
 def test_the_build_click_refuses_before_touching_the_page():
     try:
         ju._click_jenkins_build_button(ExplodingPage(), dry_run=True)
@@ -81,19 +102,71 @@ def test_a_real_build_click_is_not_blocked():
         return
 
 
-def test_the_services_recovery_refuses_during_a_dry_run():
-    """The recovery clicks a real Build ~2.4k lines above the gate. It must refuse on its own."""
+def test_the_services_recovery_never_clicks_build_during_a_dry_run():
+    """The recovery clicks a real Build ~2.4k lines above the gate, so it must handle dry runs itself.
+
+    The invariant is "no Build click", NOT "raises". It used to raise at the top and abort the
+    whole segment, but only step 2 of the sequence is forbidden: the reload + re-login half is
+    what actually fixes the common cause (UnoChoice not rendering the checkboxes inside
+    FPMS_SERVICES_APPEAR_MS — a timing failure). Refusing everything made /testing abort on
+    ordinary slowness, which is the very thing an operator runs it to watch. So a dry run now
+    performs the safe steps and skips the Build; this test pins that the Build is still never
+    reached.
+    """
+    clicked: list[bool] = []
+    orig_click = ju._click_jenkins_build_button
+    ju._click_jenkins_build_button = lambda *a, **k: clicked.append(True)
     try:
         ju._recover_services_not_found_sequence(
-            ExplodingPage(), "u", "p", build_url="https://example.invalid/job/x/build", dry_run=True
+            RecordingPage(), "u", "p", build_url="https://example.invalid/job/x/build",
+            dry_run=True,
         )
-    except ju.JenkinsDryRunBuildBlocked as ex:
-        check("Services" in str(ex), f"refusal should name the cause: {ex}")
-        return
-    except AssertionError as ex:
-        check(False, str(ex))
-        return
-    check(False, "the Services recovery did not refuse during a dry run")
+    except Exception as ex:  # a stub-page miss is fine; a Build click is not
+        print(f"    (dry recovery raised {type(ex).__name__}, acceptable)")
+    finally:
+        ju._click_jenkins_build_button = orig_click
+    check(not clicked, "the Services recovery clicked Build during a dry run")
+
+
+def test_the_services_recovery_still_builds_for_a_real_run():
+    """The other half: a real run MUST still get its Refresh-pipeline Build, or Services never
+    republish and every affected update fails."""
+    clicked: list[bool] = []
+    # These reach the Jenkins HTTP API / the real form, which this harness has no access to; they
+    # sit BEFORE the click, so without stubbing them the test can never get far enough to observe
+    # it and would "pass" for the wrong reason.
+    saved = {
+        n: getattr(ju, n)
+        for n in (
+            "_click_jenkins_build_button",
+            "_tick_refresh_pipeline_checkbox",
+            "_verify_refresh_pipeline_checked",
+            "_jenkins_last_build_state",
+            "_wait_for_refresh_build_to_finish",
+            "jenkins_login_if_needed",
+        )
+    }
+    ju._click_jenkins_build_button = lambda *a, **k: clicked.append(True)
+    ju._tick_refresh_pipeline_checkbox = lambda *a, **k: True
+    ju._verify_refresh_pipeline_checked = lambda *a, **k: None
+    ju._jenkins_last_build_state = lambda *a, **k: (7, "SUCCESS")
+    ju._wait_for_refresh_build_to_finish = lambda *a, **k: True
+    ju.jenkins_login_if_needed = lambda *a, **k: None
+    try:
+        ju._recover_services_not_found_sequence(
+            RecordingPage(), "u", "p", build_url="https://example.invalid/job/x/build",
+            dry_run=False,
+        )
+    except Exception as ex:
+        print(f"    (real recovery raised {type(ex).__name__} after the click point)")
+    finally:
+        for n, fn in saved.items():
+            setattr(ju, n, fn)
+    check(
+        bool(clicked),
+        "a REAL run's Services recovery no longer clicks Build — Jenkins would never republish "
+        "its parameter list and the update would fail",
+    )
 
 
 def test_the_blocked_error_is_not_swallowed_as_an_ordinary_failure():
@@ -155,9 +228,20 @@ def test_no_unguarded_build_click_is_reachable_from_a_gated_run():
         i for i, ln in enumerate(lines[rec_start + 1 :], start=rec_start + 1)
         if ln.startswith("def ")
     )
+    rec_src = "\n".join(lines[rec_start:rec_end])
     check(
-        "raise JenkinsDryRunBuildBlocked(" in "\n".join(lines[rec_start:rec_end]),
-        "_recover_services_not_found_sequence lost its dry-run refusal",
+        "if dry_run:" in rec_src and "return" in rec_src,
+        "_recover_services_not_found_sequence lost its dry-run branch — the Build click inside it "
+        "runs ~2.4k lines above the gate, so nothing downstream can stop it",
+    )
+    # The dry branch must return BEFORE the Build click, not merely exist.
+    _dry_at = rec_src.find("if dry_run:")
+    _click_at = rec_src.find("_click_jenkins_build_button(")
+    _ret_at = rec_src.find("return", _dry_at)
+    check(
+        0 <= _dry_at < _ret_at < _click_at,
+        "the dry-run branch must return before the Build click in "
+        "_recover_services_not_found_sequence",
     )
 
     # The VPN click and the CLI branches are unreachable for /testing; pin them by name so a NEW

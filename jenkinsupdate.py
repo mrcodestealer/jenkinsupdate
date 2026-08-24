@@ -7052,18 +7052,36 @@ def _recover_services_not_found_sequence(
     4. Open build URL again → login → settle ``FPMS_MS_POST_LOGIN_BEFORE_FORM`` — caller then
        retries Environment, Services, Branch, Version.
 
-    ``dry_run`` refuses the whole sequence. Step 2 clicks a REAL Build to make Jenkins republish its
-    parameter definitions, and this runs roughly 2,400 lines above the YES/NO gate — so a flag
-    checked at the gate would not stop it. A ``/testing`` run whose Services list fails to load must
-    abort the segment instead, or the one command whose entire contract is "never builds" would
-    build on exactly the flaky runs it exists to diagnose.
+    ``dry_run`` runs steps 1 and 4 and **skips step 2 entirely** — it never clicks Build. This
+    runs roughly 2,400 lines above the YES/NO gate, so a flag checked at the gate would not stop
+    the click; the skip has to happen here.
+
+    Why not simply refuse the whole sequence (which is what this did first): only step 2 is
+    forbidden, and it is not what fixes the common failure. ``ServicesListGoneError`` fires when
+    UnoChoice has not rendered the dependent checkboxes inside ``FPMS_SERVICES_APPEAR_MS`` — a
+    TIMING failure, which a reload plus a re-login fixes on its own. Refusing everything meant
+    ``/testing`` aborted on ordinary slowness, which is precisely the condition an operator runs
+    it to observe. If the list is genuinely unpublished, the caller's retry raises
+    ``ServicesListGoneError`` again and the segment ends with that as its reason — honest, and
+    still without a build.
     """
     if dry_run:
-        raise JenkinsDryRunBuildBlocked(
-            "Services did not load and the recovery for it clicks a real Build — refusing during "
-            "a dry run. Re-run this segment as a normal update, or retry once Jenkins has "
-            "republished its parameter list."
+        print(
+            "\n→ Services missing during a DRY RUN: reloading + re-logging in and retrying the "
+            "fill. Skipping the **Refresh pipeline → Build** step — a dry run never builds. If "
+            "the Services list is genuinely unpublished, this segment will stop with that as its "
+            "reason.",
+            flush=True,
         )
+        bu_d = (build_url or BUILD_URL).strip()
+        page.goto(bu_d, wait_until="domcontentloaded", timeout=90_000)
+        _safe_page_wait(page, 900)
+        jenkins_login_if_needed(page, username, password)
+        page.wait_for_selector("div.jenkins-form-item", timeout=60_000)
+        _safe_page_wait(page, _MS_FORM_READY)
+        _safe_page_wait(page, _MS_POST_LOGIN_BEFORE_FORM)
+        print("→ Dry-run recovery done (no Build) — retrying Environment + Services.", flush=True)
+        return
     w_ms = max(0, _MS_POST_BUILD_RECOVER_WAIT_MS)
     w_sec = w_ms / 1000.0
     print(

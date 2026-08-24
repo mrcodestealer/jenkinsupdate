@@ -119,6 +119,13 @@ Notes:
   ever claim it.
 - If a block fails verification, the card says a real run would have **refused** to build it, and
   the closing line names the blocks that failed. Later blocks still dry-run.
+- If the **Services** checkbox list does not render, a dry run reloads, re-logs in and retries the
+  fill. It skips the `Refresh pipeline` -> `Build` step that a real run uses there, so it never
+  builds; if the list is genuinely unpublished the segment stops with that as its reason. Note
+  that a REAL run hitting this silently runs an extra Jenkins build to republish the parameters.
+  If it happens often, set `FPMS_STABLE_FILL=1` -- fast-fill mode clamps the
+  `FPMS_SERVICES_APPEAR_MS` wait to 10s, and raising that variable on its own does nothing while
+  the clamp is active.
 - Two combinations are **refused** rather than half-honoured:
   - **VPN creation.** That flow clicks Build from a warm browser that never sees the dry-run flag,
     so a dry run there could not be made safe.
