@@ -8635,8 +8635,36 @@ def resolve_lark_jenkins_card_sender(
 
 
 def jenkins_update_has_active_lark_session(chat_id: str, sender_id: str) -> bool:
+    """Does this sender have a run that still needs to hear un-mentioned replies?
+
+    ``main.py`` uses this to decide whether a GROUP message with no @mention reaches the Jenkins
+    handler at all. That bypass is what lets someone answer **yes** / **no** / a picker number
+    without re-@mentioning the bot mid-run, so it has to stay open for anything genuinely waiting
+    on the user.
+
+    It used to be ``key in _fpms_lark_sessions`` — mere existence. But a finished segment
+    deliberately leaves a stub ``{"updatemore_queue": q}`` behind (see
+    :func:`_fpms_lark_finish_jenkins_run_session`), and an aborted run leaves one too. With
+    existence as the test, that stub kept the bypass open forever: every unrelated message from
+    that person was handed to the handler, did nothing, and still came back stamped with a DONE
+    reaction. That is the "bot just reacts to everything" report, and it persisted until a restart.
+
+    Fail-open on ``state``: ANY state string counts as active. There are eleven of them and more
+    will be added, and the cost of being wrong is asymmetric — a false True only over-reacts,
+    while a false False makes the bot deaf to **yes** and strands a real build gate.
+    """
     with _fpms_lark_sessions_lock:
-        return _fpms_lark_session_key(chat_id, sender_id) in _fpms_lark_sessions
+        sess = _fpms_lark_sessions.get(_fpms_lark_session_key(chat_id, sender_id))
+        if not isinstance(sess, dict):
+            return False
+        if str(sess.get("state") or "").strip():
+            return True
+        # No state: a parked stub. It still counts while its queue is genuinely mid-flight —
+        # a real /updatemore between segments sits exactly here, waiting on jenkinsbot.
+        q = sess.get("updatemore_queue")
+        return bool(
+            isinstance(q, dict) and not q.get("stopped") and q.get("waiting_jenkins")
+        )
 
 
 def _fpms_lark_clear_session(chat_id: str, sender_id: str) -> None:
