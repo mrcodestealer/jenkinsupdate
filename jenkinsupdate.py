@@ -13407,11 +13407,28 @@ def _fpms_lark_send_build_completed_plain_ping(
     """
     Final plain-text line after **Build**: @mention + job folder URL + pipeline/build number (not a card).
     Set ``JENKINS_BUILD_DONE_NOTIFY_OPEN_ID`` to empty / ``0`` / ``false`` to disable.
+
+    This is a **human** ping. It must never be addressed to jenkinsbot, because jenkinsbot starts a
+    watch from ANY Jenkins job URL in a message that @mentions it — it does not need a command. The
+    default open id here happened to be the same literal as ``JENKINS_BOT_OPEN_ID``'s default, so on
+    a stock install this "ping" was a second watch request for the build we had just asked
+    jenkinsbot to watch: two watchers, two "Jenkins Finished: SUCCESS" cards, and on a run with a
+    queue two completion callbacks racing to advance it.
     """
     raw = (os.environ.get("JENKINS_BUILD_DONE_NOTIFY_OPEN_ID") or "").strip()
     if not raw:
         raw = "ou_45cc096780a23354f0719c9635765985"
     if raw.casefold() in ("0", "false", "no", "off"):
+        return
+    if raw.strip() == _fpms_lark_jenkins_bot_open_id():
+        # Never ping the watcher about a build it is already watching.
+        print(
+            "[jenkinsupdate] build-done ping skipped: its target is jenkinsbot "
+            f"({raw}), and a bare Jenkins URL @mentioning jenkinsbot starts a SECOND watch on "
+            "this build. Set JENKINS_BUILD_DONE_NOTIFY_OPEN_ID to a real person, or to 0 to "
+            "turn the ping off.",
+            flush=True,
+        )
         return
     try:
         at = f'<at user_id="{raw}">User</at>'

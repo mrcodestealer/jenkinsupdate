@@ -2285,10 +2285,33 @@ def internal_updatemore_jenkins_callback():
     try:
         import updatemore as um
 
+        # Route this callback's own messages into the run's update thread.
+        #
+        # This used to pass ``send_message`` raw, so everything the callback said — "▶️ Next
+        # /updatemore segment (N)…", "✅ All segments finished." — landed at chat top level, while
+        # the segment it was announcing posted INSIDE the thread (``_dispatch_lark_update_command_body``
+        # wraps its own send). One run then read as two conversations.
+        #
+        # The route only knows the chat, so the session key comes from whichever queue owns it.
+        # Falls back to the raw sender on any failure: a message in the wrong place is far better
+        # than a callback that raises and answers 500.
+        callback_send = send_message
+        try:
+            _thr_sk, _thr_q, _ = um.find_active_queue_for_chat(
+                chat_id, ju._fpms_lark_sessions, ju._fpms_lark_sessions_lock
+            )
+            _thr_sk = _thr_sk or um.queue_owner_session_key(_thr_q)
+            if _thr_sk:
+                callback_send = make_update_thread_send(chat_id, _thr_sk, send_message)
+        except Exception as _thr_ex:
+            print(
+                f"[updatemore-callback] thread-send wrap skipped: {_thr_ex!r}", flush=True
+            )
+
         handled = um.process_updatemore_jenkins_command(
             chat_id,
             command,
-            send_message,
+            callback_send,
             sessions=ju._fpms_lark_sessions,
             sessions_lock=ju._fpms_lark_sessions_lock,
             session_key_fn=ju._fpms_lark_session_key,
