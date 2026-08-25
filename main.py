@@ -1700,6 +1700,92 @@ def _dispatch_jenkins_duty_command(
         return False
 
 
+_SECRET_OPENID_RE = re.compile(r"(?:^|\s)/secret1\b", re.I)
+
+
+def _looks_like_secret_openid_probe(*texts: Optional[str]) -> bool:
+    """True when any form of the message body carries ``/secret1``.
+
+    Checks every variant because Lark hands the same message over in several shapes and the
+    @mention placeholders land differently in each — the token can be in one and not another.
+    """
+    for t in texts:
+        if t and _SECRET_OPENID_RE.search(t):
+            return True
+    return False
+
+
+def _handle_openid_probe(
+    chat_id: str,
+    message_id: Optional[str],
+    sender_id: str,
+    sender_union_id: Optional[str],
+    mentions,
+    *,
+    bot_mentioned: bool,
+    chat_type: str,
+) -> None:
+    """Reply with the open_id of every @mentioned party, flagged against what config expects.
+
+    Usage in a group — tag THIS bot so the message reaches it, plus whoever you want the id of::
+
+        @Jenkins Update Bot /secret1 @Jenkins Monitoring Bot
+
+    The flags are the point. An id that is merely correct-looking tells you nothing; what matters
+    is whether it is the one a given setting already holds, because a notification sent to the
+    wrong id looks delivered and silently reaches nobody.
+    """
+    if chat_type != "p2p" and not bot_mentioned:
+        # Someone else's message that happens to contain the token — not addressed to us.
+        return
+
+    known: list[tuple[str, str]] = []
+    try:
+        ju = _get_jenkinsupdate()
+        if ju is not None:
+            known.append(("JENKINS_BOT_OPEN_ID (who /SuccessInformMe is sent to)",
+                          ju._fpms_lark_jenkins_bot_open_id()))
+    except Exception:
+        pass
+    known.append(("BOT_OPEN_ID (this bot)", (BOT_OPEN_ID or "").strip()))
+    raw_ping = (os.environ.get("JENKINS_BUILD_DONE_NOTIFY_OPEN_ID") or "").strip()
+    if raw_ping:
+        known.append(("JENKINS_BUILD_DONE_NOTIFY_OPEN_ID (build-done ping)", raw_ping))
+
+    def _labels_for(oid: str) -> str:
+        hits = [name for name, val in known if val and val == oid]
+        return ("  ← " + ", ".join(hits)) if hits else ""
+
+    lines = ["🔎 **open_id probe**", ""]
+    rows = 0
+    for m in mentions or []:
+        mid_obj = m.get("id")
+        oid = mid_obj.get("open_id", "") if isinstance(mid_obj, dict) else mid_obj
+        oid = str(oid or "").strip()
+        name = str(m.get("name") or "?").strip() or "?"
+        if not oid:
+            lines.append(f"- **{name}** — no open_id in the mention payload")
+            rows += 1
+            continue
+        lines.append(f"- **{name}**\n  `{oid}`{_labels_for(oid)}")
+        rows += 1
+    if not rows:
+        lines.append("_No @mentions in that message._ Tag whoever you want the id of, e.g.")
+        lines.append("`@Jenkins Update Bot /secret1 @Jenkins Monitoring Bot`")
+
+    su = (sender_id or "").strip()
+    if su:
+        lines += ["", f"**You** (sender)\n  `{su}`{_labels_for(su)}"]
+    if (sender_union_id or "").strip():
+        lines.append(f"  union_id: `{sender_union_id.strip()}`")
+
+    lines += ["", "_Configured now:_"]
+    for name, val in known:
+        lines.append(f"- {name}: `{val or '(unset)'}`")
+
+    send_message(chat_id, "\n".join(lines))
+
+
 # ================= Message handler (the /update flow) =================
 # Runs INLINE inside the webhook (like osedutybot): the Jenkins engine owns its own
 # deferred-DONE lifecycle, so wrapping this in start_lark_background_thread (which auto-marks
@@ -1997,6 +2083,26 @@ def lark_webhook():
                 if mid and BOT_OPEN_ID and mid == BOT_OPEN_ID:
                     bot_mentioned = True
                     break
+
+        # /secret1 — report the Lark open_id of everyone @mentioned in this message.
+        #
+        # Bot open ids are config, and getting one wrong is invisible: a notification addressed to
+        # the wrong id looks delivered and simply never arrives. Reading them out of a mention
+        # payload beats copying them from a console.
+        #
+        # Handled here, not in _handle_jenkins_message, because only the webhook has ``mentions``.
+        # It echoes nothing the caller did not already put in their own message.
+        if _looks_like_secret_openid_probe(clean_text, clean_text_multiline, original_text):
+            _handle_openid_probe(
+                chat_id,
+                message_id,
+                sender_id,
+                sender_union_id,
+                mentions,
+                bot_mentioned=bot_mentioned,
+                chat_type=chat_type,
+            )
+            return _lark_im_done()
 
         # jenkinsbot → reply-email commands (/replyupdateemail, etc.) work in groups WITHOUT an
         # @mention — treat them as addressed so the group gate below lets them through (any sender).

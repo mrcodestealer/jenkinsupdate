@@ -73,6 +73,10 @@ On startup you should see:
 - `rebuild` / `rebuild again` — re-run the last update.
 - `/warmstatus` — warm browser pool status: how many browsers are live, which are hot vs
   on-demand, and the idle-release window. See [Warm browser pool](#warm-browser-pool).
+- `/secret1` — report the Lark `open_id` of everyone @mentioned in the message, flagged against
+  the settings that already hold one. In a group, tag this bot too so the message reaches it:
+  `@Jenkins Update Bot /secret1 @Jenkins Monitoring Bot`. Use it before setting any `*_OPEN_ID`
+  variable -- a wrong id looks delivered and silently reaches nobody.
 - `/testing` — **dry run**. Put it on the first line, above the update blocks, and the bot does
   everything a real run does *up to* the build: logs in, fills the form, verifies every value and
   sends you the screenshots — then stops. See [Dry runs](#dry-runs).
