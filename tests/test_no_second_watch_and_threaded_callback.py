@@ -84,13 +84,18 @@ def _ping(target: str | None) -> list[str]:
     return sent
 
 
-def test_the_build_done_ping_never_addresses_jenkinsbot():
-    """The whole bug in one assertion."""
+def test_the_build_done_ping_is_opt_in_only():
+    """The whole bug in one assertion.
+
+    It is not enough to refuse when the target happens to equal JENKINS_BOT_OPEN_ID: that guard
+    stops protecting the moment JENKINS_BOT_OPEN_ID is corrected to a different id, and the ping
+    resumes against the stale literal. Unset must mean OFF.
+    """
     check(
         _ping(None) == [],
-        "with the stock default the ping must NOT send: its target is jenkinsbot, and a bare "
-        "Jenkins URL @mentioning jenkinsbot starts a SECOND watch on the build we just asked it "
-        "to watch",
+        "with nothing configured the ping must NOT send. It used to default to a hardcoded open "
+        "id inherited from osedutybot, and a bare Jenkins URL @mentioning a watcher bot starts a "
+        "SECOND watch on the build we just asked it to watch",
     )
     check(
         _ping(ju._fpms_lark_jenkins_bot_open_id()) == [],

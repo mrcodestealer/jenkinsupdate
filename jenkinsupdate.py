@@ -13417,7 +13417,13 @@ def _fpms_lark_send_build_completed_plain_ping(
     """
     raw = (os.environ.get("JENKINS_BUILD_DONE_NOTIFY_OPEN_ID") or "").strip()
     if not raw:
-        raw = "ou_45cc096780a23354f0719c9635765985"
+        # OPT-IN ONLY. This used to default to a hardcoded open id inherited from osedutybot,
+        # which in this deployment is not a person at all — so a stock install pinged an unknown
+        # bot with a bare Jenkins URL, and jenkinsbot starts a watch from any such URL. Guarding
+        # only "target == JENKINS_BOT_OPEN_ID" is not enough, because that guard silently stops
+        # protecting the moment JENKINS_BOT_OPEN_ID is corrected to a different id. A notification
+        # whose recipient nobody chose has no business firing.
+        return
     if raw.casefold() in ("0", "false", "no", "off"):
         return
     if raw.strip() == _fpms_lark_jenkins_bot_open_id():
