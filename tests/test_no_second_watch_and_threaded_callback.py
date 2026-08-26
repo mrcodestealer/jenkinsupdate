@@ -133,32 +133,60 @@ def test_the_two_defaults_that_collided_are_documented():
     check(0 < guard_at < send_at, "the guard must run before the send")
 
 
-def test_the_http_callback_sends_into_the_update_thread():
-    """"▶️ Next segment" belongs in the thread with the segment it announces."""
+def test_both_callback_routes_send_into_the_update_thread():
+    """"▶️ Next segment" belongs in the thread with the segment it announces.
+
+    A jenkinsbot callback arrives two ways and BOTH used the raw sender: the internal HTTP POST,
+    and a Lark message (`@Jenkins Update Bot /SuccessProceedNext`). The Lark one is the worse of
+    the two, because its sender is jenkinsbot — so even a sender-derived thread key has no root
+    and every message lands at chat top level, while the segment it dispatches threads itself
+    correctly. One run, two conversations.
+    """
     src = io.open(os.path.join(_REPO, "main.py"), encoding="utf-8").read()
+    helper = src.find("def _update_thread_send_for_chat(")
+    check(helper > 0, "there must be one shared thread-aware sender for both routes")
+    hbody = src[helper : src.find("\ndef ", helper + 10)]
+    check(
+        "make_update_thread_send(" in hbody,
+        "it must wrap through the update-thread helper",
+    )
+    check(
+        "queue_owner_session_key(" in hbody,
+        "and take the session key from the QUEUE — the callback's own sender is jenkinsbot, "
+        "whose key has no thread root",
+    )
+    check(
+        "except Exception" in hbody and "return send_message" in hbody,
+        "and fall back to the raw sender: a misplaced message beats a callback that raises, "
+        "because a non-ok answer makes jenkinsbot retry",
+    )
+
+    # Route 1: the internal HTTP POST.
     i = src.find("def internal_updatemore_jenkins_callback(")
     check(i > 0, "the callback route must exist")
     body = src[i : src.find("\n@app.route", i + 10)]
     check(
-        "make_update_thread_send(" in body,
-        "the route must wrap its sender in the update-thread helper, or its messages land at "
-        "chat top level while the segment they announce posts inside the thread",
-    )
-    check(
-        "callback_send," in body,
-        "and the wrapped sender must actually be the one passed to "
-        "process_updatemore_jenkins_command",
+        "_update_thread_send_for_chat(chat_id)" in body,
+        "the HTTP route must use the shared sender",
     )
     check(
         re.search(r"process_updatemore_jenkins_command\(\s*chat_id,\s*command,\s*send_message",
                   body) is None,
-        "the RAW send_message must no longer be passed — that is what split one run across two "
-        "conversations",
+        "the RAW send_message must no longer be passed on the HTTP route",
+    )
+
+    # Route 2: the Lark message from jenkinsbot.
+    j = src.find("if _jb_duty_cmd:")
+    check(j > 0, "the Lark duty branch must exist")
+    lark = src[j : j + 900]
+    check(
+        "_update_thread_send_for_chat(chat_id)" in lark,
+        "the Lark duty branch must use it too — this is the route "
+        "`@Jenkins Update Bot /SuccessProceedNext` actually takes",
     )
     check(
-        "except Exception" in body,
-        "and the wrap must be best-effort: a misplaced message beats a callback that 500s, "
-        "because a 500 makes jenkinsbot fall back and retry",
+        re.search(r"_dispatch_jenkins_duty_command\((?:.|\n)*?\n\s*send_message,", lark) is None,
+        "and must no longer pass the raw send_message",
     )
 
 

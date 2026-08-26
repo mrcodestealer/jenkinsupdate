@@ -1628,6 +1628,37 @@ def _run_card_callback_worker(data: dict, resolved: tuple) -> None:
             pass
 
 
+def _update_thread_send_for_chat(chat_id: str):
+    """A sender that posts into the update thread that owns ``chat_id``, if there is one.
+
+    Both routes a jenkinsbot callback can arrive by — the internal HTTP POST and a Lark message —
+    only know the CHAT. Neither can use the message's own sender for the thread key: on the Lark
+    path the sender is jenkinsbot, so ``chat:<jenkinsbot>`` has no thread root and everything
+    lands at chat top level, while the segment the callback goes on to dispatch threads itself
+    correctly (``_dispatch_lark_update_command_body`` wraps its own send). One run then reads as
+    two conversations.
+
+    The queue knows who started it, so take the session key from there. Falls back to the raw
+    sender on any failure: a message in the wrong place beats a callback that raises, because a
+    raising callback answers non-ok and makes jenkinsbot retry.
+    """
+    try:
+        ju = _get_jenkinsupdate()
+        if ju is None:
+            return send_message
+        import updatemore as um
+
+        sk, q, _ = um.find_active_queue_for_chat(
+            chat_id, ju._fpms_lark_sessions, ju._fpms_lark_sessions_lock
+        )
+        sk = sk or um.queue_owner_session_key(q)
+        if sk:
+            return make_update_thread_send(chat_id, sk, send_message)
+    except Exception as ex:
+        print(f"[lark] update-thread send wrap skipped: {ex!r}", flush=True)
+    return send_message
+
+
 # ================= jenkinsbot → reply-email callbacks (/replyupdateemail, etc.) =================
 def _dispatch_jenkins_duty_command(
     chat_id: str,
@@ -1885,7 +1916,9 @@ def _handle_jenkins_message(
             sender_id or "",
             _duty_blob or clean_text,
             _duty_blob or original_text,
-            send_message,
+            # Thread it with the run it belongs to. The sender here is jenkinsbot, so a
+            # sender-derived key would have no thread root at all.
+            _update_thread_send_for_chat(chat_id),
             message_content_raw=message_content_raw,
         ):
             return
@@ -2413,18 +2446,7 @@ def internal_updatemore_jenkins_callback():
         # The route only knows the chat, so the session key comes from whichever queue owns it.
         # Falls back to the raw sender on any failure: a message in the wrong place is far better
         # than a callback that raises and answers 500.
-        callback_send = send_message
-        try:
-            _thr_sk, _thr_q, _ = um.find_active_queue_for_chat(
-                chat_id, ju._fpms_lark_sessions, ju._fpms_lark_sessions_lock
-            )
-            _thr_sk = _thr_sk or um.queue_owner_session_key(_thr_q)
-            if _thr_sk:
-                callback_send = make_update_thread_send(chat_id, _thr_sk, send_message)
-        except Exception as _thr_ex:
-            print(
-                f"[updatemore-callback] thread-send wrap skipped: {_thr_ex!r}", flush=True
-            )
+        callback_send = _update_thread_send_for_chat(chat_id)
 
         handled = um.process_updatemore_jenkins_command(
             chat_id,
