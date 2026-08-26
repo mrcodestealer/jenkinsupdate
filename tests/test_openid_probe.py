@@ -106,8 +106,11 @@ def test_it_flags_an_id_that_matches_a_configured_setting():
         "mismatch visible instead of plausible",
     )
     out2 = _probe([{"name": "Somebody Else", "id": {"open_id": "ou_unrelated_xyz"}}])
+    # Only the mention list matters here; the trailing "Configured now" block always names every
+    # setting by design, so the check has to stop before it.
+    mentions_part = out2.split("_Configured now")[0]
     check(
-        "JENKINS_BOT_OPEN_ID (who" not in out2.split("_Configured now:_")[0],
+        "JENKINS_BOT_OPEN_ID (who" not in mentions_part,
         "an unrelated id must NOT be labelled — a false match is worse than none",
     )
 
@@ -120,8 +123,32 @@ def test_it_reports_the_senders_own_id():
 
 def test_it_always_lists_what_is_configured_now():
     out = _probe([])
-    check("_Configured now:_" in out, "it must print the current settings to compare against")
+    check("_Configured now" in out, "it must print the current settings to compare against")
     check("BOT_OPEN_ID (this bot)" in out, "including this bot's own id")
+
+
+def test_it_warns_that_open_ids_are_per_app():
+    """The trap the probe can itself cause: ids are NOT portable between bots.
+
+    A Lark open_id identifies someone within ONE app — the same bot has a different one in every
+    app that can see it. Reading the update bot's view and pasting it into jenkinsbot's
+    DUTY_BOT_OPEN_ID yields a mention jenkinsbot cannot resolve, and because a duty command works
+    untagged that failure is silent. (This mistake was actually made from this probe's output.)
+    """
+    out = _probe([{"name": "Jenkins Update Bot", "id": {"open_id": "ou_x"}}])
+    check("per-app" in out, "it must say open_id is per-app")
+    check(
+        "this* bot's config" in out or "this bot's config" in out.replace("*", ""),
+        "and that these ids only apply to this bot's own config",
+    )
+    check(
+        "union_id" in out,
+        "and point at union_id as the cross-app identifier",
+    )
+    check(
+        "DUTY_BOT_OPEN_ID" in out,
+        "naming the specific setting people get wrong is what makes the warning land",
+    )
 
 
 def test_a_mention_without_an_open_id_is_reported_not_dropped():

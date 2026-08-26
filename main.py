@@ -1779,9 +1779,21 @@ def _handle_openid_probe(
     if (sender_union_id or "").strip():
         lines.append(f"  union_id: `{sender_union_id.strip()}`")
 
-    lines += ["", "_Configured now:_"]
+    lines += ["", "_Configured now (this bot's app):_"]
     for name, val in known:
         lines.append(f"- {name}: `{val or '(unset)'}`")
+
+    # The trap this probe exists to prevent, and which it can itself cause if used carelessly.
+    # A Lark open_id identifies someone WITHIN ONE APP: the same person or bot has a different
+    # open_id in every app that can see them. So an id read here is only valid in THIS bot's
+    # config. Pasting it into jenkinsbot's .env produces a mention jenkinsbot cannot resolve —
+    # and because a duty command works untagged, that failure is invisible.
+    lines += [
+        "",
+        "⚠️ **These ids only work in *this* bot's config.** A Lark `open_id` is per-app — the "
+        "same bot has a different one in every app. For jenkinsbot's `DUTY_BOT_OPEN_ID`, run its "
+        "own probe there; don't paste from here. (`union_id` is the cross-app id.)",
+    ]
 
     send_message(chat_id, "\n".join(lines))
 
