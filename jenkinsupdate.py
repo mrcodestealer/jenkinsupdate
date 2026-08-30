@@ -10771,7 +10771,19 @@ def _jenkins_update_filter_ties_by_environment(
 ) -> list[tuple[str, float, str, str]]:
     if not (environment or "").strip():
         return ties
-    filtered = [t for t in ties if _jenkins_job_matches_environment(t[3], environment)]
+    # A literal alias hit (score ≥ 2.0) means the operator TYPED that job's name. The environment
+    # is often not typed at all — ``_environment_hint_from_banner`` infers it from the same headline
+    # — so letting the inferred value delete an explicitly named job inverts the evidence.
+    #
+    # That is not hypothetical: ``update fpms uat fgs`` ranks ``fpms uat fgs`` (FPMS FGS) at 12.012
+    # above ``fpms uat`` (FPMS UAT BRANCH) at 12.008, then the banner infers ``fpms-uat-branch``
+    # from the very same line — because it reads "fpms uat" and ignores the "fgs" qualifier — and
+    # this filter dropped the correct job, leaving the wrong one to build with no picker.
+    filtered = [
+        t
+        for t in ties
+        if t[1] >= 2.0 or _jenkins_job_matches_environment(t[3], environment)
+    ]
     return filtered if filtered else ties
 
 
@@ -10926,10 +10938,17 @@ def _fpms_lark_job_choice_card_json(
     *,
     picker_sid: str | None = None,
 ) -> str:
-    """Lark ``msg_type=interactive``: JSON **2.0** card — numbered body + rows of digit buttons + Cancel."""
+    """Lark ``msg_type=interactive``: JSON **2.0** card — one full-width button per job + Cancel.
+
+    The button text carries the **job name**, not just its index. A row of digit buttons made the
+    operator read the numbered list above, hold the mapping in their head, and then tap a bare
+    ``2`` — and picking the wrong Jenkins job is the exact failure this card exists to prevent.
+    The index is kept as a prefix so the typed fallback (``reply 2``) still lines up, and the
+    callback payload is unchanged (``{"k": "job", "i": i}``), so tap routing is untouched.
+    """
     ps = (picker_sid or "").strip()
     lines_md: list[str] = [
-        "Several Jenkins jobs match your text. **Tap a number** below to choose, or **Cancel**.",
+        "Several Jenkins jobs match your text. **Tap the job** below, or **Cancel**.",
         "",
     ]
     buttons: list[dict[str, object]] = []
@@ -10940,9 +10959,12 @@ def _fpms_lark_job_choice_card_json(
         payload: dict[str, object] = {"k": "job", "i": i}
         if ps:
             payload["sid"] = ps
+        # Truncate defensively: a Lark button renders one line, so an over-long label would be
+        # clipped by the client at an arbitrary point rather than at a marked ellipsis.
+        btn_text = _fpms_lark_short_line(f"{i}. {label}", 60)
         buttons.append(
             _fpms_lark_v2_callback_button(
-                str(i),
+                btn_text,
                 "primary" if i == 1 else "default",
                 payload,
                 element_id=f"ju_job_{i}"[:20],
@@ -10951,9 +10973,8 @@ def _fpms_lark_job_choice_card_json(
     body_elements: list[dict[str, object]] = [
         {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines_md)}},
     ]
-    for off in range(0, len(buttons), 5):
-        chunk = buttons[off : off + 5]
-        body_elements.append(_fpms_lark_v2_column_set_button_row(chunk))
+    # One button per row: job names are far too wide to sit five-across the way digits did.
+    body_elements.extend(buttons)
     body_elements.append({"tag": "hr"})
     cancel_pl: dict[str, object] = {"k": "ju_cancel"}
     if ps:
@@ -15986,6 +16007,88 @@ def looks_like_natural_jenkins_update(text: str) -> bool:
     return has_branch and has_svc and has_update_hint
 
 
+# ----- Implicit ``/update``: an addressed message is a request unless it reads as conversation -----
+#
+# ``looks_like_natural_jenkins_update`` answers "is this definitely an update request". These answer
+# the weaker question the default path needs: "is there any reason to act on this at all, and how
+# sure are we?" Three outcomes, because two would force a bad trade:
+#
+#   ``strong`` — a config block or an interpreter command line. Nobody attaches ``Services:`` or
+#                ``node x.js`` to small talk, so this dispatches exactly like a typed ``/update``.
+#   ``weak``   — the message names a job and nothing marks it as conversation. Worth acting on, but
+#                the job is CONFIRMED on a picker card first; it never auto-fills a Jenkins form.
+#   ``none``   — conversation. The caller falls back to the old help text, so behaviour is unchanged.
+#
+# The suppression rules only ever move a message toward ``none``; their failure mode is "operator
+# types /update like before", which is exactly today's behaviour. Being wrong the other way would
+# drive a browser at a production form because somebody said "ds is slow today" — the whole reason
+# this is gated rather than a bare auto-prefix.
+_IMPLICIT_Q_OPENER_RE = re.compile(
+    r"^(?:did|do|does|is|are|was|were|has|have|had|what|when|where|why|who|whom|which|how|can|could|"
+    r"should|would|will|shall|any|anyone|anybody)\b",
+    re.I,
+)
+_IMPLICIT_STATUS_RE = re.compile(
+    r"(?i)\b(?:fail(?:ed|ing|s|ure)?|broke(?:n)?|down|slow|stuck|error(?:ed|ing|s)?|issue(?:s)?|bug(?:s)?|"
+    r"crash(?:ed|ing|es)?|timeout|timed\s*out|finish(?:ed)?|done|complete[d]?|success(?:ful)?|passed|"
+    r"green|red|not\s+work(?:ing)?|no\s+longer|deployment|rollout)\b|挂了|报错|失败|完成"
+)
+# A plan or a report about another time is narration, not a request to act now.
+_IMPLICIT_PLAN_TIME_RE = re.compile(
+    r"(?i)\b(?:tomorrow|tonight|yesterday|later|earlier|just\s+now|next\s+(?:week|month|sprint|release)|"
+    r"last\s+(?:week|night|month)|this\s+(?:evening|afternoon)|eta|schedule[d]?)\b|明天|昨天|稍后|待会"
+)
+_IMPLICIT_NEGATION_RE = re.compile(
+    r"(?i)\b(?:don'?t|do\s+not|dont|never|no\s+need|hold\s+off|stop|wait)\b|不要|别"
+)
+_IMPLICIT_INTERPRETER_RE = re.compile(r"(?im)^\s*(?:node|python3?|sh|bash|npm|yarn|pnpm)\b")
+# Imperative shape: optional politeness/mention, then an action verb. "update fpms" and "please help
+# update fpms" are requests; "the fpms build failed" is not, though both contain a verb token — so
+# the status-word suppression above is only overridden when the verb actually LEADS the line.
+_IMPLICIT_IMPERATIVE_RE = re.compile(
+    r"(?i)^\s*(?:@\S+\s+)*(?:(?:please|pls|kindly|help|can\s+you|could\s+you|need\s+to|want\s+to|"
+    r"i\s+(?:want|need)\s+to|帮我|请|麻烦)\s*)*"
+    r"(?:update|updating|deploy(?:ing)?|redeploy|release|rebuild|rerun|upgrade|trigger|launch|publish|build|run)"
+    r"(?![a-z0-9])"
+)
+_IMPLICIT_CFG_KEY_RE = re.compile(r"(?im)^\s*(?:branch|version|services?|environment)\s*:")
+
+
+def implicit_update_evidence(text: str) -> str:
+    """How much reason is there to treat an addressed message as ``/update``: strong / weak / none."""
+    raw = _strip_lark_message_mentions(text or "") or (text or "")
+    raw = raw.replace("\r\n", "\n").strip()
+    if not raw:
+        return "none"
+    head = _jenkins_update_first_non_empty_line(raw).strip()
+
+    has_cfg = bool(_IMPLICIT_CFG_KEY_RE.search(_normalize_config_colons(raw)))
+    has_cmd = bool(_IMPLICIT_INTERPRETER_RE.search(raw))
+    has_imperative = bool(_IMPLICIT_IMPERATIVE_RE.match(head))
+
+    if not (has_cfg or has_cmd):
+        if _IMPLICIT_Q_OPENER_RE.search(head) or head.rstrip().endswith("?"):
+            return "none"
+        if _IMPLICIT_NEGATION_RE.search(head):
+            return "none"
+        if _IMPLICIT_STATUS_RE.search(head) and not has_imperative:
+            return "none"
+        if _IMPLICIT_PLAN_TIME_RE.search(head) and not has_imperative:
+            return "none"
+
+    if has_cfg or has_cmd:
+        return "strong"
+
+    # Nothing but a headline: it must actually NAME a job (a literal alias hit, score ≥ 2.0) to be
+    # worth a card. Below that the ranker is guessing from character overlap and would card almost
+    # anything — "ok noted" ranks FRONTEND UAT1 H5 at 0.417.
+    q = JENKINS_UPDATE_CMD_RE.sub("", head, count=1).strip()
+    ranked = _rank_jenkins_update_job_matches(q)
+    if not ranked or ranked[0][1] < 2.0:
+        return "none"
+    return "weak"
+
+
 def normalize_natural_jenkins_body(text: str) -> str:
     """Turn NL Jenkins requests into ``/update …`` + config block for existing dispatch."""
     raw = _strip_lark_message_mentions(text)
@@ -17633,10 +17736,16 @@ def _dispatch_lark_update_command_body(
     send,
     *,
     from_updatemore: bool = False,
+    confirm_job_first: bool = False,
     lark_message_id: str | None = None,
     lark_thread_root_id: str | None = None,
 ) -> bool:
-    """Core ``/update`` job match + dispatch (shared by ``/update`` and ``/updatemore``)."""
+    """Core ``/update`` job match + dispatch (shared by ``/update`` and ``/updatemore``).
+
+    ``confirm_job_first`` — the caller inferred this was an update request rather than being told
+    so (no ``/update`` typed, no config block). Show the job picker even when the ranker is sure,
+    so an inferred request can never silently open a browser against the wrong Jenkins job.
+    """
     key = session_key
     send = _fpms_lark_wrap_thread_send(chat_id, key, send)
     if not from_updatemore:
@@ -17697,7 +17806,14 @@ def _dispatch_lark_update_command_body(
             # on an orphan no lookup ever sees again.
             prev.pop("email_reply_subject", None)
 
-    if FPMS_PROD_SCRIPT_FLAG_RE.search(body) or _looks_like_fpms_prod_script_paste(body):
+    # Each family flow below returns straight into a Jenkins form fill, bypassing the job
+    # picker at the end of this function. When the caller only INFERRED that this was an update
+    # request, that bypass is exactly what must not happen — so skip them and let the ranker
+    # build a picker instead. Nothing is lost: tapping a job calls _fpms_lark_dispatch_job_row,
+    # which routes by automation profile back into the very same flow.
+    _special_ok = not confirm_job_first
+
+    if _special_ok and (FPMS_PROD_SCRIPT_FLAG_RE.search(body) or _looks_like_fpms_prod_script_paste(body)):
         return _fpms_lark_dispatch_fpms_prod_script_parameter_flow(
             chat_id,
             key,
@@ -17708,7 +17824,7 @@ def _dispatch_lark_update_command_body(
         )
 
     # BI PROD SCRIPT RUN — same form as FPMS PROD SCRIPT, Python commands on ``bi-prod``.
-    if _body_requests_bi_prod_script(body):
+    if _special_ok and _body_requests_bi_prod_script(body):
         return _fpms_lark_dispatch_fpms_prod_script_parameter_flow(
             chat_id,
             key,
@@ -17719,7 +17835,7 @@ def _dispatch_lark_update_command_body(
         )
 
     # IGO PROD SCRIPT RUN — phrase picks the environment (igo-prod / igo-report-prod / igo-gov-report-prod).
-    if _igo_prod_script_phrase_env(body):
+    if _special_ok and _igo_prod_script_phrase_env(body):
         return _fpms_lark_dispatch_igo_prod_script_parameter_flow(
             chat_id, key, body, IGO_PROD_SCRIPT_RUN_URL, send, lark_message_id=lark_message_id
         )
@@ -17729,7 +17845,7 @@ def _dispatch_lark_update_command_body(
         _cpms_pend = _fpms_lark_sessions.get(key)
     if isinstance(_cpms_pend, dict) and _cpms_pend.get("state") == "cpms_igo_typo_pick":
         return False
-    if _cpms_igo_uat_headline_detect(body) or _looks_like_cpms_igo_uat_paste(body):
+    if _special_ok and (_cpms_igo_uat_headline_detect(body) or _looks_like_cpms_igo_uat_paste(body)):
         return _fpms_lark_dispatch_cpms_igo_uat_parameter_flow(
             chat_id,
             key,
@@ -17741,7 +17857,7 @@ def _dispatch_lark_update_command_body(
 
     # BI-SCRIPT-UPDATE wins over BI-API-UPDATE when the named API is a DEPLOYMENT_FILE_NAME,
     # or when the wording says "script" and the name is not a BI-API REPOSITORY option.
-    if _body_requests_bi_script_update(body) or _body_mentions_bi_script_job(body):
+    if _special_ok and (_body_requests_bi_script_update(body) or _body_mentions_bi_script_job(body)):
         return _fpms_lark_dispatch_bi_script_update_parameter_flow(
             chat_id,
             key,
@@ -17751,7 +17867,7 @@ def _dispatch_lark_update_command_body(
             lark_message_id=lark_message_id,
         )
 
-    if _body_requests_bi_api_update(body):
+    if _special_ok and _body_requests_bi_api_update(body):
         return _fpms_lark_dispatch_bi_api_update_parameter_flow(
             chat_id,
             key,
@@ -17765,7 +17881,7 @@ def _dispatch_lark_update_command_body(
     # The registry ranker would otherwise let an env keyword like ``PMS`` outscore ``brazil uat`` when
     # the env word leads the headline.
     venue_det = _venue_uat_headline_detect(body)
-    if venue_det:
+    if _special_ok and venue_det:
         return _fpms_lark_dispatch_venue_uat_parameter_flow(
             chat_id,
             key,
@@ -17776,7 +17892,7 @@ def _dispatch_lark_update_command_body(
         )
 
     rc_url = _fnt_rc_headline_detect(body)
-    if rc_url:
+    if _special_ok and rc_url:
         label_rc = JENKINS_UPDATE_JOB_REGISTRY["rc uat master"][0]
         return _fpms_lark_dispatch_job_row(
             chat_id,
@@ -17888,6 +18004,10 @@ def _dispatch_lark_update_command_body(
     # literally, so this is a fuzzy guess. Every real headline scores well above this floor;
     # below it the ranker was picking an unrelated job rather than admitting it did not know.
     if not need_menu and not svc_tokens and ties and ties[0][1] < 2.0:
+        need_menu = True
+    # Inferred request (see ``confirm_job_first``): confirm the job before touching Jenkins. The
+    # ranker being confident is not enough here — it is confident about "ds is slow today" too.
+    if confirm_job_first and not need_menu:
         need_menu = True
     if need_menu:
         picker_sid = secrets.token_hex(16)
@@ -18218,6 +18338,7 @@ def handle_lark_jenkins_update_message(
     send,
     *,
     allow_start: bool,
+    implicit: bool = False,
     lark_sender_union_id: str | None = None,
     lark_message_id: str | None = None,
     lark_thread_root_id: str | None = None,
@@ -19020,10 +19141,28 @@ def handle_lark_jenkins_update_message(
                 "handling this message as a fresh request.",
             )
 
+    _confirm_job_first = False
     if not JENKINS_UPDATE_CMD_RE.search(clean_text or ""):
-        if not (allow_start and looks_like_natural_jenkins_update(original_text or clean_text or "")):
+        _raw_in = original_text or clean_text or ""
+        if allow_start and looks_like_natural_jenkins_update(_raw_in):
+            body = normalize_natural_jenkins_body(_raw_in)
+            # The gate has order-free alternatives (``\brc[\s-]*uat\b``, ``\b(?:cpms|igo)[\s-]*uat\b``)
+            # that fire on any mention of those jobs — so "rc uat finished ok" and "cpms uat failed"
+            # are admitted as update requests and used to auto-fill a form. Confirm the job first
+            # when the message reads as conversation; nothing is rejected, it just asks.
+            if implicit_update_evidence(_raw_in) == "none":
+                _confirm_job_first = True
+        elif allow_start and implicit:
+            # ``/update`` is the DEFAULT for a message addressed to this bot: the operator should
+            # not have to type the prefix. ``none`` means it read as conversation — return False so
+            # the caller still falls back to the old help text rather than answering with a card.
+            _ev = implicit_update_evidence(_raw_in)
+            if _ev == "none":
+                return False
+            _confirm_job_first = _ev != "strong"
+            body = normalize_natural_jenkins_body(_raw_in)
+        else:
             return False
-        body = normalize_natural_jenkins_body(original_text or clean_text or "")
     else:
         body = original_text or clean_text
     if not allow_start:
@@ -19034,6 +19173,7 @@ def handle_lark_jenkins_update_message(
         key,
         body,
         send,
+        confirm_job_first=_confirm_job_first,
         lark_message_id=lark_message_id,
         lark_thread_root_id=lark_thread_root_id,
     )

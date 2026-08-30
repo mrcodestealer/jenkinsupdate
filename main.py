@@ -1955,6 +1955,26 @@ def _handle_jenkins_message(
         )
         return
 
+    # Addressed to us and nothing above claimed it: treat it as an implicit `/update`. Operators
+    # should not have to type the prefix — `igo prod update` and `fpms uat fgs` are requests, and
+    # the narrow gate above rejects both. The handler decides how much to trust it: a config block
+    # or a `node …` line dispatches like a typed `/update`; a bare job name gets the job picker
+    # first; anything that reads as conversation returns False and falls through to the help below.
+    if (chat_type == "p2p" or bot_mentioned) and ju is not None:
+        if ju.handle_lark_jenkins_update_message(
+            chat_id,
+            sender_id,
+            _full_body,
+            _full_body,
+            send_message,
+            allow_start=True,
+            implicit=True,
+            lark_sender_union_id=sender_union_id,
+            lark_message_id=(message_id or "").strip() or None,
+            lark_thread_root_id=update_thread_root,
+        ):
+            return
+
     # Not a Jenkins update — only nudge when the bot was directly addressed.
     if chat_type == "p2p" or bot_mentioned:
         if _looks_like_jenkins_nl_update(_full_body):
