@@ -16076,17 +16076,23 @@ def implicit_update_evidence(text: str) -> str:
         if _IMPLICIT_PLAN_TIME_RE.search(head) and not has_imperative:
             return "none"
 
-    if has_cfg or has_cmd:
-        return "strong"
-
-    # Nothing but a headline: it must actually NAME a job (a literal alias hit, score ≥ 2.0) to be
-    # worth a card. Below that the ranker is guessing from character overlap and would card almost
-    # anything — "ok noted" ranks FRONTEND UAT1 H5 at 0.417.
+    # Does the headline actually NAME a job — a literal alias hit, score ≥ 2.0? Below that the
+    # ranker is guessing from character overlap and would card almost anything ("ok noted" ranks
+    # FRONTEND UAT1 H5 at 0.417).
     q = JENKINS_UPDATE_CMD_RE.sub("", head, count=1).strip()
     ranked = _rank_jenkins_update_job_matches(q)
-    if not ranked or ranked[0][1] < 2.0:
-        return "none"
-    return "weak"
+    names_job = bool(ranked) and ranked[0][1] >= 2.0
+
+    # ``strong`` means BOTH "this is definitely a request" AND "we know which job" — because that is
+    # what skipping the picker actually requires. A config block alone is not enough: when the first
+    # line is a greeting, ``normalize_natural_jenkins_body`` (:16126) makes THAT the routing
+    # headline, so "hi team / brazil uat pms / branch: … / services: pms-api" dispatched silently to
+    # PMS-UAT-UPDATE. Demote to ``weak`` and let the operator confirm the job instead.
+    if (has_cfg or has_cmd) and names_job:
+        return "strong"
+    if has_cfg or has_cmd or names_job:
+        return "weak"
+    return "none"
 
 
 def normalize_natural_jenkins_body(text: str) -> str:
@@ -17913,6 +17919,12 @@ def _dispatch_lark_update_command_body(
     # ``livechat-rollout`` exists on both FPMS and FPMS_NT master). Requiring a *unique* hit is what
     # keeps a stale catalog from routing confidently to the wrong job — it falls through instead.
     svc_row = _jenkins_update_resolve_by_services(body, svc_tokens)
+    # Service-first also returns straight into a form fill, so it is the last bypass an INFERRED
+    # request must not take. It routes on a catalog match — which is fuzzy above 0.82 and stamped
+    # with the same 2.0 that marks a literal alias hit — so on a message the operator never marked
+    # as an update it can silently pick a job nothing in the text named.
+    if svc_row is not None and confirm_job_first:
+        svc_row = None
     if svc_row is not None:
         print(
             f"→ Service-first routing: **{svc_row[2]}** hosts "
