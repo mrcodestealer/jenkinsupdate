@@ -10947,34 +10947,39 @@ def _fpms_lark_job_choice_card_json(
     callback payload is unchanged (``{"k": "job", "i": i}``), so tap routing is untouched.
     """
     ps = (picker_sid or "").strip()
-    lines_md: list[str] = [
-        "Several Jenkins jobs match your text. **Tap the job** below, or **Cancel**.",
-        "",
+    body_elements: list[dict[str, object]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "Several Jenkins jobs match your text. **Tap the job** below, or **Cancel**.",
+            },
+        },
     ]
-    buttons: list[dict[str, object]] = []
-    for i, (alias, _sc, label, url_raw) in enumerate(candidates, start=1):
-        u0 = _jenkins_update_primary_url(url_raw)
-        # No ``backticks`` around alias — Lark ``lark_md`` renders them as dark code blocks.
-        lines_md.append(f"**{i}.** **{label}** — {alias} — {u0}")
+    for i, (_alias, _sc, label, url_raw) in enumerate(candidates, start=1):
         payload: dict[str, object] = {"k": "job", "i": i}
         if ps:
             payload["sid"] = ps
-        # Truncate defensively: a Lark button renders one line, so an over-long label would be
+        # Truncate defensively: a Lark button renders on one line, so an over-long label would be
         # clipped by the client at an arbitrary point rather than at a marked ellipsis.
-        btn_text = _fpms_lark_short_line(f"{i}. {label}", 60)
-        buttons.append(
+        body_elements.append(
             _fpms_lark_v2_callback_button(
-                btn_text,
+                _fpms_lark_short_line(f"{i}. {label}", 60),
                 "primary" if i == 1 else "default",
                 payload,
                 element_id=f"ju_job_{i}"[:20],
             )
         )
-    body_elements: list[dict[str, object]] = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines_md)}},
-    ]
-    # One button per row: job names are far too wide to sit five-across the way digits did.
-    body_elements.extend(buttons)
+        # Each link sits under its OWN button rather than in one list above all of them. Choosing
+        # the right Jenkins link is the entire job of this card, and a separate list makes the
+        # operator re-match number to URL by eye — which is the mistake it exists to prevent.
+        # No ``backticks`` — Lark ``lark_md`` renders them as dark code blocks.
+        body_elements.append(
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": _jenkins_update_primary_url(url_raw)},
+            }
+        )
     body_elements.append({"tag": "hr"})
     cancel_pl: dict[str, object] = {"k": "ju_cancel"}
     if ps:
