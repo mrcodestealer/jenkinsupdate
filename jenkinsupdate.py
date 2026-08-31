@@ -16131,6 +16131,100 @@ def implicit_update_evidence(text: str) -> str:
     return "none"
 
 
+# Words allowed to surround a job alias on a headline line. Anything else means the line is data
+# (a service id) rather than a job name — see :func:`_line_is_job_headline`.
+_HEADLINE_FILLER_TOKENS = frozenset(
+    {
+        "please", "pls", "kindly", "help", "can", "you", "could", "i", "want", "need", "to",
+        "update", "updating", "updates", "deploy", "deploying", "redeploy", "release", "rebuild",
+        "rerun", "upgrade", "trigger", "launch", "publish", "build", "run",
+        "uat", "prod", "production", "master", "branch", "script", "scripts", "job", "jenkins",
+        "all", "the", "on", "for", "a", "fe", "bo", "h5", "web", "pc", "nt", "rc",
+    }
+)
+
+
+def _line_is_job_headline(line: str) -> bool:
+    """
+    True when a line NAMES a job, as opposed to merely containing a job word.
+
+    Score alone cannot decide this. ``pms uat`` (a headline) and ``pms-api`` (a service id
+    continuing a ``Services:`` block) both literal-match the 3-character alias ``pms`` at offset 0
+    and both score 12.003. What separates them is what is LEFT once the alias is removed: ``uat``
+    is a job qualifier, ``api`` is part of a service name. So excise the matched alias and require
+    the remainder to be nothing but filler.
+    """
+    q = JENKINS_UPDATE_CMD_RE.sub("", line or "", count=1).strip()
+    if not q:
+        return False
+    ranked = _rank_jenkins_update_job_matches(q)
+    if not ranked or ranked[0][1] < 2.0:
+        return False
+    sep = r"[\s_\-]+"
+    pat = sep.join(re.escape(w) for w in ranked[0][0].split())
+    m = re.search(rf"(?<![a-z0-9]){pat}(?![a-z0-9])", q.casefold())
+    if m is None:
+        return False
+    remainder = f"{q[: m.start()]} {q[m.end():]}".casefold()
+    toks = [t for t in re.split(r"[\s\-_/,:()]+", remainder) if t]
+    return all(t.isdigit() or t in _HEADLINE_FILLER_TOKENS for t in toks)
+
+
+def _implicit_updatemore_body(text: str) -> str:
+    """
+    Turn a multi-job message into a body ``parse_updatemore_body`` can segment.
+
+    That parser starts a new segment on each ``UPDATE …`` line, so it is verb-gated exactly like
+    the agent's segmenter: a noun-first pair ("fpms uat master … / pms uat …") arrives as ONE
+    segment and the second job is silently lost. Prefixing the bare headlines here is deliberately
+    preferred over teaching the parser a second headline shape — the explicit ``/updatemore`` path
+    and its tests depend on that parser, and this rewrite is visible in the segment list the bot
+    echoes back before anything builds.
+    """
+    out: list[str] = []
+    for line in (text or "").replace("\r\n", "\n").splitlines():
+        s = line.strip()
+        if (
+            s
+            and not _match_key_line_fuzzy(_normalize_config_colons(s))
+            and _line_is_job_headline(s)
+            and not _IMPLICIT_IMPERATIVE_RE.match(s)
+        ):
+            s = f"update {s}"
+        out.append(s)
+    return "/updatemore\n" + "\n".join(out).strip()
+
+
+def implicit_updatemore_segments(text: str) -> int:
+    """
+    How many distinct job headlines a body contains. Two or more means it is an ``/updatemore``.
+
+    ``/updatemore`` is otherwise only reachable by typing the literal prefix —
+    ``parse_updatemore_body`` raises ``First line must include /updatemore.`` without it. The agent
+    segmenter does rewrite some of these, but its ``_SEG_HEADLINE_RE`` demands a leading
+    ``update``/``deploy`` verb, so a noun-first pair ("fpms uat master … / pms uat …") silently
+    collapsed into a single build of the FIRST job — the second job's Branch/Version/Services were
+    parsed as extra config for the first and the operator was never told. It also disappears
+    entirely when ``BOT_JENKINS_AGENT_NORMALIZE=0``. This counts headlines directly instead.
+
+    Two shapes must NOT be counted, and both are common:
+      * ``key: value`` lines — ``Services: pms-api`` contains the whole-word alias ``pms`` and
+        literal-scores 12.x, so every services line would read as a new segment;
+      * bare service names continuing a ``Services:`` block — same problem (``pms-api`` on its own
+        line), which is why the ``services`` key is tracked across lines the way
+        :func:`_peek_service_tokens_from_update_body` tracks it.
+    """
+    raw = _strip_lark_message_mentions(text or "") or (text or "")
+    count = 0
+    for line in raw.replace("\r\n", "\n").splitlines():
+        s = line.strip()
+        if not s or _match_key_line_fuzzy(_normalize_config_colons(s)):
+            continue  # blank, or a ``key: value`` config line
+        if _line_is_job_headline(s):
+            count += 1
+    return count
+
+
 def normalize_natural_jenkins_body(text: str) -> str:
     """Turn NL Jenkins requests into ``/update …`` + config block for existing dispatch."""
     raw = _strip_lark_message_mentions(text)
@@ -18623,6 +18717,32 @@ def handle_lark_jenkins_update_message(
         import updatemore as um
     except Exception:
         um = None
+
+    # ``/updatemore`` is the DEFAULT for a multi-job message, exactly as ``/update`` is for a
+    # single-job one — the operator should have to type neither. Fires only when the body names two
+    # or more jobs AND carries a config block or a command line (``strong``): a bare list of job
+    # names is a question, and one job is an ordinary ``/update``.
+    #
+    # This has to run BEFORE the two blocks below, and both reasons are load-bearing. The family
+    # detectors that follow claim a message on a single phrase, so a two-segment script paste
+    # ("igo prod script / node a.js / fpms prod script / node b.js") was swallowed whole by the IGO
+    # flow and the FPMS half never ran. And the expert agent rewrites the body to a single
+    # ``/jenkinsupdate …`` when its own verb-gated segmenter only recognises one of the headlines,
+    # which then hid the second job from this check entirely. Prefixing here makes both blocks skip
+    # themselves — each is already guarded on ``not UPDATEMORE_CMD_RE`` — and leaves one entry into
+    # the queue machinery, which owns segment ordering and the email batches.
+    if (
+        implicit
+        and allow_start
+        and um
+        and not um.UPDATEMORE_CMD_RE.search(body_early or "")
+        and not JENKINS_UPDATE_CMD_RE.search(clean_text or "")
+        and implicit_updatemore_segments(body_early) >= 2
+        and implicit_update_evidence(body_early) == "strong"
+    ):
+        body_early = _implicit_updatemore_body(body_early)
+        clean_text = body_early
+        original_text = body_early
 
     # CPMS / IGO UAT and IGO PROD SCRIPT route deterministically straight from the message text.
     # Do this **before** the expert-agent normalizer and the job ranker so they never fall into the
