@@ -12440,22 +12440,25 @@ def _fpms_lark_verification_card_json(
     env = (filled_env or "—").strip() or "—"
     branch = (filled_branch or "—").strip() or "—"
     jp = (job_profile or "fpms").strip()
+    # Label the second value for what it actually IS. ``_jenkins_filled_env_branch_for_display``
+    # returns the **Command** in the branch slot for prod-script jobs, so the card was captioning
+    # `node addPlayerRank.js` as "Branch:" — and the VPN-shaped rows already proved these labels
+    # have to follow the profile. Rows whose value is "—" are dropped rather than printed empty:
+    # fnt_rc / sms_uat / frontend have no Environment at all, and "Env: —" reads like a failure.
     if jp == "vpn_creation":
-        block = (
-            f"**Link:** [{link}]({link})\n"
-            f"**VPN_LOCATION:** `{env}`\n"
-            f"**VPN_USERS:** `{branch}`"
-        )
+        rows = [("VPN_LOCATION", env), ("VPN_USERS", branch)]
+    elif jp == "fpms_prod_script":
+        rows = [("Env", env), ("Command", branch)]
     else:
-        block = (
-            f"**Link:** [{link}]({link})\n"
-            f"**Env:** `{env}`\n"
-            f"**Branch:** `{branch}`"
-        )
-    # One mapping for every profile — these chains had no ``pms_uat``/``frontend`` case, so a PMS
-    # run was titled "FPMS UAT" while its link and Environment were correctly PMS. The card is how
+        rows = [("Env", env), ("Branch", branch)]
+    block = "\n".join(
+        [f"**Link:** [{link}]({link})"]
+        + [f"**{k}:** `{v}`" for k, v in rows if v and v != "—"]
+    )
+    # Title from the URL's own job name, never from the automation profile — a profile is a form
+    # shape shared by several jobs, so it titled an IGO run "FPMS PROD SCRIPT". The card is how
     # people check the bot picked the right job, so a wrong title reads as a wrong job.
-    title_text = _jenkins_job_profile_display(jp)
+    title_text = _jenkins_job_display_name_for_url(link) or _jenkins_job_profile_display(jp)
     if isinstance(next_build_number, int) and next_build_number > 0:
         # Bare "#N" on a dry-run card reads as a queued build. The number is only a max+1
         # prediction, and on a dry run no build will ever claim it — say so.
@@ -12651,6 +12654,34 @@ def _jenkins_parameter_labels_for_profile(job_profile: str) -> list[str]:
     if jp == "venue_uat":
         return ["Environment", "Services", "Branch"]
     return ["Environment", "Services", "Branch", "Version"]
+
+
+def _jenkins_job_display_name_for_url(url: str) -> str:
+    """
+    Name of the Jenkins job a build URL actually points at — the last ``/job/<name>/`` segment.
+
+    The YES/NO card used to title itself from the *automation profile*, but a profile is a form
+    shape, not a job: IGO-PROD-SCRIPT-RUN, FPMS_PROD_SCRIPT_RUN and BI-PROD-SCRIPT-RUN all run the
+    ``fpms_prod_script`` flow, so every one of them announced itself as "FPMS PROD SCRIPT" while the
+    Link beneath said something else. Same for the eight FRONTEND jobs ("FRONTEND UAT"), BRAZIL vs
+    NEWPORT ("VENUE UAT") and CPMS vs IGO ("CPMS / IGO UAT").
+
+    Deriving the title from the URL cannot drift: it is the same string as the Link on the card, so
+    the title and the link can never disagree about which job is about to build.
+    """
+    segs = [v for k, v in re.findall(r"/(job|view)/([^/]+)", (url or "").strip()) if k == "job"]
+    if not segs:
+        return ""
+    name = segs[-1]
+    # The eight FRONTEND jobs are the one family whose leaf name is NOT unique — all four
+    # environments share ``h5-uat`` / ``web-uat`` and differ only in the ``uat-N`` folder above
+    # them. Without this the card would title uat-1 and uat-4 identically, which is precisely the
+    # confusion the title exists to prevent. Every other job's leaf is unique (verified over all
+    # 30 registered URLs), so nothing else gets a prefix.
+    parent = next((s for s in reversed(segs[:-1]) if re.fullmatch(r"(?i)uat-?\d+", s)), "")
+    if parent:
+        name = f"{re.sub(r'[-_]', '', parent)} {name}"
+    return re.sub(r"[\s_\-]+", " ", name).strip().upper()
 
 
 def _jenkins_job_profile_display(job_profile: str) -> str:
@@ -18791,6 +18822,15 @@ def handle_lark_jenkins_update_message(
                 return True
             row = cands[idx - 1]
             _fpms_lark_clear_session(chat_id, sender_id)
+            # Acknowledge the tap before dispatching. Everything below this line is slow — claim a
+            # warm browser (or cold-start one), navigate, wait for the reactive Services widget,
+            # fill and verify — and until the YES/NO card lands the operator has no signal that
+            # their tap registered, so they tap again. Both the card button and the typed-number
+            # fallback converge here, so one message covers both.
+            _job_name = _jenkins_job_display_name_for_url(
+                _jenkins_update_primary_url(row[3])
+            ) or row[2]
+            send(chat_id, f"⏳ Filling the form for **{_job_name}** — kindly wait…")
             return _fpms_lark_dispatch_job_row(
                 chat_id, key, pending, row, send, lark_message_id=lark_message_id
             )
