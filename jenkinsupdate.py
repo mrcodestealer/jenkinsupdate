@@ -17071,6 +17071,31 @@ def _fpms_lark_notify_jenkins_after_build_click(
             tail = f" | {email}"
             send(chat_id, f"{at} /SuccessInformMeTime {folder_url} {bn}{tail}".strip())
             return
+        if jenkins_oid and bn:
+            # A single update with no ``Email:`` still needs watching. It used to get watched only
+            # by accident: the "human" ping below defaulted to a hardcoded open id that happened to
+            # be jenkinsbot's, and jenkinsbot starts a watch from any Jenkins URL in a message that
+            # mentions it. Making that ping opt-in (5162a66) was right — it was also double-watching
+            # every queued run — but it silently took plain updates off monitoring with it.
+            #
+            # So ask for the watch deliberately, and with a BARE mention + URL + build number rather
+            # than /SuccessInformMe: the bare form puts jenkinsbot in "watch" mode, which posts the
+            # done card and stops there. /SuccessInformMe would put it in "inform" mode, which fires
+            # the duty callbacks — and with no queue to advance, this chat would get an unprompted
+            # "no active /updatemore queue" warning back for every single update.
+            at = f'<at user_id="{jenkins_oid}">jenkinsbot</at>'
+            send(chat_id, f"{at} {folder_url} {bn}".strip())
+        elif jenkins_oid:
+            # No build number resolved, so there is nothing for jenkinsbot to bind a watch to —
+            # it refuses a URL without one. Say so instead of going quiet: silent non-monitoring
+            # is the exact failure this branch was just fixed for, and an operator who is not told
+            # will assume the build is being watched.
+            send(
+                chat_id,
+                "⚠️ Build was clicked, but I could not resolve its **build number**, so "
+                "jenkinsbot was not asked to monitor it. Check the job's Build History — you "
+                f"will not get a completion message for this one.\n{folder_url}",
+            )
         _fpms_lark_send_build_completed_plain_ping(
             send, chat_id, folder_url=folder_url, build_number=build_number
         )
