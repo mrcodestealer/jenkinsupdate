@@ -16170,6 +16170,50 @@ def _line_is_job_headline(line: str) -> bool:
     return all(t.isdigit() or t in _HEADLINE_FILLER_TOKENS for t in toks)
 
 
+def _deterministic_family_claims(body: str) -> bool:
+    """
+    True when one of the family detectors will route this body exactly, with no ranking involved.
+
+    Used to keep the expert-agent normalizer off bodies that are already understood. The agent
+    rewrites a message wholesale, and it only re-emits the keys it knows — Branch / Version /
+    Services — so any other key is DROPPED. A real BI request::
+
+        hello, can you please help update API below? thankieww
+        API: ds-clickhouse-api
+        ENV: prod
+        Branch: main
+
+    came back as ``/jenkinsupdate prod`` + ``Branch: main``: the ``API:`` line that identifies the
+    repository was deleted, and ``ENV: prod`` was promoted to the headline — where the bare word
+    ``prod`` fuzzy-matches ``bi prod script`` / ``igo prod script`` / ``fpms prod script`` and
+    produces a three-way picker of script-runner jobs, none of which the operator asked for.
+
+    The guard already excluded ``_looks_like_cpms_igo_uat_paste`` for precisely this reason; every
+    other detector needed the same protection. Deterministic phrase routing beats a heuristic
+    rewrite, and the detectors run immediately below anyway — this only stops the agent from
+    destroying the evidence they depend on first.
+    """
+    probes = (
+        _looks_like_fpms_prod_script_paste,
+        _igo_prod_script_phrase_env,
+        _body_requests_bi_prod_script,
+        _cpms_igo_uat_headline_detect,
+        _looks_like_cpms_igo_uat_paste,
+        _body_requests_bi_script_update,
+        _body_mentions_bi_script_job,
+        _body_requests_bi_api_update,
+        _venue_uat_headline_detect,
+        _fnt_rc_headline_detect,
+    )
+    for probe in probes:
+        try:
+            if probe(body):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _implicit_updatemore_body(text: str) -> str:
     """
     Turn a multi-job message into a body ``parse_updatemore_body`` can segment.
@@ -18794,6 +18838,13 @@ def handle_lark_jenkins_update_message(
         and not (um and um.UPDATEMORE_CMD_RE.search(body_early or ""))
         and clean_text.strip().casefold() not in ("yes", "no", "y", "n", "cancel")
         and _parse_single_menu_index(clean_text.strip(), 9) is None
+        # These three flows fill a Jenkins form directly, without the job picker that
+        # ``confirm_job_first`` forces further down — that guard lives in
+        # ``_dispatch_lark_update_command_body`` and this block returns long before it. So screen
+        # out conversation here, or "cpms uat failed" and "igo uat login page is blank" walk
+        # straight into the CPMS/IGO parameter flow: the headline detectors match any mention of
+        # those jobs, including a report that one of them is broken.
+        and implicit_update_evidence(body_early) != "none"
     ):
         if _looks_like_fpms_prod_script_paste(body_early):
             _fpms_lark_clear_session(chat_id, sender_id)
@@ -18835,7 +18886,7 @@ def handle_lark_jenkins_update_message(
         allow_start
         and not JENKINS_UPDATE_CMD_RE.search(clean_text or "")
         and not (um and um.UPDATEMORE_CMD_RE.search(body_early or ""))
-        and not _looks_like_cpms_igo_uat_paste(body_early)
+        and not _deterministic_family_claims(body_early)
         and _looks_like_freeform_update_request(body_early)
     ):
         with _fpms_lark_sessions_lock:
