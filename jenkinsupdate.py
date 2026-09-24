@@ -1830,23 +1830,30 @@ def _ju_warm_urls() -> list[str]:
     return sorted(out, key=_ju_warm_url_key)
 
 
-# Jobs that keep a browser warm at all times. Chosen from real signal in this repo, not taste:
-#   fpms_uat_branch_update  — is ``BUILD_URL``, so every request that arrives without a resolved
-#                             build URL lands here (see _ju_warm_url_from_run_kwargs below).
-#   fpms_nt_uat_master      — 3 aliases added specifically to beat fuzzy matching; its production
-#                             email subject carries ~25 fixtures in tests/.
-#   pms-uat-update          — 4 distinct aliases, own services list + automation profile.
-#   fpms_nt_uat_bo_update   — 4 aliases (joint most in the registry), own services list.
-#   rc-uat-update           — the only registry key hardcoded into program logic
-#                             (_fnt_rc_headline_detect), and README's usage example.
-# Everything else is launched on first use and released again once idle. Re-tune from the journal:
-#   journalctl -u updatejenkins | grep -oP '\[ju-pool:\K[^\]]+'
+# Jobs that keep a browser warm at all times — an OPERATOR choice, not one inferred from usage:
+# the two prod-script runners, because those are the jobs someone waits on in chat.
+#
+#   bi-prod-script-run      — BI PROD SCRIPT RUN
+#   fpms_prod_script_run    — FPMS PROD SCRIPT RUN
+#
+# ``BUILD_URL`` (fpms_uat_branch_update) is hot on top of these whether or not it is listed:
+# :func:`_ju_warm_hot_url_keys` adds it unconditionally because every request that arrives without
+# a resolved build URL lands there. So the live count is these two plus one.
+#
+# Tokens are full folder keys on purpose. Matching is `t == key or t in key` — SUBSTRING — so a
+# short token bleeds: `pms-uat-update` would also match CPMS-UAT-UPDATE, and `/job/fpms/` does not
+# catch `/job/fpms_nt/` (underscore, not slash). Both keys below are unique among the 30 known
+# URLs; verify any replacement the same way before deploying it:
+#   python -c "import jenkinsupdate as j; print(sorted(j._ju_warm_hot_url_keys()))"
+#
+# Everything else is launched on first use and released again once idle — non-hot costs a cold
+# start, it does not make a job unreachable. Re-tune from cold starts, NOT from raw pool lines
+# (every `[ju-pool:<slug>]` line is a lifecycle event, and keepalive ticks dominate them):
+#   journalctl -u updatejenkins --since "7 days ago" \
+#     | grep -oP '\[ju-pool:\K[^\]]+(?=\] browser launched)' | sort | uniq -c | sort -rn
 _JU_WARM_HOT_DEFAULT: tuple[str, ...] = (
-    "/job/fpms/job/fpms_uat_branch_update/",
-    "/job/fpms_nt/view/all/job/fpms_nt_uat_master_update/",
-    "/job/pms/job/uat/job/pms-uat-update/",
-    "/job/fpms_nt/job/fpms_nt_uat_bo_update/",
-    "/job/fnt/job/rc-uat-update/",
+    "/job/bi-go/job/bi-prod-script-run/",
+    "/job/fpms/job/fpms_prod_script_run/",
 )
 
 

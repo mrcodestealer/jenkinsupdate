@@ -102,6 +102,14 @@ _apply_warm_pool_env_from_dotenv()
 
 from flask import Flask, request, jsonify, Response
 
+# Daily status card to the ops group (stdlib-only, inert on import; started in _run_main_entry).
+# Guarded: a missing file must never stop the bot from booting.
+try:
+    import health_report
+except Exception as _hr_import_err:
+    health_report = None
+    print(f"[health] health_report unavailable, no daily report: {_hr_import_err!r}", flush=True)
+
 # ================= CONFIGURATION =================
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -1847,6 +1855,8 @@ def _handle_jenkins_message(
     update_thread_root,
 ) -> None:
     set_lark_incoming_message(message_id)
+    if health_report is not None:
+        health_report.bump("Messages handled")
     if message_id and (chat_type == "p2p" or bot_mentioned):
         add_gotit_reaction(message_id)
 
@@ -2025,6 +2035,11 @@ def lark_webhook():
     if VERIFICATION_TOKEN and token_in and token_in != VERIFICATION_TOKEN:
         print(f"[lark] verification token mismatch (got {token_in!r}) — 403", flush=True)
         return jsonify({"error": "invalid verification token"}), 403
+
+    # Every inbound message and card tap passes here, in websocket and http mode alike.
+    if health_report is not None:
+        health_report.bump("Lark events")
+        health_report.mark("Last Lark event")
 
     hdr_et = _lark_header_event_type(data)
 
@@ -2912,8 +2927,13 @@ def _lark_ws_apply_card_frame_patch() -> None:
     print("[lark-ws] patched lark-oapi ws Client for CARD callbacks", flush=True)
 
 
+# The running lark-oapi ws.Client, kept only so health_checks can read its connection state.
+_lark_ws_client = None
+
+
 def _run_lark_ws_forever() -> None:
     """Block on Lark persistent connection (im.message + card.action.trigger)."""
+    global _lark_ws_client
     import lark_oapi as lark
 
     if not (APP_ID and APP_SECRET):
@@ -2959,6 +2979,7 @@ def _run_lark_ws_forever() -> None:
         "Developer console: Subscription mode → Receive events through persistent connection.",
         flush=True,
     )
+    _lark_ws_client = cli
     cli.start()
 
 
@@ -3088,6 +3109,36 @@ def _run_main_entry() -> int:
         threading.Thread(
             target=_start_warm_pool, daemon=True, name="jenkins-warm-boot"
         ).start()
+
+        # Daily health card to the ops group (health_report.py; checks in health_checks.py).
+        # start() only spawns a daemon thread, so there is no network I/O on this path, and
+        # nothing in here may stop the bot from booting.
+        try:
+            import health_checks
+
+            _hr_started = health_report.start(
+                "updatejenkinsbot",
+                # Always a fresh message in the report group: with reply_to_message_id=None,
+                # send_message quote-replies to the calling context's inbound message. It returns
+                # the Lark JSON, and health_report treats a non-zero "code" as a failed send.
+                send_card=lambda chat_id, card: send_message(
+                    chat_id, card, msg_type="interactive", reply_to_message_id=""
+                ),
+                checks=health_checks.checks(sys.modules[__name__]),
+                expect_threads=health_checks.expect_threads(sys.modules[__name__]),
+            )
+            print(
+                "[health] daily report "
+                + (
+                    "scheduled (HEALTH_REPORT_TIME, default 09:00 UTC+8)"
+                    if _hr_started
+                    else "not started here (HEALTH_REPORT_ENABLE=0, or another process in "
+                    "this directory owns it)"
+                ),
+                flush=True,
+            )
+        except Exception as _hr_err:
+            print(f"[health] daily report startup skipped: {_hr_err!r}", flush=True)
 
         if _lark_ws_uses_persistent_connection():
             def _flask_bg() -> None:

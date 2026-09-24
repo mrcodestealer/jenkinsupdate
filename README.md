@@ -159,14 +159,16 @@ The pool knows 29 Jenkins job URLs. It used to pre-warm **all** of them at start
 every 4 minutes forever — ~30 browsers, ~180 processes, ~11 GB, most of them for jobs nobody had
 asked for. Now:
 
-- only the jobs in `JU_WARM_HOT_URLS` are pre-warmed and held (empty = the 5-job default in
-  `_JU_WARM_HOT_DEFAULT`, chosen from alias counts, bespoke service lists and test fixtures);
+- only the jobs in `JU_WARM_HOT_URLS` are pre-warmed and held (empty = the default in
+  `_JU_WARM_HOT_DEFAULT`: **BI-PROD-SCRIPT-RUN** and **FPMS_PROD_SCRIPT_RUN**, the two jobs
+  someone sits waiting on in chat). `BUILD_URL` is hot on top of those whether listed or not —
+  it is where any request without a resolved build URL lands — so the live count is three;
 - any other known job launches on **first use** — one ~20s wait, which an `/update` run
   announces in chat (internal parameter-discovery calls just wait) — and is released again
   after `JU_WARM_IDLE_TTL_SEC` (default 1800s) of idleness;
 - `/warmstatus` shows which are hot, which are lazy-and-live, and which are idle.
 
-Steady state is ~6 browsers / ~36 processes instead of ~30 / ~180.
+Steady state is ~4 browsers / ~24 processes instead of ~30 / ~180.
 
 To go back to warming everything, no code change needed:
 
