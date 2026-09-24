@@ -3111,29 +3111,27 @@ def _run_main_entry() -> int:
         ).start()
 
         # Daily health card to the ops group (health_report.py; checks in health_checks.py).
-        # start() only spawns a daemon thread, so there is no network I/O on this path, and
-        # nothing in here may stop the bot from booting.
+        # start() reads the git version and opens its lock file, then spawns a daemon thread: no
+        # network I/O on this path, and nothing in here may stop the bot from booting.
         try:
             import health_checks
 
             _hr_started = health_report.start(
                 "updatejenkinsbot",
-                # Always a fresh message in the report group: with reply_to_message_id=None,
-                # send_message quote-replies to the calling context's inbound message. It returns
-                # the Lark JSON, and health_report treats a non-zero "code" as a failed send.
-                send_card=lambda chat_id, card: send_message(
-                    chat_id, card, msg_type="interactive", reply_to_message_id=""
-                ),
+                # The module's own sender, not send_message: it posts a fresh message (never a
+                # quote-reply), raises on any failure, and tags each report with a Lark uuid so a
+                # retry after a slow answer cannot post the card twice.
+                send_card=health_report.make_lark_sender(APP_ID or "", APP_SECRET or ""),
                 checks=health_checks.checks(sys.modules[__name__]),
                 expect_threads=health_checks.expect_threads(sys.modules[__name__]),
             )
             print(
                 "[health] daily report "
                 + (
-                    "scheduled (HEALTH_REPORT_TIME, default 09:00 UTC+8)"
+                    "scheduled (HEALTH_REPORT_TIME, default 09:00 UTC+8; one process per host "
+                    "sends, the others wait)"
                     if _hr_started
-                    else "not started here (HEALTH_REPORT_ENABLE=0, or another process in "
-                    "this directory owns it)"
+                    else "not started (not a systemd service, HEALTH_REPORT_ENABLE=0, or start failed: see stderr)"
                 ),
                 flush=True,
             )

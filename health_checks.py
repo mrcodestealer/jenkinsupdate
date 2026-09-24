@@ -135,9 +135,18 @@ def warm_browsers():
 
     if pool_on:
         pool = ju._ju_warm_pool_singleton
-        if pool is None:
+        # Boot builds the pool only when it pre-warms or waits for the browsers; otherwise the
+        # first /update does (jenkinsupdate.prewarm_all_jenkins_browsers_on_startup).
+        built_at_boot = (
+            os.environ.get("JU_WARM_PREWARM_ON_STARTUP", "1") or ""
+        ).strip().lower() not in _OFF or (
+            ju._jenkins_warm_startup_block() and ju._jenkins_warm_startup_wait_sec() > 0
+        )
+        if pool is None and built_at_boot:
             status = "warn"
             parts.append("/update pool not started")
+        elif pool is None:
+            parts.append("/update pool starts on first use")
         else:
             hot = ju._ju_warm_hot_url_keys()
             workers = pool._all_workers()
@@ -240,6 +249,10 @@ def mail_smtp():
 def llm_parser():
     """GET /models on the OpenAI-compatible endpoint. Never generates; the rules parser is the
     fallback, so an outage is degraded rather than down."""
+    # jenkinsupdate.agent_route_free_form_body is the only caller of the agent, and it returns
+    # early on this switch (jenkinsupdate._agent_normalize_enabled).
+    if (os.getenv("BOT_JENKINS_AGENT_NORMALIZE", "1") or "").strip().lower() in _OFF:
+        return None, "disabled (BOT_JENKINS_AGENT_NORMALIZE=0: free-form parser off)"
     try:
         import jenkinsupdateagent as ja
     except Exception as ex:
